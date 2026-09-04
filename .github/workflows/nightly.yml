@@ -1,0 +1,62 @@
+# Quettos Core nightly. Skeleton: every job is gated with `if: false`
+# until its deliverable lands (docs/ROADMAP.md). Jobs listed per
+# docs/VERIFICATION.md layer 8: full-top synth + reports, ECP5 (optional),
+# Qwen 4+1 end-to-end, `--x-initial unique`, quality regeneration.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC daily
+  workflow_dispatch:
+
+env:
+  OSS_CAD_SUITE_VERSION: "2026-09-01"
+
+jobs:
+  synth-full-xc7:
+    if: false   # planned: full qcore_top synth_xilinx -flatten + syn/reports/xc7.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+
+  synth-ecp5:
+    if: false   # planned: synth_ecp5 stat + yowasp-nextpnr-ecp5 fmax
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+
+  e2e-qwen-4plus1:
+    if: false   # planned: Qwen2.5-0.5B-Instruct 4 prompt + 1 generated token, RTL == isa_sim == golden
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+
+  e2e-smollm2-8plus4:
+    if: false   # planned: SmolLM2 8+4 on WB=64 (here if the PR job exceeds 15 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+
+  x-initial-unique:
+    if: false   # planned: determinism under Verilator --x-initial unique
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+
+  quality-regen:
+    if: false   # planned: >= 32k WikiText-2 tokens, golden vs HF fp32 (installs the optional 'ref' group)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - run: echo "not implemented yet (see docs/ROADMAP.md)"

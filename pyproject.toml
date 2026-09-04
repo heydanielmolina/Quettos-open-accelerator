@@ -1,0 +1,53 @@
+[project]
+name = "quettos"
+version = "0.1.0"
+description = "Quettos Core: an open, inference-only weight-streaming LLM accelerator (software stack: model download, quantization, compiler, golden model, ISA simulator)."
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "numpy>=2.0",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+    "huggingface_hub>=0.30",
+    "jinja2>=3.1",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+quettos = "quettos.cli:main"
+
+[dependency-groups]
+# Reference/quality stack (torch CPU). Never installed in CI.
+ref = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "datasets>=3.0",
+]
+# Hardware verification and lint helpers.
+dev = [
+    "cocotb>=2.1",
+    "yowasp-nextpnr-ecp5",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sw/quettos"]
+
+[tool.uv]
+# Always use a uv-managed CPython so the Homebrew/conda interpreters on dev machines are never picked up.
+python-preference = "only-managed"
+
+[tool.pytest.ini_options]
+testpaths = ["sw/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

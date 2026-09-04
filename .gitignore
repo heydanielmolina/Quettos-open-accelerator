@@ -1,0 +1,38 @@
+# Build outputs (model weights, images, Verilator objects, perf, KV prefixes)
+build/
+
+# Verilator object directories anywhere in the tree
+**/obj_dir/
+obj_dir*/
+sim/probe/obj_dir*
+
+# Python (uv-managed)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv-cache/
+.cache/uv/
+*.egg-info/
+
+# Waveforms
+*.fst
+*.fst.hier
+*.vcd
+
+# macOS
+.DS_Store
+
+# Yosys / synthesis scratch (reports under syn/reports/ stay tracked)
+*.il.gz
+
+# NOTE: models/ is intentionally tracked (calib.json, layout.json, program.lst,
+# expected_tokens.json, sha256s). Only the downloaded weights and image.bin,
+# which live under build/, are ignored.
+
+# editor settings
+.vscode/
+.idea/

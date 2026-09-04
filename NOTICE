@@ -1,0 +1,43 @@
+Quettos Core / Quettos Open Accelerator
+Copyright 2026 Quettos
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party materials
+--------------------------------------------------------------------------------
+
+Model weights are NOT redistributed by this repository. They are downloaded from
+the Hugging Face Hub at build time (`make demo` / `uv run quettos download`) into
+the gitignored build/ directory. The models used are:
+
+  * Qwen2.5-0.5B-Instruct
+    Copyright Alibaba Cloud. Licensed under the Apache License, Version 2.0.
+    https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+
+  * SmolLM2-135M-Instruct
+    Copyright Hugging Face. Licensed under the Apache License, Version 2.0.
+    https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct
+
+Evaluation data (not redistributed; downloaded on demand, used only for quality
+measurement and never shipped in any artifact):
+
+  * WikiText-2 (Merity, Xiong, Bradbury, Socher, 2016)
+    Licensed under Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0).
+    https://huggingface.co/datasets/Salesforce/wikitext
+
+--------------------------------------------------------------------------------
+Derived artifacts
+--------------------------------------------------------------------------------
+
+The following files, where present in this repository or published as release
+assets, are derived works of the model weights listed above and are made
+available under the Apache License, Version 2.0, the same license that governs
+the source weights:
+
+  * models/<model>/calib.json          (calibration maxima and per-class formats)
+  * models/<model>/expected_tokens.json (greedy tokens produced by the integer golden model)
+  * the tool-call prefix KV-cache release asset (`make regen-prefix`)
+
+Per-model layout.json, program.lst and sha256 files describe the compiled image
+and are derived from the same weights.
