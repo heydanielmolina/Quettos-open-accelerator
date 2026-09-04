@@ -3,7 +3,7 @@
 # (see docs/ROADMAP.md and docs/VERIFICATION.md layer 8).
 #
 # Action versions were checked against the upstream repos on 2026-09-02:
-#   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10,
+#   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10.0.1 (exact tag; it publishes no floating v10),
 #   YosysHQ/setup-oss-cad-suite v4 (v4.1.0), oss-cad-suite release 2026-09-01.
 name: ci
 
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -66,7 +66,7 @@ jobs:
   #   needs: lint-and-pytest
   #   steps:
   #     - uses: actions/checkout@v7
-  #     - uses: astral-sh/setup-uv@v10
+  #     - uses: astral-sh/setup-uv@v10.0.1
   #       with: { enable-cache: true }
   #     - uses: actions/cache@v6
   #       with:
@@ -84,7 +84,7 @@ jobs:
   #   needs: lint-and-pytest
   #   steps:
   #     - uses: actions/checkout@v7
-  #     - uses: astral-sh/setup-uv@v10
+  #     - uses: astral-sh/setup-uv@v10.0.1
   #       with: { enable-cache: true }
   #     - uses: actions/cache@v6
   #       with:
