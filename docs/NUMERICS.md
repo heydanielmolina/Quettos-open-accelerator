@@ -3,16 +3,16 @@
 Single source of truth: `sw/quettos/numerics.py`. Every integer operation the
 RTL performs is defined there once, in plain Python integers and numpy `int64`
 arrays; every consumer of these numbers (the table generator `lutgen.py`, the
-quantizer `quantize.py` and the hardware unit tests) imports the same
-functions, and the RTL mirrors them bit for bit. The RTL knows no fixed-point
-format: every shift, exponent and constant is a compiler value in a descriptor
-field. This document restates that module; where the two disagree, the module
-is right and this file needs fixing.
+quantizer `quantize.py`, the program constants `program.py`, the golden model
+`golden.py` and the hardware unit tests) imports the same functions, and the
+RTL mirrors them bit for bit. The RTL knows no fixed-point format: every shift,
+exponent and constant is a compiler value in a descriptor field. This document
+restates that module; where the two disagree, the module is right and this
+file needs fixing.
 
-Everything below is a definition from `numerics.py`, a value measured by a
+Everything below is a definition from `numerics.py` or a value measured by a
 command in this repository (`uv run quettos calibrate <alias>`,
-`uv run pytest -q sw/tests`), or, in the last section only, an **estimate**
-that `uv run quettos check` replaces.
+`uv run quettos check <alias>`, `uv run pytest -q sw/tests`).
 
 ## Primitives
 
@@ -158,6 +158,46 @@ EMBED dequantizes an int8 embedding row into `FRAC_X` through the same pipe:
 `8 <= s1 <= 24` so the shifted product fits 40 bits and drops only zero bits;
 the result is a single rounding of `q * Sw * 2^FRAC_X`.
 
+### Program constants
+
+`sw/quettos/program.py` (`program.build(model)`) derives one `(s1, sbias)`
+pair per GEMV class of a quantized model from these rules: `acc_bits` from `K`
+and the operand widths (`acc_bits_for`), the weight exponent window over the
+non-zero rows of every layer, the activation exponent window between a 1-LSB
+vector and the calibration absmax of the class (which the quantizer stores in
+the model as `extra["absmax"]`), and two checks of the stage-2 shift `S`: the
+window at the calibration extremes is the precision target (`choose_s1` sees
+the calibration maximum plus one octave of activation margin, so `S >= 16`
+wherever the 40-bit bound allows), and the hard minimum, evaluated with every
+operand at the int32 saturation bound of its class, must be at or above 0,
+which proves the hardware clamp `[0, 63]` is never reached on any input,
+calibration or not (`s1` is lowered when needed, as on the scores GEMV). The
+golden model and the compiler share these values; the golden counts
+`ERR_SHIFT` and `SAT`, and the tests, the quality rows and the CLI writers
+require both to be 0. Values for the W8A16 programs (Qwen2.5-0.5B-Instruct /
+SmolLM2-135M-Instruct):
+
+| GEMV | `K` | `acc_bits` | `s1` | `sbias` | `S` window | hard minimum |
+|---|---|---|---|---|---|---|
+| EMBED | 896 / 576 | 32 / 32 | 16 / 16 | -8 / -6 | [32, 35] / [31, 33] | 32 / 31 |
+| QKV | 896 / 576 | 33 / 33 | 11 / 12 | -27 / -28 | [17, 48] / [17, 41] | 10 / 5 |
+| o_proj | 896 / 576 | 33 / 33 | 16 / 16 | -32 / -30 | [18, 42] / [17, 40] | 6 / 5 |
+| gate\|up | 896 / 576 | 33 / 33 | 12 / 11 | -28 / -27 | [17, 44] / [17, 40] | 10 / 5 |
+| down | 4864 / 1536 | 36 / 34 | 12 / 10 | -28 / -24 | [15, 45] / [15, 45] | 10 / 11 |
+| LM head | 896 / 576 | 33 / 33 | 14 / 14 | -30 / -30 | [17, 43] / [17, 37] | 10 / 5 |
+| scores | 64 / 64 | 29 / 29 | 9 / 9 | -25 / -25 | [17, 60] / [23, 60] | 0 / 0 |
+| PV | 2048 / 2048 | 34 / 34 | 11 / 14 | -27 / -30 | [17, 39] / [17, 36] | 9 / 6 |
+
+Every window lies in `[0, 63]` and every hard minimum is at or above 0. The
+down GEMV is the one class where the 40-bit bound (`s1 >= acc_bits - 24`)
+beats the precision bound, so its smallest window shift is 15; the scores GEMV
+is the one where the hard bound lowers `s1` (both operands at int32 saturation
+give exactly `S = 0`). The W8A8 programs lower `s1` by 6 to 9 on the weight
+GEMVs (int8 activations carry a larger scale exponent) with the same hard
+minima and the smallest window shift again at 15 (down). The PV constants use
+`K = MAX_CTX = 2048` whatever the size of a golden run's cache, so a short run
+executes the compiled program's shifts.
+
 ## Per-tensor-class formats
 
 `FRAC_X, FRAC_QKV, FRAC_S, FRAC_GU, FRAC_H, FRAC_CTX` are chosen by
@@ -259,15 +299,28 @@ Exact for the softmax since `q . c` is constant over `t`; it conditions the
 int8 K cache against Qwen's large `k_proj` biases.
 
 Gate (`k_centering_gate` in `calib.json`): post-RoPE K quantized to int8 per
-(token, KV head) with an `absmax/127` scale, and the RMS error of the resulting
-`q . k` scores over the causal window divided by the RMS of the exact scores:
+(token, KV head) with an `absmax/127` scale, and the error of the resulting
+`q . k` scores over the causal window, in two units: relative to the RMS of the
+exact scores, and absolute in the log2 domain the softmax consumes
+(`q . k / sqrt(d) * log2(e)`; one unit halves a token's weight), as RMS and
+as the largest single error:
 
-| Model | int8 K, raw | int8 K, centered |
-|---|---|---|
-| Qwen2.5-0.5B-Instruct | 0.503% | 0.149% |
-| SmolLM2-135M-Instruct | 0.780% | 0.306% |
+| Model | int8 K | relative RMS | RMS (log2 units) | max (log2 units) |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | raw | 0.503% | 0.613 | 22.2 |
+| Qwen2.5-0.5B-Instruct | centered | 0.149% | 0.181 | 8.01 |
+| SmolLM2-135M-Instruct | raw | 0.780% | 0.0657 | 0.615 |
+| SmolLM2-135M-Instruct | centered | 0.306% | 0.0258 | 0.429 |
 
-Centering is enabled for both models.
+Centering is enabled for both models. The relative figure flatters Qwen: its
+raw scores are dominated by the constant `q . c` term (absmax 2466 against 90
+for the centered scores), so the absolute error is the one to read. Per layer
+(`layer_rms_error_log2_centered`), Qwen's centered error is 0.868 log2 units
+on layer 0 and between 0.020 and 0.069 on layers 1 to 23; SmolLM2 stays
+between 0.010 and 0.039 on every layer. Layer 0 of Qwen is the dominant error
+source of its W8A16 rows in the Quality section; the KL against fp32 is
+largest on the shortest prompt, where a few tokens carry most of the
+attention.
 
 ## KV cache
 
@@ -406,17 +459,41 @@ every position and max |logit difference| 3.3e-4 / 7.6e-4 on Qwen
 (`chat_short` T=36 / `tool_call_weather` T=180) and 1.2e-4 / 1.2e-4 on SmolLM2
 (T=37 / T=39); the test bound is 2e-2.
 
-## Quality expectations (estimates)
+## Quality
 
-The rows below are **estimates**; `uv run quettos check` produces the measured
-values that supersede them:
+Measured by `uv run quettos check <alias>` (`sw/quettos/quality.py`), which
+runs the calibration set (the three prompt files under `prompts/` and three
+prose passages of `calibrate.py`, rendered through the chat template)
+teacher-forced through the integer golden model and the float32 reference and
+scores every position that has a next token: top-1 agreement of the argmax,
+mean `KL(p_fp32 || p_int)` from float64 log-softmax, the paired next-token
+NLL difference `NLL_int - NLL_fp32` with its standard error, and the
+perplexities `exp(mean NLL)`. The results, with per-sequence values, are
+written to `models/<name>/quality.json`; the token ids are the ones hashed in
+`calib.json`.
 
-| Model | Config | PPL delta | top-1 vs fp32 | KL (nats) |
-|---|---|---|---|---|
-| Qwen2.5-0.5B | W8A16 + int8 KV + LUT nonlinearities | +1-3% (estimate) | 94-97% (estimate) | 0.01-0.03 (estimate) |
-| SmolLM2-135M | same | +1-2% (estimate) | 95-98% (estimate) | 0.01-0.02 (estimate) |
-| both | W8A8 ablation | +2-6% (estimate) | 90-95% (estimate) | 0.03-0.08 (estimate) |
+| Model | Config | Tokens | top-1 vs fp32 | mean KL (nats) | delta-NLL +/- SE (nats) | PPL fp32 -> int |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | W8A16 | 1308 | 93.65% (1225) | 0.0556 | +0.0492 +/- 0.0132 | 34.97 -> 36.73 |
+| Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.01% (1125) | 0.109 | +0.0302 +/- 0.0242 | 34.97 -> 36.04 |
+| SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00464 | +0.0052 +/- 0.0028 | 35.91 -> 36.09 |
+| SmolLM2-135M-Instruct | W8A8 | 1175 | 87.15% (1024) | 0.0468 | -0.0185 +/- 0.0101 | 35.91 -> 35.25 |
 
-CI gate on SmolLM2: `KL <= 0.02 nats`, `top-1 >= 93%`. Qwen is reported, not
-gated (expected `KL <= 0.03`, `top-1 >= 94%`). Saturation counters must be zero
-on every reported run.
+W8A16 is the default (int16 activations into every weight GEMV, int8 K/V
+cache, table-driven nonlinearities); W8A8 feeds int8 activations to the weight
+GEMVs with everything else unchanged. `sat` and `err_shift` are 0 on every
+row; the VQUANT and softmax clip counts are 246540 / 196472 on Qwen (W8A16 /
+W8A8) and 169416 / 138576 on SmolLM2. On Qwen the KL is concentrated in the
+two short prompts (0.274 per position at T = 36 and 0.101 at T = 180, W8A16)
+while the four longer sequences lie between 0.023 and 0.059; on SmolLM2 every
+sequence lies between 0.0040 and 0.0069. The W8A8 rows lose 7.6 (Qwen) and
+8.5 (SmolLM2) points of top-1 and raise the KL 2x and 10x, while their
+delta-NLL stays within two standard errors of zero: the int8 activations
+perturb the distribution far more than they shift the likelihood of the true
+token.
+
+`sw/tests/test_quality.py` gates SmolLM2 W8A16 on this set at `KL <= 0.02`
+nats and `top-1 >= 93%`, and checks that `quality.json` agrees with a fresh
+evaluation (integers exactly, floats within `2e-3` absolute plus `1e-3`
+relative, the room float32 summation order needs across BLAS libraries); Qwen
+is reported.

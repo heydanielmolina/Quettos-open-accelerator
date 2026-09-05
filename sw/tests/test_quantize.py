@@ -254,6 +254,12 @@ def test_calib_tokens_hash(spec: ModelSpec, calib: dict) -> None:
 def test_calib_gates_present(calib: dict) -> None:
     gate = calib["k_centering_gate"]
     assert 0 < gate["rel_rms_error_centered"] < gate["rel_rms_error_raw"] < 0.05
+    assert 0 < gate["rms_error_log2_centered"] < gate["rms_error_log2_raw"]
+    assert gate["rms_error_log2_centered"] <= gate["max_error_log2_centered"]
+    assert gate["rms_error_log2_raw"] <= gate["max_error_log2_raw"]
+    per_layer = gate["layer_rms_error_log2_centered"]
+    assert len(per_layer) == calib["model"]["layers"] and all(v > 0 for v in per_layer)
+    assert max(per_layer) >= gate["rms_error_log2_centered"] >= min(per_layer)
     spread = calib["v_scale_spread"]
     assert spread["p50"] <= spread["p99"] <= spread["max"]
     assert sum(spread["histogram"].values()) == spread["count"]

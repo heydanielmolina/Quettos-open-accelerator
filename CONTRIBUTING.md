@@ -129,3 +129,6 @@ If `uv` is not on PATH the pytest step is skipped with a message.
 - New RTL needs either a cocotb unit test on the tiny config or a step-mode
   per-op compare against `isa_sim.py`. New numerics need a property test in
   `sw/tests/test_numerics.py`.
+- Tests marked `slow` need the quantized models under `build/quant/` (from
+  `uv run quettos quantize <alias>`) and take a few minutes;
+  `uv run pytest -q sw/tests -m "not slow"` is the quick loop.

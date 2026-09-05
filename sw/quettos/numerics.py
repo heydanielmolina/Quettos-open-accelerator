@@ -8,9 +8,9 @@ exponent bias and constant is a compiler value carried in a descriptor field.
 
 Conventions: ``round_shift`` (round half toward +inf, arithmetic shift) is the
 only rounding operation; ``sat`` saturates and counts events in :class:`Stats`;
-an sfloat ``{m, e}`` is ``m * 2**e`` with ``m`` in ``[2**15, 2**16)`` and the
-canonical zero ``{0, 0}``; a ``FRAC_*`` class value ``v`` represents
-``v * 2**-FRAC``.  Each function's docstring states its exact formula and widths.
+an sfloat ``{m, e}`` is ``m * 2**e``, ``m`` in ``[2**15, 2**16)``, zero ``{0, 0}``;
+a ``FRAC_*`` value ``v`` represents ``v * 2**-FRAC``.  Function docstrings give
+the exact formulas and widths.
 """
 
 from __future__ import annotations
@@ -782,3 +782,144 @@ def to_fixed(x: np.ndarray, frac: int) -> np.ndarray:
 def from_fixed(x: np.ndarray, frac: int) -> np.ndarray:
     """Real values of a fixed-point vector (tests and reporting only)."""
     return np.asarray(x, dtype=np.float64) * 2.0**-frac
+
+
+# --------------------------------------------------------------------------- vectorized mirrors
+
+# Block forms of ``requant`` and ``softmax`` for the golden model's teacher-forced
+# forward.  Each is proven bit-identical to the scalar primitive by a property
+# test in ``sw/tests/test_numerics_edges.py``; the scalar functions above stay
+# the definitions.
+
+
+def bitlen_array(x: np.ndarray) -> np.ndarray:
+    """Elementwise :func:`bitlen` for non-negative int64 values below ``2**53`` (0 -> 0)."""
+    if np.any(x < 0) or np.any(x >= (1 << 53)):
+        raise ValueError("bitlen_array: values must lie in [0, 2**53)")
+    return np.frexp(x.astype(np.float64))[1].astype(np.int64)
+
+
+def requant_rows(
+    acc: np.ndarray,
+    sw_m: np.ndarray,
+    sw_e: np.ndarray,
+    sx_m: np.ndarray,
+    sx_e: np.ndarray,
+    s1: int,
+    sbias: int,
+    bias_q: np.ndarray | None = None,
+    old: np.ndarray | None = None,
+    valid: np.ndarray | None = None,
+    stats: Stats | None = None,
+) -> np.ndarray:
+    """Vectorized form of :func:`requant` over a ``[T, N]`` accumulator block.
+
+    Column ``n`` carries the weight scale ``{sw_m[n], sw_e[n]}`` and the bias
+    ``bias_q[n]``; row ``t`` carries the activation scale ``{sx_m[t], sx_e[t]}``;
+    ``old`` is the ``[T, N]`` accumulate operand.  ``valid[t, n] == False`` marks
+    an element whose weight meta is unwritten (``m = 0``: a padded channel or a
+    KV token beyond the query position), which takes the zero-scale path.
+    Element ``(t, n)`` equals ``requant(acc[t, n], Sw_n or zero, Sx_t, s1,
+    sbias, bias_q[n], old[t, n])`` and the ``Stats`` counters add up to the
+    per-element totals.
+    """
+    acc = np.asarray(acc, dtype=np.int64)
+    if acc.ndim != 2:
+        raise ValueError("requant_rows: acc must be [T, N]")
+    if s1 < 0 or s1 > 63:
+        raise ValueError(f"requant_rows: s1 {s1} out of [0, 63]")
+    swm = np.asarray(sw_m, dtype=np.int64)[None, :]
+    swe = np.asarray(sw_e, dtype=np.int64)[None, :]
+    sxm = np.asarray(sx_m, dtype=np.int64)[:, None]
+    sxe = np.asarray(sx_e, dtype=np.int64)[:, None]
+    nz = (swm != 0) & (sxm != 0)
+    if valid is not None:
+        nz = nz & np.asarray(valid, dtype=bool)
+    nz = np.broadcast_to(nz, acc.shape)
+
+    lo40, hi40 = -(1 << 39), (1 << 39) - 1
+    t = round_shift(acc * swm, s1)
+    if stats is not None:
+        stats.sat += int(np.count_nonzero(((t < lo40) | (t > hi40)) & nz))
+    t = np.clip(t, lo40, hi40)
+
+    shift = np.broadcast_to(sbias - (swe + sxe), acc.shape)
+    if stats is not None:
+        stats.err_shift += int(np.count_nonzero(((shift < 0) | (shift > 63)) & nz))
+    shift = np.clip(shift, 0, 63)
+    half = np.where(shift > 0, np.left_shift(np.int64(1), np.maximum(shift - 1, 0)), 0)
+    y = (t * sxm + half) >> shift
+
+    lo32, hi32 = -(1 << 31), I32_MAX
+    if stats is not None:
+        stats.sat += int(np.count_nonzero(((y < lo32) | (y > hi32)) & nz))
+    y = np.where(nz, np.clip(y, lo32, hi32), 0)
+    if bias_q is not None:
+        y = sat(y + np.asarray(bias_q, dtype=np.int64)[None, :], 32, stats)
+    if old is not None:
+        y = sat(y + np.asarray(old, dtype=np.int64), 32, stats)
+    return y
+
+
+def softmax_rows(
+    scores: np.ndarray,
+    lengths: np.ndarray,
+    frac_s: int,
+    sv_m: np.ndarray,
+    sv_e: np.ndarray,
+    tables: Tables,
+    stats: Stats | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized form of :func:`softmax` over the rows of a ``[T, L]`` score block.
+
+    Row ``t`` equals ``softmax(scores[t], lengths[t], frac_s, v_scales, tables)``
+    with ``v_scales[j] = {sv_m[j], sv_e[j]}`` shared by every row.  Returns the
+    ``[T, L]`` int16 weights (zero at and beyond each row's length) and the
+    per-row ``SREG_out`` as ``(m[T], e[T])`` arrays, ``{0, 0}`` for a row whose
+    V scales are all zero.  ``Stats.clip`` adds up to the per-row totals.
+    """
+    scores = np.asarray(scores, dtype=np.int64)
+    if scores.ndim != 2:
+        raise ValueError("softmax_rows: scores must be [T, L]")
+    n_rows, width = scores.shape
+    lengths = np.asarray(lengths, dtype=np.int64)
+    if lengths.shape != (n_rows,) or np.any(lengths < 1) or np.any(lengths > width):
+        raise ValueError("softmax_rows: bad lengths")
+    svm = np.asarray(sv_m, dtype=np.int64)
+    sve = np.asarray(sv_e, dtype=np.int64)
+    if svm.shape != (width,) or sve.shape != (width,):
+        raise ValueError("softmax_rows: V scales must have one entry per column")
+    ext = SOFTMAX_EXT_BITS
+    mask = np.arange(width, dtype=np.int64)[None, :] < lengths[:, None]
+
+    s_min = np.iinfo(np.int64).min
+    m = np.max(np.where(mask, scores, s_min), axis=1, keepdims=True)
+    d = np.clip(m - np.where(mask, scores, m), 0, SOFTMAX_CLAMP << frac_s)
+    n = (d + (1 << frac_s) - 1) >> frac_s
+    g = (n << frac_s) - d
+    f16 = g >> (frac_s - 16) if frac_s >= 16 else g << (16 - frac_s)
+    e2 = exp2_q15(f16, tables) << ext
+    half = np.where(n > 0, np.left_shift(np.int64(1), np.maximum(n - 1, 0)), 0)
+    e_t = np.where(mask, (e2 + half) >> n, 0)
+    total = np.sum(e_t, axis=1)
+    e_s = bitlen_array(total) - 16
+    sum_hi = np.where(e_s >= 0, total >> np.maximum(e_s, 0), total << np.maximum(-e_s, 0))
+    inv = tables.recip.interp((sum_hi >> 7) & 0xFF, (sum_hi & 0x7F) << 1)
+    sh_p = (15 - ext + e_s)[:, None]
+    if np.any(sh_p < 1):
+        raise ValueError("softmax_rows: probability shift below 1")
+    p = (e_t * inv[:, None] + np.left_shift(np.int64(1), sh_p - 1)) >> sh_p
+
+    nonzero = mask & (svm[None, :] != 0)
+    any_nz = np.any(nonzero, axis=1)
+    e_max = np.max(np.where(nonzero, sve[None, :], s_min), axis=1)
+    e_max_safe = np.where(any_nz, e_max, 0)
+    shifts = np.minimum(np.where(nonzero, 16 + ext + e_max_safe[:, None] - sve[None, :], 16), 40)
+    prod = p * svm[None, :]
+    w_len = np.where(nonzero, (prod + np.left_shift(np.int64(1), shifts - 1)) >> shifts, 0)
+    if stats is not None:
+        stats.clip += int(np.count_nonzero(w_len > I16_MAX))
+    w = np.minimum(w_len, I16_MAX)
+    sreg_m = np.where(any_nz, 1 << 15, 0).astype(np.int64)
+    sreg_e = np.where(any_nz, 1 + e_max_safe - 15, 0).astype(np.int64)
+    return w, sreg_m, sreg_e

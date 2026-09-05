@@ -95,7 +95,7 @@ class QuantModel:
     embed: QuantLinear
     k_center: np.ndarray  # int32 [layers, kv_heads, head_dim] in FRAC_QKV
     numerics_version: int = NUMERICS_VERSION
-    extra: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)  # "absmax": calibration maxima per class
 
     @property
     def n_layers(self) -> int:
@@ -187,7 +187,9 @@ def build_quant_model(
     """Quantize ``spec`` with the formats and K-centering rows of ``calib``.
 
     ``layers`` keeps only the first ``layers`` decoder layers (for fast tests);
-    the norm, embedding and constants are always produced.
+    the norm, embedding and constants are always produced.  The calibration
+    maxima per class travel with the model in ``extra["absmax"]`` so the
+    program constants (:mod:`quettos.program`) derive from the ``.npz`` alone.
     """
     if not isinstance(calib, dict):
         calib = load_calib(calib)
@@ -206,6 +208,7 @@ def build_quant_model(
     if k_center.shape != (n_layers, spec.kv_heads, spec.head_dim):
         raise ValueError(f"calib.json k_center shape {k_center.shape} does not match the model")
     eps_c = numerics.eps_const(spec.rms_norm_eps, spec.hidden, frac["X"])
+    absmax = {k: float(v) for k, v in calib["absmax"].items()}
     return QuantModel(
         name=spec.name,
         repo_id=spec.repo_id,
@@ -228,6 +231,7 @@ def build_quant_model(
         norm_final=quantize_norm(load_final_norm(spec)),
         embed=quantize_linear(load_embedding(spec).astype(np.float64)),
         k_center=numerics.to_fixed(k_center, frac["QKV"]).astype(np.int32),
+        extra={"absmax": absmax},
     )
 
 

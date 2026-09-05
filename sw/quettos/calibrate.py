@@ -225,13 +225,25 @@ def int8_roundtrip(x: np.ndarray) -> np.ndarray:
     return q * scale
 
 
-def k_centering_gate(rec: CalibrationRecorder, centers: np.ndarray) -> dict[str, float]:
-    """Relative RMS error of ``q . k`` scores with int8 K, raw and centered."""
+def k_centering_gate(rec: CalibrationRecorder, centers: np.ndarray) -> dict[str, Any]:
+    """Score error of int8 K over the causal window, raw and centered, in two units.
+
+    ``rel_rms_error_*`` is ``rms(q.k_int8 - q.k) / rms(q.k)`` over all layers;
+    ``rms_error_log2_*`` and ``max_error_log2_*`` are the RMS and largest
+    absolute error of the log2-domain score ``q.k / sqrt(d) * log2(e)``, the
+    unit the softmax consumes (one unit halves a token's weight);
+    ``layer_rms_error_log2_centered`` gives that RMS per layer.
+    """
     spec = rec.spec
     h, kv, d = spec.heads, spec.kv_heads, spec.head_dim
     n_rep = h // kv
+    scale = float(LOG2E) / math.sqrt(d)
     err = {"raw": 0.0, "centered": 0.0}
+    err_max = {"raw": 0.0, "centered": 0.0}
+    layer_err = np.zeros(spec.layers, dtype=np.float64)
+    layer_count = np.zeros(spec.layers, dtype=np.int64)
     ref = 0.0
+    count = 0
     for s in range(len(rec.k_rope)):
         for layer in range(spec.layers):
             q = rec.q_rope[s][layer].astype(np.float64)
@@ -251,11 +263,22 @@ def k_centering_gate(rec: CalibrationRecorder, centers: np.ndarray) -> dict[str,
                 kh = np.repeat(np.transpose(kvar, (1, 0, 2)), n_rep, axis=0)  # [H, T, D]
                 scores[name] = (qh @ np.transpose(kh, (0, 2, 1)))[:, mask]
             ref += float(np.sum(scores["exact"] ** 2))
+            count += scores["exact"].size
             for name in ("raw", "centered"):
-                err[name] += float(np.sum((scores[name] - scores["exact"]) ** 2))
+                diff = scores[name] - scores["exact"]
+                err[name] += float(np.sum(diff**2))
+                err_max[name] = max(err_max[name], float(np.max(np.abs(diff))))
+            diff_c = scores["centered"] - scores["exact"]
+            layer_err[layer] += float(np.sum(diff_c**2))
+            layer_count[layer] += diff_c.size
     return {
         "rel_rms_error_raw": math.sqrt(err["raw"] / ref),
         "rel_rms_error_centered": math.sqrt(err["centered"] / ref),
+        "rms_error_log2_raw": math.sqrt(err["raw"] / count) * scale,
+        "rms_error_log2_centered": math.sqrt(err["centered"] / count) * scale,
+        "max_error_log2_raw": err_max["raw"] * scale,
+        "max_error_log2_centered": err_max["centered"] * scale,
+        "layer_rms_error_log2_centered": (np.sqrt(layer_err / layer_count) * scale).tolist(),
     }
 
 
@@ -373,7 +396,10 @@ def calibrate(spec: ModelSpec) -> dict[str, Any]:
         "k_center": centers.tolist(),
         "k_centering_gate": {
             "k_bits": K_CACHE_BITS,
-            "metric": "rms(q.k_int8 - q.k) / rms(q.k) over the causal window",
+            "metric": (
+                "rel: rms(q.k_int8 - q.k) / rms(q.k); log2: error of q.k / sqrt(d) * log2(e); "
+                "both over the causal window"
+            ),
             **k_centering_gate(rec, centers),
         },
         "v_scale_spread": v_scale_spread(rec),
@@ -390,9 +416,14 @@ def _round_floats(obj: Any) -> Any:
     return obj
 
 
+def canonical_json_text(obj: Any) -> str:
+    """Canonical JSON of a report: sorted keys, floats at six significant digits, newline."""
+    return json.dumps(_round_floats(obj), sort_keys=True, indent=1) + "\n"
+
+
 def calib_json_text(report: dict[str, Any]) -> str:
-    """Canonical text of a calibration report (sorted keys, six significant digits)."""
-    return json.dumps(_round_floats(report), sort_keys=True, indent=1) + "\n"
+    """Canonical text of a calibration report (:func:`canonical_json_text`)."""
+    return canonical_json_text(report)
 
 
 def calib_path(spec: ModelSpec) -> Path:

@@ -1,0 +1,61 @@
+{
+ "a_bits": 16,
+ "calib_tokens_sha256": "696c361a744cb7bdf36be38f8de8b3bf1b1d20ff834b802680e87aae5a1ba6ee",
+ "eos_ids": [
+  151645,
+  151643
+ ],
+ "format": "quettos-expected-tokens",
+ "max_new": 20,
+ "model": {
+  "layers": 24,
+  "name": "qwen2.5-0.5b-instruct",
+  "repo_id": "Qwen/Qwen2.5-0.5B-Instruct"
+ },
+ "numerics": 1,
+ "prompts": {
+  "prompts/chat_short.json": {
+   "generated_ids": [
+    785,
+    6722,
+    315,
+    9625,
+    374,
+    12095,
+    13,
+    151645
+   ],
+   "prompt_tokens": 36,
+   "sha256": "648383380ed47abdf263707ad806af8442ce2ac3fdc0b025364a8e4b35cc0fa3",
+   "text": "The capital of France is Paris.<|im_end|>"
+  },
+  "prompts/tool_call_weather.json": {
+   "generated_ids": [
+    151657,
+    198,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    69364,
+    497,
+    330,
+    16370,
+    788,
+    5212,
+    8926,
+    788,
+    330,
+    59604,
+    95642,
+    151658,
+    151645
+   ],
+   "prompt_tokens": 180,
+   "sha256": "0bd92fb2f46529357cce309d8ea910763d65d70c6f70da31a617ba5d855e515f",
+   "text": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|im_end|>"
+  }
+ },
+ "sha256_of": "json list of generated_ids without spaces"
+}

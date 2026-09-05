@@ -1,0 +1,60 @@
+{
+ "a_bits": 16,
+ "calib_tokens_sha256": "18052010bfee5b3382728050fd00ebdf677e61048bb8a40b1feed7441d1274ee",
+ "eos_ids": [
+  2
+ ],
+ "format": "quettos-expected-tokens",
+ "max_new": 20,
+ "model": {
+  "layers": 30,
+  "name": "smollm2-135m-instruct",
+  "repo_id": "HuggingFaceTB/SmolLM2-135M-Instruct"
+ },
+ "numerics": 1,
+ "prompts": {
+  "prompts/chat_short.json": {
+   "generated_ids": [
+    504,
+    3575,
+    282,
+    4649,
+    314,
+    7042,
+    30,
+    2
+   ],
+   "prompt_tokens": 37,
+   "sha256": "fa8f9203caefcf39e83cfa9393e858fb7d3170ae7236a8f4f581261ddf16cd84",
+   "text": "The capital of France is Paris.<|im_end|>"
+  },
+  "prompts/tool_call_weather.json": {
+   "generated_ids": [
+    38634,
+    28,
+    260,
+    4206,
+    282,
+    9017,
+    28,
+    314,
+    4112,
+    281,
+    260,
+    18867,
+    282,
+    253,
+    3953,
+    284,
+    8685,
+    4018,
+    3645,
+    30
+   ],
+   "prompt_tokens": 39,
+   "sha256": "a5e40799d884988e7a27580ec2a1eab624f2e8d991faa8ad7d7b8fa59182abb9",
+   "text": "Paris, the City of Light, is currently in the midst of a beautiful and vibrant summer season."
+  }
+ },
+ "sha256_of": "json list of generated_ids without spaces"
+}

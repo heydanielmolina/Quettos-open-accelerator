@@ -42,8 +42,11 @@ decode, a paged KV cache and constrained decoding on the
 
 ## Status
 
-**2026-09-02:** repo scaffold, Python model loader, Verilator speed
-probe. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next and
+**2026-09-04:** the integer numerics, lookup tables, calibration, int8
+quantizer and the bit-exact integer golden model are in place; both models
+generate text from integer arithmetic (`models/*/expected_tokens.json`), and
+`models/*/quality.json` holds the measured quality against fp32. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next and
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the speed-probe result and
 the locked demo configuration.
 
@@ -55,6 +58,12 @@ the locked demo configuration.
 make lint    # three-parser RTL lint (Verilator, Yosys, Icarus)
 make test    # uv run pytest -q sw/tests
 make probe   # Verilator speed probe (sim/probe)
+
+uv run quettos download qwen        # or smollm2; fetches the model from Hugging Face
+uv run quettos calibrate qwen       # activation ranges -> models/<name>/calib.json
+uv run quettos quantize qwen        # int8 weights + constants -> build/quant/<name>.npz
+uv run quettos golden qwen          # greedy generation on the integer golden model
+uv run quettos check qwen           # quality vs fp32 -> models/<name>/quality.json
 ```
 
 Requirements: Verilator 5.x, Yosys 0.65, Icarus Verilog 13, `uv` (Python 3.13

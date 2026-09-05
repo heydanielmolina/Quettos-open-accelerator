@@ -6,11 +6,12 @@
 HF fp32 (transformers, optional torch)      quality reference only
    |  top-1 / KL / PPL deltas, never bit-exact
    v
-golden.py         op-by-op integer forward, float64 BLAS for exact integer GEMV (partials < 2^53)
-   |  bit-exact
+golden.py         op-by-op integer forward, float64 BLAS for exact integer GEMV (partials < 2^53);
+   |              forward_tokens (teacher-forced, all positions) == step (one program at one
+   |  bit-exact   position) at every position; program.py supplies the requant constants
    v
-quality_model.py  batched teacher-forced twin of golden (asserted == golden on 64 tokens);
-   |              >= 32k WikiText-2 tokens in minutes
+quality.py        golden vs fp32 over the calibration set (uv run quettos check <alias>):
+   |              top-1, KL, delta-NLL +/- SE, PPL -> models/<name>/quality.json
    |
 isa_sim.py        executes decode.prog / prefill.prog on image.bin exactly as the RTL does
    |  bit-exact  (== golden on both models and random tiny shapes)
@@ -20,7 +21,7 @@ RTL (Verilator)   qcore_top, all three configurations
 
 "Bit-exact" always means RTL == isa_sim == golden, our own integer model. It
 never means "matches PyTorch". Quality relative to HF fp32 is a **measured
-delta**, reported with standard errors at the tested context lengths (<= 1024).
+delta**, reported with standard errors at the calibration-set lengths (up to 520 tokens).
 
 ## The eight layers
 
@@ -55,12 +56,16 @@ delta**, reported with standard errors at the tested context lengths (<= 1024).
    dump compared; determinism at `--lat 1 / 200`, `--bw-div 2`, `--threads 1
    vs 4`; WB=64 vs WB=128 identical tokens on a tiny shape and on
    SmolLM2; nightly `--x-initial unique`.
-6. **Quality (golden vs HF fp32, not RTL).** >= 32k WikiText-2 tokens in
-   1024-token windows; paired delta-NLL +/- SE, KL, top-1, PPL for fp32 / bf16 /
-   W8A16 / W8A8 on both models; first-divergence index on 5-10 greedy prompts;
-   a 10-20-prompt ChatML / tool-call set. CI gate on SmolLM2 (`KL <= 0.02
-   nats`, `top-1 >= 93%`); Qwen reported (expected `KL <= 0.03`, `top-1 >=
-   94%`). Saturation counters zero on every reported run.
+6. **Quality (golden vs fp32, not RTL).** `uv run quettos check <alias>`
+   scores the calibration set (1181 / 1314 tokens, 1175 / 1308 scored positions) teacher-forced: paired
+   delta-NLL +/- SE, KL, top-1 and PPL for W8A16 and W8A8 on both models,
+   written to `models/<name>/quality.json` and tabulated in `NUMERICS.md`.
+   CI gate on SmolLM2 W8A16 (`KL <= 0.02 nats`, `top-1 >= 93%`; measured
+   0.0046 and 95.66%); Qwen is reported (W8A16 measured `KL 0.0556`, `top-1
+   93.65%`, with the int8 K cache on layer 0 as the dominant term, see the
+   K-centering section of `NUMERICS.md`). Saturation and shift-error
+   counters are zero on every reported run. The table covers the calibration set; `docs/ROADMAP.md` lists the
+   longer WikiText-2 run.
 7. **Perf counters.** The harness asserts `busy = mac_active + stall_mem +
    stall_vpu + stall_kv + stall_seq + stall_drain`; byte counters are
    cross-checked against the C++ memory model; weight bytes/token ==
@@ -77,6 +82,10 @@ delta**, reported with standard errors at the tested context lengths (<= 1024).
 
 ## What is checked into `models/<model>/`
 
-`calib.json`, `layout.json`, `program.lst`, `expected_tokens.json`, sha256s.
-`image.bin` stays in the gitignored `build/`. A clean clone must reproduce the
-sha256s (checked on CI and on a second machine).
+`calib.json`, `quality.json` and `expected_tokens.json`. `expected_tokens.json` holds the golden model's greedy
+continuation of `prompts/chat_short.json` and `prompts/tool_call_weather.json`
+(20 tokens or until an end-of-sequence id) with the SHA-256 of each id list,
+written by `uv run quettos golden <alias> --write-expected` and reproduced by
+`sw/tests/test_golden.py`; the RTL and the ISA simulator must emit exactly
+these ids. `image.bin` stays in the gitignored `build/`. A clean clone must
+reproduce the sha256s (checked on CI and on a second machine).

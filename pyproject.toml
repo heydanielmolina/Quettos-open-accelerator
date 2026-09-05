@@ -45,6 +45,9 @@ python-preference = "only-managed"
 
 [tool.pytest.ini_options]
 testpaths = ["sw/tests"]
+markers = [
+    "slow: complete-model runs of several minutes (deselect with -m 'not slow')",
+]
 
 [tool.ruff]
 line-length = 100

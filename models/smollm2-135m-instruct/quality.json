@@ -1,0 +1,142 @@
+{
+ "calib_tokens_sha256": "18052010bfee5b3382728050fd00ebdf677e61048bb8a40b1feed7441d1274ee",
+ "format": "quettos-quality",
+ "model": {
+  "layers": 30,
+  "name": "smollm2-135m-instruct",
+  "repo_id": "HuggingFaceTB/SmolLM2-135M-Instruct"
+ },
+ "numerics": 1,
+ "protocol": {
+  "ids_sha256": "18052010bfee5b3382728050fd00ebdf677e61048bb8a40b1feed7441d1274ee",
+  "logits_frac": 16,
+  "reference": "quettos.reference_np.forward (float32) over the same token ids",
+  "scoring": "teacher-forced; every position with a next token is scored (T - 1 per sequence): top-1 is argmax(int) == argmax(fp32); KL is sum_v p_fp32 log(p_fp32 / p_int) in nats from float64 log-softmax; NLL is -log p(next token) under each model; delta-NLL is the mean of the per-token nll_int - nll_fp32 with its standard error std(ddof=1) / sqrt(tokens); PPL is exp(mean NLL)",
+  "sequences": [
+   37,
+   39,
+   520,
+   182,
+   200,
+   203
+  ],
+  "text": "calibration set of quettos.calibrate: the three prompt files under prompts/ and three prose passages, rendered through the model's chat template",
+  "tokens": 1175
+ },
+ "rows": {
+  "W8A16": {
+   "a_bits": 16,
+   "config": "W8A16",
+   "delta_nll": 0.0051745,
+   "delta_nll_se": 0.00280708,
+   "kl_mean": 0.00463724,
+   "nll_fp32": 3.5809,
+   "nll_int": 3.58608,
+   "ppl_fp32": 35.9059,
+   "ppl_int": 36.0922,
+   "sequences": [
+    {
+     "delta_nll": 0.0396737,
+     "kl_mean": 0.00694039,
+     "tokens": 36,
+     "top1_percent": 94.4444
+    },
+    {
+     "delta_nll": 0.0291639,
+     "kl_mean": 0.00679065,
+     "tokens": 38,
+     "top1_percent": 94.7368
+    },
+    {
+     "delta_nll": 0.000892995,
+     "kl_mean": 0.00396475,
+     "tokens": 519,
+     "top1_percent": 97.1098
+    },
+    {
+     "delta_nll": 0.00701506,
+     "kl_mean": 0.00483563,
+     "tokens": 181,
+     "top1_percent": 94.4751
+    },
+    {
+     "delta_nll": 0.00407343,
+     "kl_mean": 0.00512825,
+     "tokens": 199,
+     "top1_percent": 92.9648
+    },
+    {
+     "delta_nll": 0.00494924,
+     "kl_mean": 0.00488801,
+     "tokens": 202,
+     "top1_percent": 96.0396
+    }
+   ],
+   "stats": {
+    "clip": 169416,
+    "err_shift": 0,
+    "sat": 0
+   },
+   "tokens": 1175,
+   "top1_matches": 1124,
+   "top1_percent": 95.6596
+  },
+  "W8A8": {
+   "a_bits": 8,
+   "config": "W8A8",
+   "delta_nll": -0.0184743,
+   "delta_nll_se": 0.0101062,
+   "kl_mean": 0.0467538,
+   "nll_fp32": 3.5809,
+   "nll_int": 3.56243,
+   "ppl_fp32": 35.9059,
+   "ppl_int": 35.2487,
+   "sequences": [
+    {
+     "delta_nll": -0.145937,
+     "kl_mean": 0.10588,
+     "tokens": 36,
+     "top1_percent": 83.3333
+    },
+    {
+     "delta_nll": -0.17814,
+     "kl_mean": 0.0960124,
+     "tokens": 38,
+     "top1_percent": 84.2105
+    },
+    {
+     "delta_nll": -0.00396757,
+     "kl_mean": 0.0365147,
+     "tokens": 519,
+     "top1_percent": 89.5954
+    },
+    {
+     "delta_nll": -0.00942964,
+     "kl_mean": 0.0505342,
+     "tokens": 181,
+     "top1_percent": 83.4254
+    },
+    {
+     "delta_nll": -0.0257643,
+     "kl_mean": 0.0496279,
+     "tokens": 199,
+     "top1_percent": 84.9246
+    },
+    {
+     "delta_nll": -0.00391719,
+     "kl_mean": 0.0470384,
+     "tokens": 202,
+     "top1_percent": 87.6238
+    }
+   ],
+   "stats": {
+    "clip": 138576,
+    "err_shift": 0,
+    "sat": 0
+   },
+   "tokens": 1175,
+   "top1_matches": 1024,
+   "top1_percent": 87.1489
+  }
+ }
+}
