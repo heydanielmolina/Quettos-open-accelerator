@@ -1,25 +1,9 @@
-"""Chat-template rendering, tokenization and byte-level vocabulary export.
+"""Chat-template rendering, tokenization and the ``tokens.bin`` export.
 
-The RTL never sees text: the host feeds token ids in and prints the bytes of
-the ids that come out. This module is the whole text boundary:
-
-* :func:`render_chat` renders ``tokenizer_config.json``'s Jinja chat template
-  with an environment that mirrors ``transformers.apply_chat_template``
-  (``trim_blocks``/``lstrip_blocks`` on, ``loopcontrols`` extension,
-  non-strict undefined, ``raise_exception`` global and a ``tojson`` filter
-  with the same argument semantics, special-token names injected as globals).
-* :func:`encode` tokenizes with the ``tokenizers`` library and
-  ``add_special_tokens=False`` -- the template text already carries the
-  ChatML specials, exactly as ``apply_chat_template(tokenize=True)`` does.
-* :func:`token_bytes` / :func:`write_tokens_bin` export ``tokens.bin``: for
-  every id the raw byte string of that token (both models use byte-level BPE,
-  so vocab strings are translated back through the inverse of GPT-2's
-  ``bytes_to_unicode`` map; added/special tokens map to their literal UTF-8).
-  Format: ``u32 count`` then, per id, ``u16 length`` + ``bytes``
-  (little-endian).
-* :func:`detokenize` joins token bytes and decodes UTF-8 with replacement.
-* :func:`prompt_tokens` turns a ``prompts/*.json`` file into the id list the
-  harness prefills.
+Renders ``tokenizer_config.json``'s chat template with a transformers-compatible
+Jinja environment (including tools), encodes with the ``tokenizers`` library,
+and exports every token's raw bytes (inverse byte-level BPE map) so the C++
+harness can print text without Python.
 """
 
 from __future__ import annotations

@@ -1,16 +1,8 @@
-"""Numpy-only reader for ``.safetensors`` files, including bf16 tensors.
+"""Numpy-only reader for bf16 safetensors files.
 
-The official ``safetensors.numpy`` API cannot load ``BF16`` (numpy has no
-bfloat16 dtype), so this module parses the container itself: an 8-byte
-little-endian header length, a JSON header mapping tensor names to
-``{dtype, shape, data_offsets}``, then the raw byte buffer. bf16 payloads are
-read as ``uint16`` and shifted into the high half of a ``uint32`` which is
-then viewed as ``float32`` -- an exact conversion, since bf16 is the top 16
-bits of an IEEE float32.
-
-Every tensor is returned as ``float32`` regardless of its stored dtype so the
-quantizer downstream has one code path. The file is memory-mapped, so
-iterating a 1 GB checkpoint does not load it all at once.
+Parses the header and reinterprets the bf16 payload as float32 by shifting into
+the high half of a uint32; tensors are memory-mapped so iterating a large
+checkpoint does not load it all at once.
 """
 
 from __future__ import annotations

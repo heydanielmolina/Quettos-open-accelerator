@@ -22,7 +22,7 @@ SmolLM2-135M-Instruct: ~136 MB of weights + 26.5 MB KV at MAX_CTX 2048 (30
 layers x 3 kv heads).
 
 Bytes streamed per decode token (weights + meta + gammas; from the model
-shapes, not yet measured on RTL): Qwen 497,697,536 B = 7,776,524 beats at 64 B;
+shapes, an analytical figure until `make perf` measures it): Qwen 497,697,536 B = 7,776,524 beats at 64 B;
 SmolLM2 136,187,520 B = 2,127,930 beats. The LM head is 136,134,656 of Qwen's
 493,961,216 linear MACs (27.6%), which is what `prefill.prog` skips.
 

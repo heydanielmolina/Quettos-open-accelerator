@@ -1,5 +1,5 @@
 # Quettos Core CI. Only lint-and-pytest is active so far. The other jobs are
-# skeletons that turn on as the corresponding day's deliverable lands
+# skeletons that turn on as the corresponding component lands
 # (see docs/ROADMAP.md and docs/VERIFICATION.md layer 8).
 #
 # Action versions were checked against the upstream repos on 2026-09-02:
@@ -53,13 +53,13 @@ jobs:
       - name: Lint (three parsers + forbidden-construct greps)
         run: make lint
 
-      - name: Sync Python environment (core deps only, no torch)
-        run: uv sync --frozen
+      - name: Sync Python environment (core + dev groups, no torch)
+        run: uv sync --frozen --group dev
 
       - name: pytest
         run: uv run pytest -q sw/tests
 
-  # --- not yet enabled: cocotb unit tests on the tiny config (WB=16, B_MAX=2, VL=2) ---
+  # --- disabled until the cocotb tests exist: cocotb unit tests on the tiny config (WB=16, B_MAX=2, VL=2) ---
   # cocotb-units:
   #   runs-on: ubuntu-latest
   #   timeout-minutes: 30
@@ -77,7 +77,7 @@ jobs:
   #     - run: uv sync --frozen --group dev
   #     - run: uv run pytest -q sim/cocotb -x
 
-  # --- not yet enabled: tiny-shape RTL vs isa_sim end-to-end (-CFLAGS -O1 + ccache) ---
+  # --- disabled until the RTL and ISA simulator exist: tiny-shape RTL vs isa_sim end-to-end (-CFLAGS -O1 + ccache) ---
   # e2e-tiny:
   #   runs-on: ubuntu-latest
   #   timeout-minutes: 30
@@ -100,7 +100,7 @@ jobs:
   #     # SmolLM2 8+4 e2e on WB=64 lives here too unless it exceeds 15 min on
   #     # first measurement, in which case it moves to nightly.yml.
 
-  # --- not yet enabled: per-block synth_xilinx stat with DSP/BRAM band checks ---
+  # --- disabled until the RTL exists: per-block synth_xilinx stat with DSP/BRAM band checks ---
   # synth-xc7:
   #   runs-on: ubuntu-latest
   #   timeout-minutes: 30

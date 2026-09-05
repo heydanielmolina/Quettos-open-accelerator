@@ -26,6 +26,7 @@ ref = [
 ]
 # Hardware verification and lint helpers.
 dev = [
+    "mpmath>=1.3",      # exact table generation (quettos.lutgen)
     "cocotb>=2.1",
     "yowasp-nextpnr-ecp5",
     "ruff",

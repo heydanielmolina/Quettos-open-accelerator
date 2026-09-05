@@ -1,13 +1,8 @@
-"""``quettos`` command-line entry point.
+"""Command-line entry point: ``quettos <command>``.
 
-Subcommands::
-
-    quettos download <alias|repo>              fetch a model, print its ModelSpec as JSON
-    quettos tokens <alias|repo> <prompt.json>  render the chat template, print ids and count
-    quettos export-tokens-bin <alias|repo> <out>   write the id -> raw bytes table
-
-Later days add ``quantize``, ``compile``, ``golden``, ``run``, ``check``,
-``perf``, ``synth-report`` and ``demo`` here.
+Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
+``quantize``.  The remaining commands of the stack register here as they land
+(see ``docs/ROADMAP.md``).
 """
 
 from __future__ import annotations
@@ -19,6 +14,65 @@ from collections.abc import Sequence
 
 from quettos.model import load_spec
 from quettos.tokenizer_io import prompt_tokens, render_prompt, write_tokens_bin
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    import time
+
+    from quettos import calibrate
+
+    spec = load_spec(args.model)
+    t0 = time.perf_counter()
+    path, report = calibrate.write_calib(spec, args.out)
+    elapsed = time.perf_counter() - t0
+    summary = {
+        "model": spec.repo_id,
+        "out": str(path),
+        "bytes": path.stat().st_size,
+        "tokens": report["tokens"]["count"],
+        "tokens_sha256": report["tokens"]["sha256"],
+        "absmax": {k: float(f"{v:.6g}") for k, v in report["absmax"].items()},
+        "frac": report["frac"],
+        "k_centering_gate": {
+            k: float(f"{v:.6g}")
+            for k, v in report["k_centering_gate"].items()
+            if isinstance(v, float)
+        },
+        "v_scale_spread": {k: report["v_scale_spread"][k] for k in ("p50", "p99", "max")},
+        "seconds": round(elapsed, 2),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_quantize(args: argparse.Namespace) -> int:
+    import time
+
+    from quettos import calibrate, quantize
+
+    spec = load_spec(args.model)
+    calib_path = calibrate.calib_path(spec) if args.calib is None else args.calib
+    t0 = time.perf_counter()
+    model = quantize.build_quant_model(spec, calib_path, layers=args.layers)
+    t1 = time.perf_counter()
+    path = quantize.save(model, args.out)
+    t2 = time.perf_counter()
+    summary = {
+        "model": spec.repo_id,
+        "calib": str(calib_path),
+        "out": str(path),
+        "bytes": path.stat().st_size,
+        "layers": model.n_layers,
+        "weight_bytes": quantize.weight_bytes(model),
+        "frac": model.frac,
+        "eps_c": model.eps_c,
+        "sqrt_d": {"m": model.sqrt_d.m, "e": model.sqrt_d.e},
+        "log2e_over_8": {"m": model.log2e_over_8.m, "e": model.log2e_over_8.e},
+        "build_seconds": round(t1 - t0, 2),
+        "save_seconds": round(t2 - t1, 2),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def _cmd_download(args: argparse.Namespace) -> int:
@@ -63,6 +117,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
     p.add_argument("out", help="output path")
     p.set_defaults(func=_cmd_export_tokens_bin)
+
+    p = sub.add_parser("calibrate", help="measure activation ranges and write calib.json")
+    p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
+    p.add_argument("--out", default=None, help="output path (default models/<name>/calib.json)")
+    p.set_defaults(func=_cmd_calibrate)
+
+    p = sub.add_parser("quantize", help="quantize weights to int8 and write build/quant/<name>.npz")
+    p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
+    p.add_argument("--calib", default=None, help="calib.json to use (default models/<name>/)")
+    p.add_argument("--out", default=None, help="output .npz path (default build/quant/<name>.npz)")
+    p.add_argument("--layers", type=int, default=None, help="keep only the first N layers")
+    p.set_defaults(func=_cmd_quantize)
     return parser
 
 

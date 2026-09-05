@@ -44,7 +44,8 @@ choice.
   a real tok/s line; WASM build of the same Verilator model for an in-browser
   demo.
 - **v1.2**: paged KV with block tables (prefix sharing in hardware addressing),
-  flash-style online softmax, on-chip K^T tile assembly buffer.
+  flash-style online softmax, wider attention weights for long contexts, on-chip
+  K^T tile assembly buffer.
 - **v1.3**: speculative-decode verify rows, grammar-mask port on the sampler,
   deterministic integer sampling in the bit-exact contract.
 - **v1.4**: W4 with block-32 sub-scales (if 0.5B quality holds), SmoothQuant if

@@ -84,7 +84,7 @@ Block labels inside the box are the `qcore_*` modules with the prefix dropped
 for width (`vpu_top` = `qcore_vpu_top`, `mem_arb` = `qcore_mem_arb`, `requant`
 = `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on).
 
-Module list and responsibilities (all `rtl/qcore_*.sv`; LOC are **estimates**):
+Module list and responsibilities (all `rtl/qcore_*.sv`):
 
 | Module | Purpose |
 |---|---|
@@ -110,8 +110,8 @@ The host writes `TOK`, `POS`, `ROW_EN`, pulses `START`; the program runs to
 `HALT`. Everything position-dependent is derived in hardware from `POS`.
 
 1. **EMBED**: gather 896 int8 bytes of row `TOK` from the tiled tied table
-   (896 strided beats); `SREG <- row scale`; dequant through requant
-   (`acc = q << 24`, the compiler subtracts 24 in `sbias`) -> residual `X`
+   (896 strided beats); the row scale is `Sw`, `Sx = 1.0`; dequant through
+   requant (`acc = q << 24`, the compiler adds 24 to `sbias`) -> residual `X`
    (int32, `FRAC_X`).
 2. **Per layer**: `VRMSNORM(X, gamma_in)` -> `VQUANT` (int16 per-token) ->
    `GEMV(Wqkv, 18 tiles x 896 beats, meta {Sw, bias})` -> `QKV`. `VROPE` (14 q +

@@ -36,3 +36,6 @@ __pycache__/
 # editor settings
 .vscode/
 .idea/
+
+# Claude Code project settings (local tooling)
+.claude/

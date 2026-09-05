@@ -1,178 +1,421 @@
 # Numerics
 
-Single source of truth: `sw/quettos/numerics.py`. The RTL knows no fixed-point
-format; every shift, exponent and constant is a compiler value in a descriptor
-field. `golden.py`, `quality_model.py`, `isa_sim.py`, `lutgen.py` and the
-cocotb tests all import the same primitives.
+Single source of truth: `sw/quettos/numerics.py`. Every integer operation the
+RTL performs is defined there once, in plain Python integers and numpy `int64`
+arrays; every consumer of these numbers (the table generator `lutgen.py`, the
+quantizer `quantize.py` and the hardware unit tests) imports the same
+functions, and the RTL mirrors them bit for bit. The RTL knows no fixed-point
+format: every shift, exponent and constant is a compiler value in a descriptor
+field. This document restates that module; where the two disagree, the module
+is right and this file needs fixing.
 
-Status: this is the specification. **Measured maxima and the frozen per-class
-formats are TBD** until calibration freezes the numerics. Where a value is expected rather
-than measured it is marked **estimate**.
+Everything below is a definition from `numerics.py`, a value measured by a
+command in this repository (`uv run quettos calibrate <alias>`,
+`uv run pytest -q sw/tests`), or, in the last section only, an **estimate**
+that `uv run quettos check` replaces.
 
 ## Primitives
 
-- `round_shift(x, s) = (x + (1 << (s-1))) >>> s` for `s >= 1`, `x` for `s = 0`
-  (round half toward +inf, arithmetic shift).
-- `sat_N(x)` saturates to signed N bits.
+- `round_shift(x, s) = (x + (1 << (s-1))) >> s` for `1 <= s <= 63`, `x` for
+  `s = 0` (round half toward +inf, arithmetic shift). It is the only rounding
+  operation in the datapath; `s = 63` is the top of the requant clamp range.
+- `sat_N(x)` saturates to signed N bits. Every saturation is counted
+  (`Stats.sat` in software, the `SAT_*` CSRs in hardware) so the golden model
+  and the RTL counters can be compared.
+- `Stats` holds three counters: `sat` (sat40/sat32 events), `err_shift`
+  (a requant stage-2 shift outside `[0, 63]`; must stay 0 on a correct
+  program) and `clip` (VQUANT clips at `+-(2^(w-1) - 1)` and the softmax weight
+  clip at 32767; expected, not a fault).
+- Vectors are `int64` arrays, scalars are Python ints; every intermediate
+  product fits in 63 bits by construction (see the width notes below).
 - All RTL intermediates are `logic signed`; every operand is wrapped in
   `$signed()`; u16 mantissas are handled as 17-bit signed.
 
 ## sfloat
 
-`sfloat = { u16 m in [2^15, 2^16), i8 e }`, value `m * 2^e`. Canonical zero is
-`{m = 0, e = 0}`.
+`sfloat = { u16 m in [2^15, 2^16), signed e }`, value `m * 2^e`. The canonical
+zero is `{m = 0, e = 0}` and is the only encoding with `m` outside the mantissa
+range. Weight meta stores `e` as an `i8`.
 
-`sfloat_mul(a, b)`: `p = m_a * m_b`; `m = round_shift(p, 16)`; if `m >= 2^16`:
-`m >>= 1, e += 1`; elif `m < 2^15`: `m <<= 1, e -= 1`; `e += e_a + e_b + 16`.
-Property-tested: `m` in range for all pairs.
+- `sfloat_from_int(a, e)`: exact when `a` has at most 16 significant bits
+  (`{a << (16 - bitlen(a)), e + bitlen(a) - 16}`); otherwise
+  `m = round_shift(a, bitlen(a) - 16)` with a `2^16` rounding overflow folded
+  into the exponent (`{2^15, e + 1}`).
+- `sfloat_from_float(x)` (offline only: weight scales, constants):
+  `x = f * 2^k` with `f` in `[0.5, 1)` from `math.frexp`,
+  `m = floor(f * 2^16 + 0.5)`, `e = k - 16`, same overflow fold. Deterministic
+  across platforms because `frexp` is exact.
+- `sfloat_mul(a, b)`: `p = m_a * m_b` lies in `[2^30, 2^32)`. If `p >= 2^31`:
+  `m = round_shift(p, 16)`, `e = e_a + e_b + 16`; otherwise
+  `m = round_shift(p, 15)`, `e = e_a + e_b + 15`. A rounding overflow to `2^16`
+  becomes `{2^15, e + 1}`. Zero times anything is the canonical zero. There is
+  one rounding, so the result is the correctly rounded (half-up) product;
+  property-tested against exact rationals on every edge-mantissa/exponent
+  combination and on 200k random pairs.
 
 ## Weights
 
-int8 symmetric round-to-nearest per output channel, `Sw = absmax / 127`, RNE in
-float64 offline; tiled `[N/WB][K][WB]`; zero-padded partial tiles allowed.
-Per-channel meta 8 B little-endian `{i32 bias_q, u16 Sw_m, i8 Sw_e, u8 pad=0}`
-(`bias_q` in the `FRAC_QKV` domain for QKV; o_proj carries the folded V bias;
-else 0). No block scales in v1. SmoothQuant OFF by default (export flag exists
-for ablation).
+int8 symmetric per output channel, rounded half up in float64 offline
+(`quantize_rows_int8`): for each row `Sw = sfloat_from_float(absmax / 127)` is
+encoded first, then `q = round_half_up(w / Sw)` clipped to `[-127, 127]`, so
+the dequantized scale is exactly the one the hardware uses. An all-zero row
+gets `q = 0` and the zero scale. Rows are grouped the way the programs stream
+them: `wqkv = [q; k; v]`, `wgu = [gate; up]`, `wo`, `wdown`, and the tied
+embedding / LM-head table row by row. Tiled `[N/WB][K][WB]`; zero-padded
+partial tiles allowed. Per-channel meta is 8 B little-endian
+`{i32 bias_q, u16 Sw_m, i8 Sw_e, u8 pad = 0}`. No block scales, no
+SmoothQuant.
 
-## Activations into GEMV
+- `bias_q`: `to_fixed(bias, FRAC_QKV)` (round half up, saturating to int32)
+  for the Q and K rows of `wqkv`; 0 for the V rows.
+  `wo.bias_q = to_fixed(W_o @ tile(b_v), FRAC_X)` carries the V bias folded
+  into `o_proj`, where `tile` repeats each KV head's bias over the query heads
+  it serves; softmax weights sum to one, so
+  `sum_t p_t (v_t + b_v) = sum_t p_t v_t + b_v` and the fold is exact. Every
+  `bias_q` is 0 on models without QKV biases (SmolLM2).
+- RMSNorm gamma: int16 with one per-tensor exponent `e <= 0`
+  (`quantize_gamma`: the smallest `e` such that `max |q| <= 32767`,
+  `q = floor(gamma / 2^e + 0.5)`; values above 32767 have no encoding and are
+  rejected).
+- K-centering rows: int32 in `FRAC_QKV` (`to_fixed`).
+- Constants: `eps_c = round(eps * d * 2^(2 FRAC_X))` (Qwen `3848291`, SmolLM2
+  `1546188`); `sqrt_d = sfloat_from_float(sqrt(d))` (Qwen `{61303, -11}`,
+  SmolLM2 `{49152, -11}`); `log2(e)/8 = {47274, -18}`.
 
-int16 symmetric per-token dynamic (**W8A16 default**; the lane is 8w x 16a so
-this costs nothing). `VQUANT`: `a` = tracked absmax or own pass; `a_hi` = top 16
-bits after LOD; `inv = recip_LUT` rounded toward zero so `|q| <= 32767` always;
-`q = sat16(round_shift(x * inv, shift(e)))`;
-`Sx = sfloat_mul(sfloat_norm(a), C_INV_32767)`, optionally `sfloat_mul`'ed by a
-descriptor constant (`log2e/8` for q). Zero vector: `Sx = 0, q = 0`. int8 mode
-only for K/V into the cache and the W8A8 ablation.
+`uv run quettos quantize <alias>` writes all of this to
+`build/quant/<name>.npz` (int8/int16/int32 arrays plus a JSON manifest); the
+tests check every integer against the `numerics.py` primitive that defines it.
+
+## Activations into GEMV (VQUANT)
+
+int16 symmetric per token, dynamic (**W8A16 default**; the lane is 8w x 16a so
+the wide activation costs nothing). int8 only for K and V into the cache and
+for the W8A8 ablation. `quant(x, w, FRAC_in)` with `w` in `{8, 16}`:
+
+```
+a     = absmax(x)                       # or the absmax tracked by the producing op
+a_eff = a + (a >> (w-1)) + 1            # the absmax element maps to 2^(w-1) - 1, not 2^(w-1)
+a_eff = a_hi * 2^e_a,  a_hi in [2^15, 2^16),  e_a = bitlen(a_eff) - 16  (negative: shifted left)
+Sx    = {a_hi, e_a - (w-1) - FRAC_in}   # a_eff / 2^(w-1) in real units, exact in sfloat
+inv   = recip_q15(a_hi)                 # 1/m in Q1.15, m = a_hi / 2^15
+q     = round_shift(x * inv, 31 + e_a - w)
+q     = clip(q, -(2^(w-1) - 1), 2^(w-1) - 1)   # counted in `clip`, not a fault
+```
+
+since `x * 2^(w-1) / a_eff = x * inv * 2^-(31 + e_a - w)`. Using `a_eff` gives
+the same `2^(w-1) - 1` levels as an `absmax / (2^(w-1) - 1)` scale without a
+division, and the `+ 1` keeps the rounding of the absmax element below the
+half-way point for every `a`. The clip is reachable only at the absmax element
+and only through the reciprocal table's error: never for `w = 8`; for `w = 16`
+the table's ~1 LSB error spans the two-level margin, so roughly one vector in
+four clips its absmax element by one level (harmless, counted in `clip`; a
+non-zero clip counter is the normal state). A zero vector gives `q = 0` and
+the zero scale. A descriptor sfloat constant (`log2(e)/8` for q) multiplies
+the scale through `sfloat_mul`. `quant_groups` applies the same per group of
+64 elements (per head) for q, K and V. Widths: `x` int32, `inv` 16 bits,
+product 47 bits.
 
 ## Accumulator
 
-40-bit signed (`ACC_W` parameter). 8x16 product is 24 b; `K <= 4864` int16
-needs <= 35 b; PV over 8192 tokens needs 36 b.
+40-bit signed (`ACC_W` parameter). An 8x16 product is 24 b; `K <= 4864` int16
+needs 36 b; PV over 8192 tokens needs 36 b.
 
 ## Requant (1 output per cycle)
 
+The real value of an accumulator is `acc * Sw * Sx`; the output class has
+`FRAC_out` fraction bits and the compiler sets `sbias = -(FRAC_out + s1)`
+(plus 24 for EMBED, below):
+
 ```
-t = sat40(round_shift(acc * Sw_m, s1))        s1 = descriptor sh0 (default 16; compiler lowers it to keep S >= 0)
-y = sat32(round_shift(t * Sx_m, S))           S  = sbias - (Sw_e + Sx_e), sbias = descriptor sh1
+t = sat40(round_shift(acc * Sw_m, s1))     s1 = descriptor sh0
+S = sbias - (Sw_e + Sx_e)                  sbias = descriptor sh1; hardware clamps S to [0, 63] and counts ERR_SHIFT
+y = sat32(round_shift(t * Sx_m, S))
+y = sat32(y + bias_q)
+y = sat32(y + old)                         only with the accumulate flag (fused residual add)
 ```
 
-Hardware clamps `S` to `[0, 63]` and counts any clamp in `ERR_SHIFT` (must be
-0; the compiler proves the S range statically). If meta `m == 0` (padded
-channel or token): output 0, no shift, no ERR/SAT count. Then
-`y = sat32(y + bias_q)`; if `accumulate`: `y = sat32(y + old)`. Saturations are
-counted in `SAT_REQ`.
+`ERR_SHIFT` must be 0: the compiler proves the `S` range statically with
+`requant_shift(Sw, Sx, sbias) = sbias - (Sw_e + Sx_e)`. If either scale is the
+canonical zero (padded channel or padded token) the dequantized term is
+exactly 0 with no shift and no ERR/SAT event; the bias and accumulate adds
+still apply. Saturations are counted in `SAT_REQ`. Widths: `acc` 40 bits,
+mantissas 16 bits, both products 56 bits.
+
+Stage-1 rule (`choose_s1(acc_bits, FRAC_out, Sw_e_max, Sx_e_max)`, with
+`acc_bits` the signed width of the accumulator values the GEMV can produce):
+`t` must fit 40 bits, so `s1 >= acc_bits + 16 - 40`; stage-1 rounding
+contributes `0.5 * Sx_m * 2^-S` output LSBs, so the smallest reachable `S`
+should stay at or above 16 (`<= 0.5` LSB). `S` is smallest at the largest
+reachable exponents, hence `s1 <= -(FRAC_out + Sw_e_max + Sx_e_max) - 16`. The
+rule returns the largest `s1 <= 16` that meets the 40-bit bound and, when
+feasible, the precision bound; the compiler checks the `[0, 63]` window with
+`requant_shift` at the smallest reachable exponents. When both bounds hold the
+output is within one LSB of the exact value (worst case
+`0.5 + 0.5 * Sx_m * 2^-16`, property-tested).
+
+EMBED dequantizes an int8 embedding row into `FRAC_X` through the same pipe:
+`acc = q << 24`, `Sx = 1.0 = {2^15, -15}`, `sbias = -(FRAC_X + s1) + 24`, with
+`8 <= s1 <= 24` so the shifted product fits 40 bits and drops only zero bits;
+the result is a single rounding of `q * Sw * 2^FRAC_X`.
 
 ## Per-tensor-class formats
 
 `FRAC_X, FRAC_QKV, FRAC_S, FRAC_GU, FRAC_H, FRAC_CTX` are chosen by
-`quantize.py` from calibration maxima with >= 2 bits of headroom over ~1k
-tokens (including ChatML specials, `<tools>` JSON, newlines, the first token),
-written into descriptor shifts, and published here.
+`uv run quettos calibrate <alias>` from the float32 reference forward
+(`reference_np.py`) over a calibration set of about a thousand tokens and
+written to `models/<name>/calib.json`, which the quantizer reads. The rule is
+`FRAC = min(16, 29 - ceil(log2(absmax)))`, which leaves at least two bits of
+headroom in an int32 (`2^(31 - FRAC) >= 4 * absmax`). `FRAC_X` covers the
+residual stream and the RMSNorm outputs (class `XN`) together because the norm
+writes back into the residual class; `FRAC_S` is sized from the centered scores
+`q . (k - c)` that the hardware holds after K-centering (the raw `q . k` maximum
+is recorded for reference, and on Qwen it is almost entirely the constant
+`q . c` term), must come out at 16 (the softmax consumes a 16-bit fraction) and
+calibration fails otherwise; `FRAC_QKV` also covers the centered K vectors;
+logits are fixed at 16. The quantizer also requires `FRAC_GU >= 13` (sigmoid table index) and
+`FRAC_H <= 2 FRAC_GU` (SiLU shift).
 
-| Class | Qwen2.5-0.5B-Instruct | SmolLM2-135M-Instruct | Calibration absmax |
-|---|---|---|---|
-| `FRAC_X` | TBD | TBD | measured maxima: TBD |
-| `FRAC_QKV` | TBD | TBD | measured maxima: TBD |
-| `FRAC_S` | TBD | TBD | measured maxima: TBD |
-| `FRAC_GU` | TBD | TBD | measured maxima: TBD |
-| `FRAC_H` | TBD | TBD | measured maxima: TBD |
-| `FRAC_CTX` | TBD | TBD | measured maxima: TBD |
-| logits | 16 (fixed) | 16 (fixed) | n/a |
+The calibration set is the three prompt files under `prompts/` plus three
+passages of plain prose rendered through the model's chat template, so ChatML
+specials, a `<tools>` JSON block, newlines and a first token are all present:
+1314 tokens in 6 sequences for Qwen, 1181 for SmolLM2 (the SHA-256 of the id
+lists is recorded in `calib.json`). Measured maxima (largest |value| over all
+tokens and layers, in real units) and the resulting formats:
+
+| Class | Qwen2.5-0.5B-Instruct | SmolLM2-135M-Instruct |
+|---|---|---|
+| `FRAC_X` (residual `X`, norm output `XN`) | 16 (`X` 1710.84, `XN` 336.443) | 14 (`X` 25982.0, `XN` 47.5371) |
+| `FRAC_QKV` (Q/K/V after projection, bias and RoPE; centered K 57.68 / 15.46) | 16 (221.359) | 16 (22.1061) |
+| `FRAC_S` (log2-domain scores of centered K, `q . (k - c)`) | 16 (90.1764; raw `q . k` 2466.37) | 16 (54.5107; raw 88.3937) |
+| `FRAC_GU` (gate, up) | 16 (101.81) | 16 (78.5393) |
+| `FRAC_H` (`silu(gate) * up`) | 16 (1817.01) | 16 (3164.41) |
+| `FRAC_CTX` (attention output before `o_proj`) | 16 (12.9361) | 16 (9.30108) |
+| logits | 16 (31.17) | 16 (42.4522) |
+
+The residual maxima come from a few outlier channels: on Qwen the per-layer
+`X` maximum jumps from 6.8 to 827 at layer 2 and stays near 1700 through layer
+21 before falling to 69 and 89 in the last two layers; on SmolLM2 it jumps from
+384 to 25982 at layer 11 and stays there through layer 28 (10067 at the last
+layer). `FRAC_X = 14` on SmolLM2 therefore keeps 2.3 bits of headroom, the
+tightest class of either model; every other class keeps 3.4 bits or more. The
+embedding rows are small (absmax 0.116 on Qwen, 1.078 on SmolLM2) and are
+dequantized into `FRAC_X` by EMBED.
 
 Runtime counters `SAT_REQ`, `SAT_VPU`, `ERR_SHIFT`, `ERR_BOUNDS` are printed
 per run; `make demo` fails on any non-zero counter unless `--allow-sat`.
-`SAT_VPU` counts only saturations outside VQUANT's expected clip.
+`SAT_VPU` counts saturations; the VQUANT and softmax clips are counted separately as clips.
 
-## RMSNorm
+## RMSNorm (VRMSNORM)
 
-`amax -> sh = max(0, bitlen(amax) - 15)`; `ss = sum((x >> sh)^2)` (48-bit);
-`ss' = ss + (eps_c >> 2sh)`, `eps_c = round(eps * d * 2^(2*FRAC_X))` from
-`imm32`; LOD -> `m in [1, 4)` as two 256-entry segments (exponent parity);
-`R = rsqrt_LUT(m)` (u16 Q1.15); `Rc = sfloat_mul(R, sqrt(d) constant)`;
-`xhat = round_shift(x * Rc_m, S1)`; `y = sat32(round_shift(xhat * gamma[j], G))`,
-gamma int16 with a per-tensor exponent; absmax tracked into SREG.
-
-## RoPE
-
-cos/sin int16 Q1.14 `table[pos][32 pairs]`, rotate_half convention:
+Input and output are int32 of class `FRAC_X`; `gamma_q` is int16 with a
+per-tensor exponent `gamma_e <= 0`; `eps_c` (`imm32`) and `sqrt_d` (an sfloat)
+are descriptor constants.
 
 ```
-q'_i      = sat32(round_shift(q_i * cos_i - q_{i+32} * sin_i, 14))
-q'_{i+32} = sat32(round_shift(q_{i+32} * cos_i + q_i * sin_i, 14))
+amax = absmax(x);  sh = max(0, bitlen(amax) - 15)
+ss   = sum((x >> sh)^2)                               # <= 48 bits
+ss'  = ss + (eps_c >> 2 sh)                           # (mean(x^2) + eps) * d * 2^(2 FRAC_X - 2 sh)
+ss'  = m * 2^(2e), m in [1, 4):  L = bitlen(ss'); 2e = L-1 if L odd else L-2
+R    = rsqrt_q15(m)                                   # m as Q2.16 in [2^16, 2^18); 1/sqrt(m) in Q1.15
+Rc   = sfloat_mul(sfloat_from_int(R, -15), sqrt_d)    # sqrt(d)/sqrt(m); R is normalized first
+xhat = round_shift(x * Rc_m, S1),  S1 = -(Rc_e + FRAC_X - sh - e)
+y    = sat32(round_shift(xhat * gamma_q, G)),  G = -gamma_e
 ```
 
-The table is generated once by `lutgen.py` with exact angle reduction (mpmath,
-or exactly reduced `math`), checked in as `rope_theta1e6_2048.npy` and
-`rope_theta1e5_2048.npy` (256 KB each); compiler, golden and isa_sim load the
-checked-in file; sha256 recorded in `layout.json`.
+because `rsqrt(mean(x^2) + eps) = sqrt(d) * 2^(FRAC_X - sh - e) * R * 2^-15`.
+`ss' = 0` gives an all-zero output. `S1` is non-negative whenever
+`eps_c >= 2^(2 (FRAC_X + e_d))` with `e_d = floor(log2 sqrt(d)) - 15` (`2^10`
+for `FRAC_X = 16` and `512 <= d < 1024`; both models use `eps_c > 1.5e6`); a
+program that still produces `S1 < 0` gets the shift clamped to 0 and counted
+in `ERR_SHIFT`. `|xhat| <= sqrt(d) * 2^FRAC_X * (1 + 2^-13)`, 21 bits at
+`d = 896`. The output absmax is tracked for the VQUANT that follows. Measured against a float64 reference over 240 random
+vectors (d = 896 and 576, `FRAC_X` 14 and 16, scales from 0.01 to 8000, single
+outlier channels): worst relative error `0.23 * 2^-12` (test bound `2^-12`).
 
-## K-centering
+## RoPE (VROPE)
 
-`k' = k - c[layer][kvh]` (`VSUBC`, `c` = mean post-RoPE k over calibration
-tokens). Exact for softmax since `q . c` is constant over `t`; conditions int8
-K against Qwen's large k_proj biases. **Calibration gate**: int8 K vs fp K on 2k
-tokens; RTL-free fallback = two K=32 half-dot GEMVs with separate per-token
-scale arrays (accumulate flag). Result: TBD.
+cos/sin are int16 Q1.14 in `table[pos][2][32]` (index 0 cos, index 1 sin) for
+`head_dim = 64`, rotate_half convention; for each head and `i < 32`, with
+`a = x[i]` and `b = x[i + 32]`:
+
+```
+a' = sat32(round_shift(a * cos_i - b * sin_i, 14))
+b' = sat32(round_shift(b * cos_i + a * sin_i, 14))
+```
+
+`lutgen.py` generates the tables with mpmath at 128-bit precision
+(`inv_freq_i = theta^(-2i/64)`, `angle = pos * inv_freq_i`, rounded half up),
+checked in as `sw/quettos/tables/rope_theta1e6_2048.npy` (Qwen) and
+`rope_theta1e5_2048.npy` (SmolLM2), 256 KB each, positions `0..2047`. Every
+entry equals float64 `floor(cos(angle) * 2^14 + 0.5)` exactly, and the
+float32 `cos`/`sin` of the reference forward agree with the table within 2 LSB
+at every position.
+
+## K-centering (VSUBC)
+
+`k' = sat32(k - c[layer][kvh])`, with `c` the mean post-RoPE K vector per
+(layer, KV head) over the calibration tokens, stored as int32 in `FRAC_QKV`.
+Exact for the softmax since `q . c` is constant over `t`; it conditions the
+int8 K cache against Qwen's large `k_proj` biases.
+
+Gate (`k_centering_gate` in `calib.json`): post-RoPE K quantized to int8 per
+(token, KV head) with an `absmax/127` scale, and the RMS error of the resulting
+`q . k` scores over the causal window divided by the RMS of the exact scores:
+
+| Model | int8 K, raw | int8 K, centered |
+|---|---|---|
+| Qwen2.5-0.5B-Instruct | 0.503% | 0.149% |
+| SmolLM2-135M-Instruct | 0.780% | 0.306% |
+
+Centering is enabled for both models.
 
 ## KV cache
 
 K int8 per (token, kv head) + sfloat scale, transposed in 64-token tiles; V
-int8 (`v_raw`) per (token, kv head) + scale, row-major; 8 B meta each. The
-compiler writes zero K/V meta for the whole `MAX_CTX` range into `image.bin`;
-the harness zero-fills the KV region at sequence start and before prefix
-restore; `compare.py` masks score elements `>= len`.
+int8 (`v_raw`, without its bias) per (token, kv head) + scale, row-major; 8 B
+meta each. The compiler writes zero K/V meta for the whole `MAX_CTX` range into
+`image.bin`; the harness zero-fills the KV region at sequence start and before
+prefix restore; `compare.py` masks score elements `>= len`.
 
 ## Scores
 
 `dot64(q_int16, k_int8)` requantized with per-token `Sk_t` and `Sq * log2e/8`
 -> log2-domain score in `FRAC_S` (`1/sqrt(64)` exact as exponent -3).
 
-## Softmax
+## Softmax (VSOFTMAX)
 
-`m = max s_t`; `d_t = clamp(s_t - m, -16 << FRAC_S, 0)`; `n = -(d_t >> FRAC_S)`,
-`f` = fraction (8 index + 8 interpolation bits); `e_t = exp2_LUT(f)` (u16 Q1.15
-in `[32768, 65535]`) `>> n` (`n >= 16 -> 0`); `sum` u32;
-`inv = recip_LUT(LOD(sum))`; `p_t = sat(round_shift(e_t * inv_m, k))` u16 Q1.15
-(`len = 1` gives exactly 32768); `e_max` = max V exponent in the row;
-`w_t = sat16(round_shift(p_t * Sv_m[t], 16 + e_max - Sv_e[t]))` in `[0, 32767]`,
-`w_t = 0` for `t >= len`; `SREG_out = sfloat(2^(1 + e_max))`.
+Over `scores[:len]` in class `FRAC_S` (log2 domain), with the per-token V
+scales `Sv_t` of the row; returns int16 weights `w` (zero beyond `len`) and
+`SREG_out` such that `sum_t w_t * V_t * SREG_out` reproduces
+`sum_t p_t * Sv_t * V_t`:
 
-**Calibration gate**: histogram of `(e_max - Sv_e)` per (layer, head); if p99 > ~6,
-switch to per-(layer, kv head) static V scales or the half-dot pattern. Result:
-TBD.
+```
+m     = max s_t
+d_t   = clamp(m - s_t, 0, 25 << FRAC_S)                  # distance in log2 units; beyond 25 the weight rounds to 0
+n     = ceil(d_t / 2^FRAC_S);  g = n * 2^FRAC_S - d_t     # 2^-d = 2^-n * 2^(g / 2^FRAC_S)
+e_t   = round_shift(exp2_q15(g as a 16-bit fraction) << 8, n)   # Q1.23; the max token gives 2^23
+sum   = sum_t e_t                                         # <= 2^36 for 8192 tokens
+sum   = sum_hi * 2^e_s;  inv = recip_q15(sum_hi)
+p_t   = round_shift(e_t * inv, 7 + e_s)                   # Q1.23 probability; len = 1 gives exactly 2^23
+e_max = max Sv_e over the row (zero scales excluded)
+w_t   = round_shift(p_t * Sv_m[t], 24 + e_max - Sv_e[t])         in [0, 32768]; shift amounts above 40 saturate to 40 (w_t = 0)
+SREG_out = 2^(1 + e_max) = {2^15, e_max - 14}
+```
 
-## SiLU
+`g` becomes a 16-bit fraction by `g >> (FRAC_S - 16)` (or `<< (16 - FRAC_S)`).
+Tokens whose V scale is the canonical zero get `w_t = 0` and do not enter
+`e_max`; a row of all-zero scales returns zeros and the zero `SREG`. `w_t`
+reaches 32768 only when `p_t = 1.0` (every other token at least 25 log2 units
+below the maximum) and `Sv_m[t] = 65535`; that value is clipped to 32767 and
+counted as a clip, like VQUANT's, never as a saturation. The exponential and
+the probability carry eight extra fraction bits (Q1.23) so that tokens 13 to 23
+log2 units below the maximum, the shape attention sinks produce, keep their
+relative precision and the normalizer stays unbiased; the multipliers are 24 x
+16 unsigned (25 x 17 in the RTL's signed convention), which the vector lanes
+already have. The weights themselves are 16-bit: a token rounds to zero weight
+when `p_t * Sv_t` is below `2^e_max` (half of `SREG_out`), and every weight
+carries a rounding error of up to `2^e_max` in either direction, so a row of
+`L` tokens has its total mass off by at most `L * 2^e_max / Sv_max <= L * 2^-15`
+(3.1% at 1024 tokens in the worst case; wider weights are a roadmap item for
+long contexts). Widths: `m - s_t` is a 33-bit signed difference before the
+clamp, `n <= 25`, `e_t * inv` and `p_t * Sv_m` fit 39 bits, and the per-token
+`w` shift lies in `[24, 54]` for real V scales (larger amounts saturate to
+40 and give a zero weight). Measured against a
+float64 softmax over random rows (lengths 1..600, `FRAC_S` 14/16/18, V
+exponents spread over 6 octaves) and sink-dominated rows of 2048 and 8192
+tokens, in units of `2^-15 * max Sv`, the per-token error stays within the
+property-tested budget (`sw/tests/test_numerics.py`,
+`sw/tests/test_numerics_edges.py`).
 
-`sig = sigmoid_LUT(|g| clamped to [0, 16), 512 entries, u16 Q1.15,
-interpolated)`, `sig(-x) = 32768 - sig(x)`; `silu = round_shift(g * sig, 15)`;
-`h = sat32(round_shift(silu * u, sh_h))`; absmax tracked.
+Gate (`v_scale_spread` in `calib.json`): histogram of `e_max - e_t` per
+(layer, KV head, sequence) with `e_t = floor(log2(absmax(v_t)))` of the
+bias-free V the cache stores:
 
-## LUT ROMs
+| Model | samples | p50 | p99 | max |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 63072 | 1 | 3 | 5 |
+| SmolLM2-135M-Instruct | 106290 | 1 | 3 | 7 |
 
-exp2 256, sigmoid 512, rsqrt 2x256, recip 256 entries of `(v16, dv16)`;
-`out = v + ((dv * frac8) >> 8)`; interpolation error <= 2^-16 (**verified by
-pytest against float64**). 1-D initialized memories with registered
-reads, dual-port serving 2 lanes each, `$readmemh` from checked-in
-`rtl/gen/*.hex` via a `ROM_FILE` string parameter with no default, set as an
-absolute path from the Makefile/.ys. CI lints that no literal `$readmemh("...")`
-exists.
+A token `k` exponents below the row maximum keeps `15 - k` bits in `w_t`; with
+p99 = 3 the per-token dynamic V scales stay and no static per-head V scale is
+needed.
+
+## SiLU (VSILUMUL)
+
+`h = silu(g) * u` from class `FRAC_GU` (both inputs) into `FRAC_H`:
+
+```
+sig  = sigmoid_q15(g, FRAC_GU)             # Q1.15; sigmoid(-x) = 32768 - sigmoid(x); |g| >= 16 -> 1.0
+silu = round_shift(g * sig, 15)            # class FRAC_GU
+h    = sat32(round_shift(silu * u, 2 FRAC_GU - FRAC_H))
+```
+
+The sigmoid index is `floor(|g| * 32)` (bits `FRAC_GU - 5` and up; 512 entries
+over `[0, 16)`) and `frac8` the next 8 bits, which needs `FRAC_GU >= 13`.
+Widths: `g * sig` 47 bits, `silu * u` at most 62 bits. The output absmax is
+tracked. Measured against float64 over 150 random vectors (`FRAC_GU` 13..20,
+`FRAC_H` 8..20, inputs in `[-20, 20]`): worst relative error `0.10 * 2^-13`.
+
+## Lookup tables
+
+Four `(v16, dv16)` tables generated by `uv run python -m quettos.lutgen` with
+mpmath at 128-bit precision and rounded half up, checked in as
+`sw/quettos/tables/luts.json` (with a SHA-256 of the table payload in `meta`)
+and as `rtl/gen/{exp2,sigmoid,rsqrt,recip}.hex` (one 32-bit word
+`{v[15:0], dv[15:0]}` per line for `$readmemh`, `dv` two's complement).
+`uv run python -m quettos.lutgen --check` regenerates in memory and reports any
+difference. Entry `i` stores `v_i = round_half_up(f(x_i) * 2^15)` and the
+forward difference `dv_i = v_{i+1} - v_i`, with `v_N` the value at the right
+end of the domain. Interpolation is `out = v_i + round_shift(dv_i * frac8, 8)`
+with `frac8` the 8 bits below the index.
+
+| Table | Entries | Grid and values | Right end | Index / frac8 |
+|---|---|---|---|---|
+| `exp2` | 256 | `x_i = i/256` on `[0, 1)`, `f = 2^x`, `v` in `[32768, 65535]` | 65536 | `f16` in `[0, 2^16)`: bits 15..8 / bits 7..0 |
+| `sigmoid` | 512 | `x_i = i/32` on `[0, 16)`, `v` in `[16384, 32768]` (32768 from entry 355 on) | 32768 | `\|x\| >> (FRAC - 5)` / `(\|x\| >> (FRAC - 13)) & 0xFF` |
+| `rsqrt` | 2 x 256 | seg 0 `x_i = 1 + i/256` on `[1, 2)`; seg 1 `x_i = 2 + 2i/256` on `[2, 4)`; `v` in `(16384, 32768]` | 16384 | `m` as Q2.16: seg 0 bits 15..8 / bits 7..0; seg 1 `256 +` bits 16..9 / bits 8..1 |
+| `recip` | 256 | `x_i = 1 + i/256` on `[1, 2)`, `v` in `(16384, 32768]` | 16384 | `a_hi` in `[2^15, 2^16)`: bits 14..7 / bits 6..0 `<< 1` |
+
+Interpolation error against mpmath over the full input domain, in Q1.15 LSB:
+`exp2` 0.98, `recip` 1.03, `rsqrt` 0.98 (segment 0) and 1.05 (segment 1),
+`sigmoid` 1.25 at 13 fraction bits and below 2.0 at 16 and 20 (input bits
+below `FRAC - 13` are dropped before the lookup). The tests bound the lookups
+at 2 LSB (`2^-14` in real units; 2.25 for the sigmoid at 20 fraction bits) and
+recompute every table entry independently.
+
+Hardware: 1-D initialized memories with registered reads, dual-port serving 2
+lanes each, `$readmemh` from the checked-in `rtl/gen/*.hex` via a `ROM_FILE`
+string parameter with no default, set as an absolute path from the
+Makefile/.ys. CI lints that no literal `$readmemh("...")` exists.
 
 ## Logits
 
 `FRAC = 16`; argmax strict-greater ascending, so ties resolve to the lowest id.
 Greedy only in the bit-exact contract.
 
+## Float32 reference
+
+`sw/quettos/reference_np.py` is the float32 numpy forward the integer numerics
+are measured against (Hugging Face Llama/Qwen2 semantics: RMSNorm, rotate_half
+RoPE with float32 `inv_freq`, grouped-query attention by repeating KV heads,
+causal fp32 softmax, SwiGLU, tied LM head), with a recorder hook on every
+intermediate. Against `transformers` fp32 eager attention on the same local
+weights (`uv sync --group ref`, then
+`uv run pytest -q sw/tests/test_reference_np.py`): argmax agreement 1.0 at
+every position and max |logit difference| 3.3e-4 / 7.6e-4 on Qwen
+(`chat_short` T=36 / `tool_call_weather` T=180) and 1.2e-4 / 1.2e-4 on SmolLM2
+(T=37 / T=39); the test bound is 2e-2.
+
 ## Quality expectations (estimates)
 
-All rows below are **estimates** to be replaced by `uv run quettos check`
-measurements before publication (overnight quality run):
+The rows below are **estimates**; `uv run quettos check` produces the measured
+values that supersede them:
 
 | Model | Config | PPL delta | top-1 vs fp32 | KL (nats) |
 |---|---|---|---|---|
 | Qwen2.5-0.5B | W8A16 + int8 KV + LUT nonlinearities | +1-3% (estimate) | 94-97% (estimate) | 0.01-0.03 (estimate) |
-| SmolLM2-135M | same | +1-2% (estimate) | 95-98% (estimate) | TBD |
-| both | W8A8 ablation | +2-6% (estimate) | 90-95% (estimate) | TBD |
+| SmolLM2-135M | same | +1-2% (estimate) | 95-98% (estimate) | 0.01-0.02 (estimate) |
+| both | W8A8 ablation | +2-6% (estimate) | 90-95% (estimate) | 0.03-0.08 (estimate) |
 
 CI gate on SmolLM2: `KL <= 0.02 nats`, `top-1 >= 93%`. Qwen is reported, not
 gated (expected `KL <= 0.03`, `top-1 >= 94%`). Saturation counters must be zero
