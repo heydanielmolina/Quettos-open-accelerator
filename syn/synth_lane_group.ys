@@ -1,0 +1,10 @@
+# Yosys synthesis of qcore_mac_lane_group alone for Xilinx 7 series.
+# Run from the repository root:
+#   yosys -q -l build/synth/synth_lane_group.log -s syn/synth_lane_group.ys
+# The stat block reports the DSP48E1, LUT and FF counts; the dump lists every
+# DSP48E1 with its parameters and pins (PREG, OPMODE, CEP, C, P).
+read_verilog -sv rtl/qcore_mac_lane_group.sv
+hierarchy -check -top qcore_mac_lane_group -chparam ACC_W 40
+synth_xilinx -family xc7 -top qcore_mac_lane_group
+stat -tech xilinx
+tee -q -o build/synth/qcore_mac_lane_group_dsp.txt dump t:DSP48E1

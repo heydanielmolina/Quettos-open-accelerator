@@ -1,0 +1,14 @@
+# Yosys synth_xilinx (xc7) of qcore_requant on its own, default configuration
+# (WB = 64, B_MAX = 1, ACC_W = 40, VSRAM_WORDS = 4096). Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/qcore_requant_xc7.log -s syn/synth_requant.ys
+# The log ends with the cell table (stat -tech xilinx) and two longest
+# topological paths in cells: the LUT fabric alone (flops, I/O buffers, DSP
+# blocks and LUTRAM as cut points), then through the DSP blocks and LUTRAM.
+# Override the parameters before hierarchy with
+# `chparam -set WB 16 -set B_MAX 2 -set VSRAM_WORDS 2048 qcore_requant`.
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_requant.sv
+hierarchy -check -top qcore_requant
+synth_xilinx -family xc7 -top qcore_requant
+stat -tech xilinx
+ltp -noff t:FDRE t:FDSE t:BUFG t:IBUF t:OBUF t:DSP48E1 t:RAM32M %u %u %u %u %u %u %n
+ltp -noff t:FDRE t:FDSE t:BUFG t:IBUF t:OBUF %u %u %u %u %n

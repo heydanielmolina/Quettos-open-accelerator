@@ -88,15 +88,15 @@ Module list and responsibilities (all `rtl/qcore_*.sv`):
 
 | Module | Purpose |
 |---|---|
-| `qcore_pkg` | parameters, the ISA constants of `rtl/qcore_csr_defs.svh` restated as localparams (opcodes, flags, descriptor field ranges), sfloat typedefs, `round_shift`/`sat` functions (explicit `qcore_pkg::` scoping only) |
+| `qcore_pkg` | descriptor field extractors, SREG / sfloat / meta packing, the QMEM read tags, `round_shift` / `sat` / clip functions mirroring `numerics.py` (explicit `qcore_pkg::` scoping only; each module restates the `rtl/qcore_csr_defs.svh` macros it uses) |
 | `qcore_top` | flat QMEM/CSR ports, instantiates everything, generate-for rows; parameter root |
 | `qcore_csr` | CTRL/STATUS/PC/ROW_EN/TOK/POS/ARGMAX/PERF halves/SAT+ERR counters |
 | `qcore_seq_fetch` | descriptor fetch, 8-deep queue, step-mode gating |
 | `qcore_seq_dispatch` | decode, POS-derived N/K/len/addresses, in-order issue, auto-fence, busy/retire, stall classification |
 | `qcore_mem_arb` | read arbiter with a reserved fetch slot, tag routing, write mux, ack counter, byte counters |
 | `qcore_stream_ctrl` | bursts, weight FIFO, meta side-stream, tile/k counters, EMBED gather, partial last tile |
-| `qcore_row` | activation word buffer, 8 lane groups, accumulator double buffer, tile handshake |
-| `qcore_mac_lane_group` | 8 lanes of 8w x 16a -> 24-bit product, 40-bit accumulate (`acc <= prod + (tile_start ? 0 : acc)`) |
+| `qcore_row` | four-word activation ring read ahead of the stream, `WB/8` lane groups, tile handshake, SREG bank |
+| `qcore_mac_lane_group` | 8 lanes of 8w x 16a -> 24-bit product into one 40-bit accumulator per lane (`acc <= prod + (tile_start ? load : acc)`, a DSP48E1 with the P feedback and the C override for the EMBED load) plus a hold set for the finished tile |
 | `qcore_requant` | two-stage sfloat requant, S clamp + ERR, m==0 rule, bias, RMW, sat counters, absmax, argmax, dump, partial-tile drain |
 | `qcore_vsram` | true-dual-port 256-bit RAM wrapper, `verilator public_flat_rd` for zero-cycle dumps |
 | `qcore_vpu_top` / `_lane` / `_scalar` | the six V ops, VL lanes, LOD/sfloat/LUT scalar path |

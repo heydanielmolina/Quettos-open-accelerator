@@ -50,7 +50,11 @@ descriptor ISA (`sw/quettos/isa.py`, generated into `rtl/qcore_csr_defs.svh`
 and `sim/verilator/csr_defs.hpp`), the compiler (`image.bin`, `decode.prog`,
 `prefill.prog`, `layout.json`) and the ISA-level simulator are in place; the
 simulator reproduces the golden model bit for bit on both complete models
-(`uv run quettos isa-sim <alias> --compare`). See
+(`uv run quettos isa-sim <alias> --compare`). The GEMV datapath RTL is in
+`rtl/` (package, vector SRAM, MAC lane group, row, requant, memory arbiter,
+stream controller): every module passes the three-parser lint on its own,
+the cocotb benches in `sim/cocotb/` check them bit for bit against
+`numerics.py`, and `syn/reports/` holds the Yosys xc7 block synthesis. See
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next and
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the speed-probe result and
 the locked demo configuration.
@@ -62,6 +66,8 @@ the locked demo configuration.
 ```sh
 make lint    # three-parser RTL lint (Verilator, Yosys, Icarus)
 make test    # uv run pytest -q sw/tests
+make cocotb  # cocotb + Verilator unit benches (sim/cocotb)
+make synth   # Yosys synth_xilinx of every syn/*.ys block; reports in syn/reports/
 make probe   # Verilator speed probe (sim/probe)
 
 uv run quettos download qwen        # or smollm2; fetches the model from Hugging Face

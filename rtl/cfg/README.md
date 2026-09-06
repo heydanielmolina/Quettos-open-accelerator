@@ -23,8 +23,9 @@ Parameter meaning:
   32,768 int32 elements; 2048 is enough for the truncated-model tests).
 - `FIFO_BEATS` -- depth of the weight FIFO between `qcore_stream_ctrl` and the
   lanes.
-- `ROM_FILE` (string, no default) -- absolute path to a `rtl/gen/*.hex` LUT
-  image; set by the Makefile/.ys, never as a literal in RTL.
+- `ROM_FILE_EXP2`, `ROM_FILE_SIGMOID`, `ROM_FILE_RSQRT`, `ROM_FILE_RECIP`
+  (untyped parameters, empty default) -- absolute paths to the `rtl/gen/*.hex`
+  LUT images; set by the Makefile/.ys, never as literals in RTL.
 
 ## Passing a configuration
 
@@ -33,20 +34,25 @@ Verilator (`-G` sets a top-level parameter; quote strings twice):
 ```sh
 verilator --cc --exe --build -j 0 -O3 --top-module qcore_top \
   -GWB=64 -GB_MAX=1 -GVL=4 -GVSRAM_WORDS=4096 -GFIFO_BEATS=128 \
-  -GROM_FILE='"'"$PWD"'/rtl/gen/exp2.hex"' \
+  -GROM_FILE_EXP2='"'"$PWD"'/rtl/gen/exp2.hex"' \
   rtl/*.sv sim/verilator/main.cpp
 ```
 
-Yosys (`-chparam` on `hierarchy`, before `proc`):
+Yosys (`read_verilog -defer` so that `$readmemh` runs after the parameters
+are set with `chparam`; `hierarchy -chparam` cannot take a string value):
 
 ```sh
-yosys -p "read_verilog -sv rtl/*.sv; \
-  hierarchy -check -top qcore_top \
-    -chparam WB 64 -chparam B_MAX 1 -chparam VL 4 \
-    -chparam VSRAM_WORDS 4096 -chparam FIFO_BEATS 128 \
-    -chparam ROM_FILE \"$PWD/rtl/gen/exp2.hex\"; \
-  synth_xilinx -family xc7 -flatten -top qcore_top; stat -tech xilinx; ltp -noff"
+yosys -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv; \
+  chparam -set WB 64 -set B_MAX 1 -set VL 4 \
+    -set VSRAM_WORDS 4096 -set FIFO_BEATS 128 \
+    -set ROM_FILE_EXP2 \"$PWD/rtl/gen/exp2.hex\" qcore_top; \
+  hierarchy -check -top qcore_top; \
+  synth_xilinx -family xc7 -flatten -top qcore_top; stat -tech xilinx; \
+  ltp -noff t:FDRE t:FDSE t:BUFG t:IBUF t:OBUF t:DSP48E1 t:RAMB36E1 t:RAM32M %u %u %u %u %u %u %u %n"
 ```
+
+The `ltp` selection uses the flops, I/O buffers, DSPs and RAMs as cut points;
+`ltp -noff` alone reports paths through the `FDRE`/`FDSE` primitives.
 
 Icarus (parse/lint only; `-P` sets a top parameter):
 

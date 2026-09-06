@@ -50,9 +50,11 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 - Memories as **1-D unpacked arrays of packed words** (`logic [255:0] mem
   [0:VSRAM_WORDS-1]`) with **registered reads** (read address or read data
   goes through a flop) and separate `always_ff` read and write processes.
-- ROM initialization only through a `ROM_FILE` string parameter with **no
-  default**, set to an **absolute path** by the Makefile / `.ys` script:
-  `$readmemh(ROM_FILE, mem);`.
+- ROM initialization only through an untyped `parameter ROM_FILE = ""`
+  (Yosys 0.65 rejects `parameter string`), set to an **absolute path** by the
+  Makefile / `.ys` script: `$readmemh(ROM_FILE, mem);`. Yosys resolves
+  `$readmemh` while reading, so the script uses `read_verilog -sv -defer`
+  followed by `chparam -set ROM_FILE "<abs path>" <module>` before `hierarchy`.
 - ISA constants (opcodes, flag masks, descriptor field positions, CSR offsets,
   PERF indices) come from the generated include `rtl/qcore_csr_defs.svh`
   (`uv run quettos csr-defs`), which defines one `` `define QCORE_<NAME> ``
@@ -75,8 +77,8 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   property`, `always_latch`, `initial` blocks in synthesizable modules.
 - Literal **`$readmemh("...")`** with a string constant (CI greps for it).
 - Multi-dimensional unpacked memories, `automatic` variables, `real`,
-  `string` variables (a `string` *parameter* for `ROM_FILE` is the one
-  exception), `$clog2` on anything but constants, dynamic arrays, queues.
+  `string` variables and `string` parameters, `$clog2` on anything but
+  constants, dynamic arrays, queues.
 - Lint waivers of any kind (`/* verilator lint_off */`). `UNOPTFLAT` must be
   fixed, not silenced.
 - Any fixed-point format knowledge in RTL. **Numerics conventions live only in
@@ -94,17 +96,21 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 
 ## 4. Three-parser lint recipe
 
-`make lint` runs `scripts/lint.sh`, which for every `rtl/*.sv` runs:
+`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` as its own
+top (`qcore_pkg.sv` always first on the command line, since Yosys and Icarus
+resolve `qcore_pkg::` references only after parsing the package):
 
 ```sh
-verilator --lint-only -Wall -Wpedantic --top-module qcore_top rtl/*.sv
-yosys -q -p "read_verilog -sv rtl/*.sv; hierarchy -check -top qcore_top; proc; opt; check -assert"
-iverilog -g2012 -o /dev/null rtl/*.sv
+verilator --lint-only -Wall -Wpedantic -Irtl --top-module <mod> rtl/qcore_pkg.sv rtl/*.sv
+yosys -q -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv; hierarchy -check -top <mod>; proc; opt; check -assert"
+iverilog -g2012 -Irtl -s <mod> -o /dev/null rtl/qcore_pkg.sv rtl/*.sv
 ```
 
 followed by greps that fail on the forbidden constructs listed above. The
 unpacked-port check is a heuristic (a port declaration whose identifier is
 followed by a `[..]` range); see the comment in `scripts/lint.sh`.
+
+`make lint TOPS="qcore_row qcore_requant"` restricts the run to named tops.
 
 The glob is `rtl/*.sv`: the generated include `rtl/qcore_csr_defs.svh` is
 linted through the modules that include it, checked against `isa.py` by

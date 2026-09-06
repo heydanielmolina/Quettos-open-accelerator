@@ -1,6 +1,7 @@
-# Quettos Core CI. Only lint-and-pytest is active so far. The other jobs are
-# skeletons that turn on as the corresponding component lands
-# (see docs/ROADMAP.md and docs/VERIFICATION.md layer 8).
+# Quettos Core CI: three-parser lint and the software tests, the cocotb block
+# tests on the tiny configuration, and the per-block synthesis. The e2e job is
+# a skeleton that turns on with the Verilator harness (docs/VERIFICATION.md
+# layer 8).
 #
 # Action versions were checked against the upstream repos on 2026-09-02:
 #   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10.0.1 (exact tag; it publishes no floating v10),
@@ -59,25 +60,49 @@ jobs:
       - name: pytest
         run: uv run pytest -q sw/tests
 
-  # --- disabled until the cocotb tests exist: cocotb unit tests on the tiny config (WB=16, B_MAX=2, VL=2) ---
-  # cocotb-units:
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 30
-  #   needs: lint-and-pytest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #     - uses: astral-sh/setup-uv@v10.0.1
-  #       with: { enable-cache: true }
-  #     - uses: actions/cache@v6
-  #       with:
-  #         path: ${{ runner.temp }}/oss-cad-suite
-  #         key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
-  #     - uses: YosysHQ/setup-oss-cad-suite@v4
-  #       with: { version: "${{ env.OSS_CAD_SUITE_VERSION }}", github-token: "${{ secrets.GITHUB_TOKEN }}" }
-  #     - run: uv sync --frozen --group dev
-  #     - run: uv run pytest -q sim/cocotb -x
+  # cocotb unit tests on the tiny configuration (WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048):
+  # every rtl/*.sv block and the assembled GEMV path, built with Verilator through
+  # cocotb's runner (make cocotb). A clean build and run takes under a minute locally.
+  cocotb-units:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: lint-and-pytest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/oss-cad-suite
+          key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: ${{ env.OSS_CAD_SUITE_VERSION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: uv sync --frozen --group dev
+      - run: make cocotb
 
-  # --- disabled until the RTL and ISA simulator exist: tiny-shape RTL vs isa_sim end-to-end (-CFLAGS -O1 + ccache) ---
+  # per-block Yosys synth_xilinx (xc7) of the syn/*.ys scripts; the stat tables land in
+  # build/synth/ and are recorded under syn/reports/.
+  synth-xc7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint-and-pytest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/oss-cad-suite
+          key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: ${{ env.OSS_CAD_SUITE_VERSION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: make synth
+
+  # --- enabled once the Verilator harness lands: tiny-shape RTL vs isa_sim end-to-end (-CFLAGS -O1 + ccache) ---
   # e2e-tiny:
   #   runs-on: ubuntu-latest
   #   timeout-minutes: 30
@@ -100,18 +125,3 @@ jobs:
   #     # SmolLM2 8+4 e2e on WB=64 lives here too unless it exceeds 15 min on
   #     # first measurement, in which case it moves to nightly.yml.
 
-  # --- disabled until the RTL exists: per-block synth_xilinx stat with DSP/BRAM band checks ---
-  # synth-xc7:
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 30
-  #   needs: lint-and-pytest
-  #   steps:
-  #     - uses: actions/checkout@v7
-  #     - uses: actions/cache@v6
-  #       with:
-  #         path: ${{ runner.temp }}/oss-cad-suite
-  #         key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
-  #     - uses: YosysHQ/setup-oss-cad-suite@v4
-  #       with: { version: "${{ env.OSS_CAD_SUITE_VERSION }}", github-token: "${{ secrets.GITHUB_TOKEN }}" }
-  #     - run: make synth BLOCKS="qcore_mac_lane_group qcore_requant"
-  #     - run: uv run python scripts/synth_report.py --check-bands
