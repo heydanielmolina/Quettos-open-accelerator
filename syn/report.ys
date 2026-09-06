@@ -1,0 +1,32 @@
+# The per-configuration report block. Every configuration in every
+# syn/synth_*.ys ends with `script syn/report.ys`, and scripts/synth_report.py
+# reads what these commands print out of build/synth/<script>.log to write
+# syn/reports/<block>.md. Nothing in a report is typed by hand, so changing a
+# script or the RTL changes the report on the next `make synth`.
+#
+# The `log ==== qreport ...` lines delimit the regions the generator reads:
+#   stat    the post-synthesis cell table of the top module
+#   ltp     the longest topological path through the LUT fabric, cutting at the
+#           flops, the clock buffer, the I/O buffers and every hard block, so
+#           the depth means the same thing in every block and configuration
+#   cells   the instance names of each hard-block primitive, which carry the
+#           instance path and the source line the primitive was inferred from
+select -clear
+log ==== qreport stat
+stat -tech xilinx
+log ==== qreport ltp
+ltp -noff t:FDRE t:FDSE t:BUFG t:IBUF t:OBUF t:DSP48E1 t:RAMB36E1 t:RAMB18E1 t:RAM32M t:RAM64M t:RAM128X1D %u %u %u %u %u %u %u %u %u %u %n
+log ==== qreport cells DSP48E1
+select -list t:DSP48E1
+log ==== qreport cells RAMB36E1
+select -list t:RAMB36E1
+log ==== qreport cells RAMB18E1
+select -list t:RAMB18E1
+log ==== qreport cells RAM32M
+select -list t:RAM32M
+log ==== qreport cells RAM64M
+select -list t:RAM64M
+log ==== qreport cells RAM128X1D
+select -list t:RAM128X1D
+log ==== qreport end
+select -clear

@@ -6,9 +6,9 @@
 // fewer than 4. A requester's ready is high while the stage is free or drains
 // this cycle. Returned beats are routed by tag as rdf / rdw / rdm / rdv valids
 // in the cycle they arrive; the payload fans out unchanged on rdd_*. Writes:
-// KV writer over dump through one registered stage; wr_idle is high while every
-// write accepted has been acknowledged. The PERF strobes lag their event by one
-// cycle and come from registers.
+// KV writer over dump through one registered stage; wr_idle is high while no
+// write is presented, held or unacknowledged. The PERF strobes lag their event
+// by one cycle and come from registers.
 module qcore_mem_arb #(
   parameter int WB        = 64,
   parameter int MAX_BURST = 64
@@ -204,7 +204,13 @@ module qcore_mem_arb #(
     end
   end
 
-  assign wr_idle = !wq_valid && (issued == acked);
+  // A write accepted this cycle reaches wq_valid only on the next edge, so a
+  // wr_idle formed from the stage and the counters alone still reads idle in
+  // the cycle it takes a write -- and the descriptor fetch that wr_idle
+  // releases is granted in that same cycle, ahead of the write. The presented
+  // valids close it: while a requester holds one, the stage is either taking
+  // that write now or already full, and the path is not idle either way.
+  assign wr_idle = !wq_valid && !k_wr_valid && !d_wr_valid && (issued == acked);
 
   // ---------------------------------------------------------------- PERF strobes
   always_comb begin

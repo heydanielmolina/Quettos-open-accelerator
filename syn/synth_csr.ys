@@ -1,0 +1,15 @@
+# Yosys synth_xilinx (xc7) of qcore_csr on its own. The module has no
+# parameters: the host window is 64 words wide and the PERF snapshot 1024 bits
+# in every configuration, so one run covers the demo and the tiny build alike.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_csr.log -s syn/synth_csr.ys
+# syn/report.ys prints the cell table, the longest topological path and the
+# hard-block instances that scripts/synth_report.py turns into
+# syn/reports/qcore_csr.md.
+
+# ---- default: the module takes no parameters
+log ==== qreport config default
+read_verilog -sv -defer -Irtl rtl/qcore_csr.sv
+hierarchy -check -top qcore_csr
+synth_xilinx -family xc7 -top qcore_csr
+script syn/report.ys

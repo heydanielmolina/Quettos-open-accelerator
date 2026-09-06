@@ -1,10 +1,17 @@
-# Yosys synthesis of qcore_mac_lane_group alone for Xilinx 7 series.
-# Run from the repository root:
-#   yosys -q -l build/synth/synth_lane_group.log -s syn/synth_lane_group.ys
-# The stat block reports the DSP48E1, LUT and FF counts; the dump lists every
-# DSP48E1 with its parameters and pins (PREG, OPMODE, CEP, C, P).
-read_verilog -sv rtl/qcore_mac_lane_group.sv
-hierarchy -check -top qcore_mac_lane_group -chparam ACC_W 40
+# Yosys synth_xilinx (xc7) of qcore_mac_lane_group on its own. ACC_W is the
+# module's only parameter and is 40 in every build, so one run covers them all.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_lane_group.log -s syn/synth_lane_group.ys
+# The dump build/synth/qcore_mac_lane_group_dsp.txt lists every DSP48E1 with its
+# parameters and pins (PREG, OPMODE, CEP, C, P). syn/report.ys prints the cell
+# table, the longest topological path and the hard-block instances that
+# scripts/synth_report.py turns into syn/reports/qcore_mac_lane_group.md.
+
+# ---- default: ACC_W = 40
+log ==== qreport config default
+read_verilog -sv -defer -Irtl rtl/qcore_mac_lane_group.sv
+chparam -set ACC_W 40 qcore_mac_lane_group
+hierarchy -check -top qcore_mac_lane_group
 synth_xilinx -family xc7 -top qcore_mac_lane_group
-stat -tech xilinx
 tee -q -o build/synth/qcore_mac_lane_group_dsp.txt dump t:DSP48E1
+script syn/report.ys

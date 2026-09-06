@@ -46,61 +46,67 @@ See `rtl/cfg/README.md` for how parameters are passed.
 ## Block diagram
 
 The host/RTL boundary is the horizontal line above `qcore_top`. Above it is
-C++ (or cocotb in unit tests). Below it is synthesizable SystemVerilog. The
+C++ (or cocotb in the block tests). Below it is synthesizable SystemVerilog. The
 external memory model is also C++ and sits outside the design boundary.
 
 ```
- host: C++ Verilator harness (tokenizer I/O, memory model, printing) / cocotb unit tests
+ host: C++ Verilator harness (tokenizer I/O, memory model, printing) / cocotb block tests
        | CSR port (32b): CTRL, STATUS, PC, ROW_EN, TOK, POS, ARGMAX_TOK/VAL, ISA_VERSION, PERF[16]x64b, SAT/ERR counters
- +-----v---------------------------------------------------------------------------------+
- | qcore_top (WB, B_MAX, VL, VSRAM_WORDS, FIFO_BEATS)                                     |
- |  seq_fetch -> seq_dispatch --GEMV/EMBED--> stream_ctrl --64 int8 w/cycle + k tag--+    |
- |   (PC,       (decode, pos-derived      (bursts <=64 beats, weight FIFO,          v    |
- |    8-deep)    N/K/len/addr, in-order    meta side-FIFO, EMBED gather)   row[0] (x B_MAX)|
- |               issue, auto-fence,                                         8x lane_group |
- |               busy/retire)                                               (8w x 16a ->  |
- |                 |            |                                            40b acc x2)  |
- |                 | VPU cmd    | KVWRITE                                        |         |
- |                 v            v                                     A[k] ^    v         |
- |            vpu_top       kv_writer                            vsram 4096x256b  requant |
- |  (VRMSNORM VQUANT VROPE  (K^T byte    port A: MAC act reads  <----------------(acc*Sw  |
- |   VSILUMUL VSOFTMAX      scatter,     port B: VPU + requant writes             >>s1*Sx |
- |   VSUBC; VL lanes;       V tiles, meta) SREG[32] x 32b per row                 >>S,+b, |
- |   scalar LOD/sfloat;                                                           RMW,    |
- |   lut_interp exp2/sigmoid/rsqrt/recip)                                        argmax) |
- |                 |            |                                                  | dump  |
- |  mem_arb: 1 read port (stream > vpu tables > fetch, reserved fetch slot), 1 write port |
- |           (kv_writer, logit dump), write-ack counter for auto-fence; perf counters     |
- +--------------------------------------|------------------------------------------------+
+ +-----v------------------------------------------------------------------------------------+
+ | qcore_top (WB, B_MAX, VL, VSRAM_WORDS; full parameter list in docs/RTL.md 3.2)           |
+ |  seq_fetch -> seq_dispatch --GEMV/EMBED--> stream_ctrl --64 int8 w/cycle + k tag--+      |
+ |   (PC,       (decode, pos-derived      (bursts <=64 beats, weight FIFO,          v       |
+ |    8-deep)    N/K/len/addr, in-order    meta side-FIFO, EMBED gather)   row[0] (x B_MAX) |
+ |               issue, auto-fence,                                         8x lane_group   |
+ |               busy/retire)                                               (8w x 16a ->    |
+ |                 |            |                                            40b acc x2)    |
+ |                 | VPU cmd    | KVWRITE                                        |          |
+ |                 v            v                                     A[k] ^    v           |
+ |            vpu_top       kv_writer                            vsram 4096x256b  requant   |
+ |  (VRMSNORM VQUANT VROPE  (K^T byte    port A: MAC act reads  <----------------(acc*Sw    |
+ |   VSILUMUL VSOFTMAX      scatter,     port B: requant/VPU/kv_writer            >>s1*Sx   |
+ |   VSUBC; VL lanes;       V tiles, meta) SREG[32] x 32b per row                 >>S,+b,   |
+ |   scalar LOD/sfloat;                                                           RMW,      |
+ |   lut_interp exp2/sigmoid/rsqrt/recip)                                        argmax)    |
+ |                 |            |                                                  | dump   |
+ |  mem_arb: 1 read port (stream > vpu tables > fetch, reserved fetch slot), 1 write port   |
+ |           (kv_writer, logit dump), write-ack counter for auto-fence; perf counters       |
+ +--------------------------------------|---------------------------------------------------+
         QMEM: rd_req{addr32,len8,tag4} v/r ; rd_data{WB*8b,tag,last} v ; wr{addr32,data,strobes} v/r ; wr_ack
- +--------------------------------------v------------------------------------------------+
- | C++ external memory model: fixed latency LAT (default 32), 1 beat/cycle, --bw-div N    |
+ +--------------------------------------v---------------------------------------------------+
+ | C++ external memory model: fixed latency LAT (default 32), 1 beat/cycle, --bw-div N      |
  | image.bin: programs | RoPE table | k-center rows | tiled weights+meta | gammas |         |
  |            tied embedding/LM head | KV region (~498 MB Qwen + 14.2 MB KV @2048)          |
- +----------------------------------------------------------------------------------------+
+ +------------------------------------------------------------------------------------------+
 ```
 
 Block labels inside the box are the `qcore_*` modules with the prefix dropped
 for width (`vpu_top` = `qcore_vpu_top`, `mem_arb` = `qcore_mem_arb`, `requant`
-= `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on).
+= `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on). The six V
+opcodes run on `qcore_vpu_top`; `qcore_top` wires the GEMV, EMBED and KVWRITE
+units, and a V descriptor stops the program with `STATUS.ERR`,
+`FAULT = OPCODE`, `FAULT_OP` = the opcode byte and `PC` on the descriptor.
 
-Module list and responsibilities (all `rtl/qcore_*.sv`):
+Module list and responsibilities. Thirteen of them are files under `rtl/`,
+each linted as its own top by `make lint`; the vector unit and its lookup-table
+pair land with `qcore_vpu_top`, to the interface `docs/RTL.md` 3.12-3.16
+specifies:
 
 | Module | Purpose |
 |---|---|
 | `qcore_pkg` | descriptor field extractors, SREG / sfloat / meta packing, the QMEM read tags, `round_shift` / `sat` / clip functions mirroring `numerics.py` (explicit `qcore_pkg::` scoping only; each module restates the `rtl/qcore_csr_defs.svh` macros it uses) |
-| `qcore_top` | flat QMEM/CSR ports, instantiates everything, generate-for rows; parameter root |
+| `qcore_top` | flat QMEM/CSR ports, parameter root, generate-for rows with their VSRAMs, the VSRAM port-B crossbar and the SREG muxes, the beat fan-out and the event adders |
 | `qcore_csr` | CTRL/STATUS/PC/ROW_EN/TOK/POS/ARGMAX/PERF halves/SAT+ERR counters |
-| `qcore_seq_fetch` | descriptor fetch, 8-deep queue, step-mode gating |
-| `qcore_seq_dispatch` | decode, POS-derived N/K/len/addresses, in-order issue, auto-fence, busy/retire, stall classification |
+| `qcore_seq_fetch` | descriptor fetch, 8-deep queue, step-mode gating, the write fence on new requests |
+| `qcore_seq_dispatch` | decode, POS-derived N/K/len/addresses, in-order issue, auto-fence, busy/retire, stall classification, the program end (HALT, fault, ABORT) |
 | `qcore_mem_arb` | read arbiter with a reserved fetch slot, tag routing, write mux, ack counter, byte counters |
 | `qcore_stream_ctrl` | bursts, weight FIFO, meta side-stream, tile/k counters, EMBED gather, partial last tile |
 | `qcore_row` | four-word activation ring read ahead of the stream, `WB/8` lane groups, tile handshake, SREG bank |
 | `qcore_mac_lane_group` | 8 lanes of 8w x 16a -> 24-bit product into one 40-bit accumulator per lane (`acc <= prod + (tile_start ? load : acc)`, a DSP48E1 with the P feedback and the C override for the EMBED load) plus a hold set for the finished tile |
 | `qcore_requant` | two-stage sfloat requant, S clamp + ERR, m==0 rule, bias, RMW, sat counters, absmax, argmax, dump, partial-tile drain |
 | `qcore_vsram` | true-dual-port 256-bit RAM wrapper, `verilator public_flat_rd` for zero-cycle dumps |
-| `qcore_vpu_top` / `_lane` / `_scalar` | the six V ops, VL lanes, LOD/sfloat/LUT scalar path |
-| `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation |
+| `qcore_vpu_top` / `_lane` / `_scalar` | the six V ops, VL lanes, LOD/sfloat/LUT scalar path — lands with the vector unit |
+| `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation — lands with the vector unit |
 | `qcore_kv_writer` | K^T byte scatter / V tile row / meta writes, issued-write tracking |
 | `qcore_perf` | 16 x 64-bit counters with exclusive stall buckets |
 
@@ -179,7 +185,9 @@ write VSRAM mid-token is a design change, not a fix.
 - **FPGA throughput** is derived from those cycle counts at a stated clock and
   memory bandwidth (100 MHz and 6.4 GB/s for the WB=64 configuration).
   Synthesis results come from Yosys `synth_xilinx`, reported post-synthesis
-  with the exact command and tool version; fmax comes from nextpnr when run.
+  with the exact command and tool version: `scripts/synth_report.py` writes each
+  `syn/reports/*.md` from the log of the run that produced it, and `make synth`
+  fails when a report stops reproducing. fmax comes from nextpnr when run.
 - **Bit-exact** means the RTL matches the integer golden model bit for bit,
   token by token and, on request, over the full logit vector. **Quality** is a
   measured perplexity, KL and top-1 delta against fp32 at the tested context

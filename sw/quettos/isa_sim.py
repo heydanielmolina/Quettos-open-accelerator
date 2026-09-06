@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from quettos import golden, isa, numerics, program
-from quettos.isa import Descriptor, KvwriteFlag, Opcode, OutMode, VquantFlag
+from quettos.isa import Descriptor, Fault, KvwriteFlag, Opcode, OutMode, VquantFlag
 from quettos.numerics import SFLOAT_ONE, SFLOAT_ZERO, SFloat, Stats
 from quettos.quantize import QuantModel
 
@@ -148,6 +148,7 @@ class Machine:
         self.err_bounds = 0
         self.argmax_out = None
         self._set_status(False, "DONE", "STEP_HALTED", "ERR")
+        self._clear_fault()
         self.update_counter_csrs()
         for i in range(isa.PERF_COUNT):
             self.csr[f"PERF{i}_LO"] = 0
@@ -162,6 +163,24 @@ class Machine:
 
     def status(self, name: str) -> bool:
         return bool(self.csr["STATUS"] >> isa.STATUS_BITS[name] & 1)
+
+    def _clear_fault(self) -> None:
+        for lsb, width in isa.STATUS_FIELDS.values():
+            self.csr["STATUS"] &= ~(((1 << width) - 1) << lsb) & MASK32
+
+    def fault(self, code: Fault, opcode: int) -> None:
+        """Stop with ``STATUS.ERR``: the fault code and the faulting opcode byte in ``STATUS``.
+
+        ``PC`` keeps the address of the descriptor that faulted, as the
+        sequencer leaves it (``docs/RTL.md`` 3.5).
+        """
+        self._clear_fault()
+        self.csr["STATUS"] |= isa.status_word(fault=code, fault_op=opcode)
+        self._set_status(True, "ERR", "DONE")
+
+    def fault_state(self) -> tuple[Fault, int]:
+        """``(fault, opcode byte)`` of the current ``STATUS`` word."""
+        return isa.status_fault(self.csr["STATUS"])
 
     def update_counter_csrs(self) -> None:
         self.csr["SAT_REQ"] = self.stats_req.sat & MASK32
@@ -475,7 +494,9 @@ def _exec_gemv(m: Machine, d: Descriptor, r: int, src: int, dst: int) -> None:
     pos = m.csr["POS"]
     n, k, errors = gemv_dims(d, pos, m.wb)
     m.err_bounds += errors
-    if n == 0:
+    # Zero work: N == 0 or K == 0 retires the descriptor with the bounds events
+    # counted and nothing else touched (docs/RTL.md 2.2).
+    if n == 0 or k == 0:
         return
     tiles = -(-n // m.wb)
     a = m.act_i16(src, d.vs_src, k)
@@ -648,10 +669,11 @@ def execute(m: Machine, d: Descriptor) -> None:
 # --------------------------------------------------------------------------- programs
 
 
-def _descriptors(m: Machine, source: Source) -> Iterator[tuple[int, Descriptor | None]]:
-    """``(index, descriptor)`` from a list, ``.prog`` bytes or the image at ``PC``.
+def _descriptors(m: Machine, source: Source) -> Iterator[tuple[int, Descriptor | None, int]]:
+    """``(index, descriptor, opcode byte)`` from a list, ``.prog`` bytes or the image at ``PC``.
 
-    An undecodable descriptor (unknown opcode) yields ``None``.
+    An undecodable descriptor (unknown opcode) yields ``None`` with the byte
+    that could not be decoded.
     """
     if source is None or isinstance(source, bytes | bytearray):
         index = 0
@@ -663,12 +685,12 @@ def _descriptors(m: Machine, source: Source) -> Iterator[tuple[int, Descriptor |
                 raw = bytes(source[index * isa.DESC_BYTES : (index + 1) * isa.DESC_BYTES])
             if len(raw) < isa.DESC_BYTES:
                 raise ValueError("program runs past the end of its bytes without HALT")
-            d = isa.decode(raw) if isa.is_opcode(isa.opcode_of(raw)) else None
-            yield index, d
+            op = isa.opcode_of(raw)
+            yield index, (isa.decode(raw) if isa.is_opcode(op) else None), op
             index += 1
     else:
         for index, d in enumerate(source):
-            yield index, d
+            yield index, d, int(d.opcode)
 
 
 def _retire(m: Machine, d: Descriptor) -> None:
@@ -690,17 +712,18 @@ def run_program(
     ``source`` is a descriptor sequence, the bytes of a ``.prog`` file, or
     ``None`` for the image at ``PC`` (``pc`` sets the CSR first).  ``start``
     clears the counters and status bits.  An unknown opcode stops the program
-    with ``STATUS.ERR`` and ``DONE``.  ``on_retire(index, d)`` runs after every
-    retired descriptor, HALT included.
+    with ``STATUS.ERR``, ``DONE``, ``FAULT = OPCODE`` and the undecodable byte
+    in ``FAULT_OP``, leaving ``PC`` on the descriptor that faulted.
+    ``on_retire(index, d)`` runs after every retired descriptor, HALT included.
     """
     if start:
         m.start()
     if pc is not None:
         m.csr["PC"] = pc & MASK32
     retired = 0
-    for index, d in _descriptors(m, source):
+    for index, d, op in _descriptors(m, source):
         if d is None:
-            m._set_status(True, "ERR", "DONE")
+            m.fault(Fault.OPCODE, op)
             m.snapshot_perf()
             return retired
         execute(m, d)
@@ -719,6 +742,7 @@ def run_program(
 def step(m: Machine, d: Descriptor) -> None:
     """``CTRL.STEP``: execute ``d`` at ``PC`` and set ``STEP_HALTED`` (``DONE`` for HALT)."""
     m._set_status(False, "DONE", "STEP_HALTED", "ERR")
+    m._clear_fault()
     execute(m, d)
     _retire(m, d)
     if d.opcode == Opcode.HALT:
@@ -862,8 +886,8 @@ def written_ranges(
     op = d.opcode
     for r, src, dst in _participants(d, b_max, row_en):
         if op in (Opcode.GEMV, Opcode.EMBED):
-            n = gemv_dims(d, pos, wb)[0] if op == Opcode.GEMV else d.k
-            if n == 0:
+            n, k = gemv_dims(d, pos, wb)[:2] if op == Opcode.GEMV else (d.k, d.k)
+            if n == 0 or k == 0:
                 continue
             if d.out_mode in (OutMode.VSRAM, OutMode.VSRAM_DUMP):
                 keys.add(("vsram", dst, d.vs_dst, n))

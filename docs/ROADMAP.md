@@ -13,7 +13,7 @@
   `qcore_requant`, `qcore_mem_arb`, `qcore_stream_ctrl`, `qcore_csr`,
   `qcore_seq_fetch`, `qcore_seq_dispatch`, `qcore_kv_writer`, `qcore_perf`,
   the vector unit (`qcore_vpu_*`, `qcore_lut_*`) and `qcore_top`, all clean
-  under Verilator, Yosys and Icarus with zero waivers; cocotb unit tests on the
+  under Verilator, Yosys and Icarus with zero waivers; cocotb block tests on the
   tiny configuration.
 - **Integration.** Per-op bit-exact comparison of the RTL against the ISA
   simulator on random tiny shapes and truncated real models, then
@@ -23,8 +23,8 @@
   with the exact command and tool version; ECP5 and a nextpnr fmax
   follow in a later release.
 - **Results.** Performance tables produced only by `make perf` from RTL
-  counters, a quality table from the overnight run, the tool-call demo with
-  prefix-KV reuse, README, docs, architecture diagram and a recorded GIF.
+  counters, the quality table of `uv run quettos check`, the tool-call demo
+  with prefix-KV reuse, README, docs, architecture diagram and a recorded GIF.
 
 ### Demo configuration
 
@@ -41,8 +41,9 @@ choice.
 - **v1.1**: rows-as-heads GQA attention and end-to-end multi-sequence decode
   with the measured utilization-vs-B curve; batched prefill; cross-op weight
   prefetch and per-row VPU slices; LOOP/JUMP descriptors; nextpnr-ecp5 fmax and
-  a real tok/s line; WASM build of the same Verilator model for an in-browser
-  demo.
+  a real tok/s line; quality scored over a wider set than the calibration corpus
+  (WikiText-2, at least 32k tokens), which the nightly `quality-regen` job runs;
+  WASM build of the same Verilator model for an in-browser demo.
 - **v1.2**: paged KV with block tables (prefix sharing in hardware addressing),
   flash-style online softmax, wider attention weights for long contexts, on-chip
   K^T tile assembly buffer.

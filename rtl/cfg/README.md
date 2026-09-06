@@ -61,5 +61,34 @@ iverilog -g2012 -s qcore_top -Pqcore_top.WB=16 -Pqcore_top.B_MAX=2 -Pqcore_top.V
   -Pqcore_top.VSRAM_WORDS=2048 -o /dev/null rtl/*.sv
 ```
 
-The Makefile exposes these as `CFG=fpga_w64|sim_w128|tiny_w16` once the RTL
-exists. Until then this file is the reference.
+## Who passes what
+
+Each consumer sets the parameters its own way; the three sets above are what
+they agree on.
+
+- **The Verilator harness** takes them as make variables:
+  `make harness HARNESS_CFG="WB=64 B_MAX=1 VL=4 VSRAM_WORDS=4096"`, which
+  `make perf` passes on unchanged; `make bringup` takes its widths from
+  `sw/quettos/compare.py`, which calls the same makefile once per configuration
+  it compares. `sim/verilator/Makefile` turns each variable into a Verilator
+  `-G` parameter and a matching `-D` define for the C++ side, and names the
+  object directory after a hash of the RTL, the C++ and the configuration, so
+  two configurations never share a build.
+- **The synthesis scripts** set them with `chparam -set` after a deferred
+  `read_verilog` and before `hierarchy`, one block per configuration in each
+  `syn/synth_*.ys`. `scripts/synth_report.py` reads the `Parameter \X = Y` lines
+  Yosys prints back, so every table in `syn/reports/` states the configuration
+  the tool actually elaborated.
+- **The cocotb benches** hold `tiny_w16` as `qc_runner.TINY` and hand a top the
+  parameters it declares through `parameters=`; a bench that wants another width
+  names it in its own `test_*.py` (`sim/cocotb/README.md`). The
+  `*_elaborates` tests run all three parsers over a module in all three
+  configurations.
+- **`scripts/lint.sh`** elaborates every top at its declared defaults and passes
+  only the `ROM_FILE*` image paths, which is the one parameter that must be a
+  string: `-G` for Verilator, `-P` for Icarus, `chparam -set` for Yosys.
+
+`sw/quettos/compare.py` keeps the same three sets in one place
+(`Config(wb, b_max, vl, vsram_words)`) and drives both the compiler and the
+harness from them, which is what makes an RTL-versus-simulator run use one
+configuration on both sides.

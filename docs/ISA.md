@@ -19,12 +19,19 @@ The compiler emits, per model:
 
 The sequencer fetches descriptors at `PC` (2 per 64-byte beat, 8-deep prefetch,
 one fetch slot reserved per 64 stream beats when the queue is below 4), issues
-**strictly in order** (the next descriptor issues when all units have retired;
-GEMV retires when requant has drained) and stops at `HALT`. Per token the host
-writes `TOK`, `POS`, `ROW_EN` and pulses `START`; all position-dependent values
+**strictly in order** (one descriptor is in flight at a time; a GEMV retires
+when the requant has drained and the weight stream is idle) and stops at
+`HALT`, or earlier on a fault (program end, below). `CTRL.STEP` runs exactly
+one descriptor and reports `STEP_HALTED` once its writes are acknowledged, so
+the host can read every register, and the memory the descriptor wrote, between
+descriptors (`docs/RTL.md` 3.5, step mode). Per token the host writes `TOK`,
+`POS`, `ROW_EN` and pulses `START`; all position-dependent values
 (`n_from_pos`, `k_from_pos`, `len_from_pos`, KV addresses, RoPE row) derive in
 hardware from `POS`. The programs carry no `FENCE`: the hardware fences every
-memory-reading descriptor while KV writes are outstanding.
+memory-reading descriptor, and the descriptor prefetch with them, while KV or
+dump writes are outstanding. The fence orders the bus; a descriptor already
+prefetched is not read again, so a program keeps writes to its own descriptor
+bytes outside the prefetch window (`docs/RTL.md` 3.4).
 
 A decode program is `1 + L (16 + 2 KV + 3 H) + 4` descriptors (`L` layers,
 `KV` KV heads, `H` query heads), the prefill program three fewer: Qwen2.5-0.5B
@@ -92,10 +99,14 @@ Rows (`B_MAX` activation rows share one weight stream):
   `row_mask[r] & ROW_EN[r]` is set; bits at or above `B_MAX` are ignored. A
   participating row reads VSRAM / SREG row `src_row + r` and writes row
   `dst_row + r`; both lie below `B_MAX` (a compiler assertion; the simulator
-  rejects a descriptor that breaks it).
+  rejects a descriptor that breaks it, and the hardware halts it with
+  `FAULT = ROW` rather than address a bank that does not exist).
 - Rows execute in ascending order. A descriptor whose participating set is
   empty retires as a NOP: `DESCRIPTORS` counts it and nothing else changes (no
   memory traffic, no VSRAM, SREG, KV, ARGMAX or counter update).
+- A GEMV or EMBED whose executed `N` or `K` is zero, and a V op with `n == 0`,
+  retire the same way. The `ERR_BOUNDS` events of the POS derivation are still
+  counted, since they describe the descriptor and not its work.
 - `ARGMAX_TOK` / `ARGMAX_VAL` hold the result of the highest-numbered
   participating row; a DUMP writes row `r`'s outputs at `addr_c + r * 4 * N`.
   The `SAT_*` and `ERR_*` counters are shared by all rows.
@@ -148,8 +159,29 @@ On-chip ranges:
 
 Program end:
 
-- An unknown opcode stops the program as HALT does and sets `STATUS.ERR`
-  (`isa.opcode_of` / `isa.is_opcode` probe the byte before decoding).
+- `HALT` sets `STATUS.DONE` and snapshots the PERF counters. It also waits for
+  every issued write to be acknowledged, so `DONE` means the KV and dump bytes
+  of the program have landed.
+- A descriptor the hardware cannot execute stops the program the way `HALT`
+  does, including that wait -- `STATUS.DONE` on the first cycle every issued
+  write is acknowledged, PERF snapshotted, nothing further issued -- and in
+  addition sets `STATUS.ERR` with the reason in `STATUS.FAULT`, the opcode byte
+  in `STATUS.FAULT_OP` and `PC` left on the descriptor that faulted. Nothing of
+  that descriptor executes and none of its work is counted. `DONE` therefore
+  carries the same guarantee on the fault path as on the `HALT` path.
+- `CTRL.ABORT` ends a run the same way: issue stops on the cycle the write is
+  seen, the descriptor in flight retires, and `DONE` follows once every issued
+  write is acknowledged.
+
+| `FAULT` | Name | Raised when | `FAULT_OP` |
+|---|---|---|---|
+| 0 | `NONE` | no fault; the value while a program runs | 0 |
+| 1 | `OPCODE` | the opcode byte is none of the twelve (`isa.opcode_of` / `isa.is_opcode` probe it before decoding), or it names a unit the build does not carry -- a `qcore_top` built without `qcore_vpu_top` refuses the six vector opcodes this way | that byte |
+| 2 | `ROW` | a participating row's `src_row + r` or `dst_row + r` is at or above `B_MAX` | the opcode |
+| 3 | `PC_ALIGN` | `START` or `STEP` with a `PC` that is not a multiple of 32 | 0 |
+
+  `isa.status_word()` builds the word and `isa.status_fault()` reads the two
+  fields back; `quettos.isa_sim` reports the `OPCODE` fault the same way.
 
 Compiler assertions: GEMV / EMBED `vs_dst` is 8-aligned, `K < 2^16`,
 `n < 2^24`, every VSRAM range fits the map, every SREG index is below 32, and
@@ -169,7 +201,7 @@ the requant shift `S` is in `[0, 63]` for all reachable exponents.
 | `0x24` | VSOFTMAX | scores at `vs_src`, `len = POS+1` or `imm`, clamped into `[1, n]`; V-scale meta at `addr_a`; `w` int16 to `vs_dst` (zeros from `len` to `n`); `SREG[sreg_dst] = sfloat(2^(1+e_max))`; `sh0 = FRAC_S` |
 | `0x25` | VSUBC | `dst = sat32(src - const row streamed from addr_a)`, `n` elements |
 | `0x30` | KVWRITE | the 64 int8 values at `vs_src` (low byte of each element), `k` = token capacity; flag `TRANSPOSED`: 64 single-byte-strobe writes into `addr_a + (POS/WB)*64*WB + d*WB + POS%WB`; else `ceil(64/WB)` `WB`-byte beats, tile `t` at `addr_a + (t*k + POS)*WB` holding dims `t*WB ..` zero-padded; meta `{0, SREG[sreg_src]}` -> `addr_m + POS*8`; `POS >= k` writes nothing and counts in `ERR_BOUNDS` |
-| `0x31` | FENCE | wait for write-ack count == issued (auto-fence is implicit; explicit FENCE exists for step mode) |
+| `0x31` | FENCE | wait for write-ack count == issued (the auto-fence ahead of every memory-reading descriptor is implicit; an explicit FENCE parks a program at a point where every issued write is acknowledged) |
 
 Removed from v1 (v1.1): VCOPY, VADD/VSUB/VMOV, PERFMARK, last_row_only,
 LOOP/JUMP.
@@ -209,6 +241,66 @@ All multi-byte quantities are **little-endian**.
 - **Dump**: `N` int32 little-endian at `addr_c` (field conventions above).
 - **KV cache**: see `MEMORY_MAP.md`.
 
+## Bring-up programs
+
+Two short programs over a compiled image bring a machine up: one for a machine
+with the vector unit, one for the GEMV and EMBED units alone.
+Both are small enough to read end to end in a waveform and both are
+self-checking on a tied-embedding model: v1 ties the embedding and the LM head,
+so the largest logit of the embedding row of token `t` against the embedding
+matrix is row `t` itself. `ARGMAX_TOK == TOK` for every token of the model, and
+`SAT_REQ`, `SAT_VPU`, `ERR_SHIFT` and `ERR_BOUNDS` all read 0.
+
+### Four descriptors: the whole decode path
+
+`bringup_program` in `sw/tests/test_isa.py` assembles it from the model's own
+`decode.prog` and runs it on `quettos.isa_sim` over every token of a random
+tiny model from `quettos.synthetic`, so `ARGMAX_TOK`, `ARGMAX_VAL`,
+`DESCRIPTORS`, `MACS` and `WT_BYTES` have a reference.
+
+| # | Descriptor | Exercises |
+|---|---|---|
+| 0 | `EMBED` -- descriptor 0 of `decode.prog` | fetch, dispatch, the TOK-gathered table read, the meta record, the requant, a VSRAM write |
+| 1 | `VQUANT` of the EMBED output into the activation slot | the vector unit, an SREG scale write |
+| 2 | `GEMV` with `out_mode = ARGMAX` -- the LM-head descriptor of `decode.prog` with its `out_mode` replaced | the weight stream, the tiles, the MAC rows, the requant, the ARGMAX CSRs |
+| 3 | `HALT` | the auto-fence, the PERF snapshot, `STATUS.DONE` |
+
+The VQUANT earns its place: a GEMV takes its `Sx` from
+`SREG[src_row + r][sreg_src]`, the SREG banks have no reset, and a VQUANT is
+what writes a scale there, so a program that reaches a GEMV without one has no
+defined activation scale.
+
+### Three descriptors: the GEMV and EMBED units
+
+`quettos.compiler.build_bringup` assembles it and `sw/quettos/compare.py` runs
+it on `qcore_top` through the Verilator harness and on `quettos.isa_sim` at the
+same time, comparing every VSRAM element, SREG word, dumped logit, CSR and PERF
+counter after each descriptor (`make bringup`, `make bringup-sweep`,
+`sw/tests/test_bringup.py`).
+
+| # | Descriptor | Exercises |
+|---|---|---|
+| 0 | `EMBED` -- descriptor 0 of `decode.prog`, writing the LM head's activation slot, with `sh1` raised by `q` | fetch, dispatch, the TOK-gathered table read, the meta record, the requant, a VSRAM write |
+| 1 | `GEMV` in `ARGMAX_DUMP` mode -- the LM-head descriptor of `decode.prog` | the weight stream, the tiles, the MAC rows, the requant, the ARGMAX CSRs and a dump of all `N` int32 logits |
+| 2 | `HALT` | the auto-fence, the PERF snapshot, `STATUS.DONE` |
+
+The activation scale is the host's here: `SREG[0][sreg_src] = 2^-(FRAC_X + q)`,
+written before `START`, paired with the EMBED output shift raised by the same
+`q = max(0, bitlen(absmax) - 15)`. That is the scale a `VQUANT` would have
+written, and it keeps the gathered row inside the int16 window a GEMV
+activation is read through. Both models are given the same scale; every other
+input is the compiled image. `ARGMAX_DUMP` puts every logit in memory, so the
+comparison covers the whole output vector and not only its argmax.
+
+Format, both programs: the same 32-byte descriptors as any program, assembled
+with `isa.assemble` and placed in the 1 MB program window of `image.bin` after
+`prefill.prog`, at `programs.prefill.addr + programs.prefill.size` rounded up
+to 64 from `layout.json`; nothing else in the image moves. The three-descriptor
+program's dump region follows the descriptors at the next 64-byte boundary,
+inside the same window. The host writes the program address to `PC`, the token
+under test to `TOK`, `POS = 0` and `ROW_EN = 1`, then pulses `START` and waits
+for `STATUS.DONE`.
+
 ## CSR table
 
 The host sees 64 32-bit words (256 bytes). `sw/quettos/isa.py` is the source;
@@ -220,14 +312,15 @@ clean under `verilator -Wall`) and `sim/verilator/csr_defs.hpp`
 them and `sw/tests/test_isa.py` asserts the three agree and runs the include
 through the three lint parsers. The same table carries the opcodes, output
 modes, flag masks and descriptor field positions (`QCORE_DESC_<FIELD>_LSB` /
-`_W`). Access: `rw` host read/write, `ro` read-only, `w1p` write-one-to-pulse
-(a 1 written to a bit acts once; reads return 0).
+`_W`). Access: `rw` host read/write, `ro` read-only, `w1p` write-one-to-pulse (a 1
+written to a bit acts once; reads return 0), `w1c` read plus write-one-to-clear
+(a 1 written to a bit clears it).
 
 | Word | Name | Access | Contents |
 |---|---|---|---|
-| 0 | `CTRL` | w1p | bit 0 `START`: run from `PC` to HALT; bit 1 `STEP`: execute the descriptor at `PC`, then set `STEP_HALTED` (`DONE` if it was HALT); bit 2 `ABORT`: stop issuing, let the in-flight descriptor retire, set `DONE`. `START` and `STEP` are ignored while `BUSY` |
-| 1 | `STATUS` | ro | bit 0 `DONE` (set by HALT and ABORT), bit 1 `BUSY` (a descriptor is in flight or queued), bit 2 `STEP_HALTED`, bit 3 `ERR` (an unknown opcode was fetched). `START` and `STEP` clear `DONE`, `STEP_HALTED` and `ERR` |
-| 2 | `PC` | rw | byte address of the next descriptor; written 64-byte aligned before `START`, advanced by 32 per retired descriptor |
+| 0 | `CTRL` | w1p | bit 0 `START`: clear the counters and run from `PC` to HALT; bit 1 `STEP`: execute the descriptor at `PC`, then set `STEP_HALTED` once every write it issued is acknowledged (`DONE` if it was HALT); bit 2 `ABORT`: stop issuing, let the descriptor in flight retire, set `DONE` once every issued write is acknowledged. A descriptor already popped but not issued does not run, and `PC` is left on it. `START` and `STEP` act only while `BUSY` is low and `ABORT` only while it is high, and `START` wins over `STEP` in one write, so a write produces at most one pulse. Reads return 0 |
+| 1 | `STATUS` | w1c | bit 0 `DONE` (set by HALT, by ABORT and by a fault), bit 1 `BUSY` (a descriptor is in flight or queued), bit 2 `STEP_HALTED` (a stepped descriptor finished and its writes are acknowledged), bit 3 `ERR` (a fault stopped the program), bits `[7:4]` `FAULT` (the code below), bits `[15:8]` `FAULT_OP` (the opcode byte that faulted). `START` and `STEP` clear `DONE`, `STEP_HALTED`, `ERR` and both fault fields, and so does writing a one to a bit -- a one in `ERR` clears `FAULT` and `FAULT_OP` with it. `BUSY` and the reserved bits ignore writes |
+| 2 | `PC` | rw | byte address of the next descriptor; written 32-byte aligned before `START` (64-byte aligned at the start of a program), advanced by 32 per retired descriptor, left where it is by a fault |
 | 3 | `ROW_EN` | rw | bit `r` enables activation row `r` for the token |
 | 4 | `TOK` | rw | token id gathered by EMBED |
 | 5 | `POS` | rw | position of the token; source of every POS-derived value |
@@ -243,9 +336,13 @@ modes, flag masks and descriptor field positions (`QCORE_DESC_<FIELD>_LSB` /
 | 17 + 2i | `PERF<i>_HI` | ro | bits `[63:32]` of `PERF[i]` |
 | 48-63 | | | zero |
 
-`START` clears the PERF, SAT and ERR counters; HALT snapshots the PERF
-counters into the halves above, so they read stable while the host prepares
-the next token. `PERF` indices:
+The four `rw` registers take a host write only while `BUSY` is low, so the
+values a descriptor sees cannot change under it; the host reads a register back
+to confirm. `START` clears the PERF, SAT and ERR counters; `STEP` clears none of
+them, so a stepped descriptor's contribution is the difference between two
+consecutive steps. The PERF counters are snapshotted into the halves above on a
+HALT retire and at the end of a STEP, an ABORT or a fault, so they read stable
+while the host works between descriptors or prepares the next token. `PERF` indices:
 
 | `i` | Name | Counts |
 |---|---|---|
@@ -259,14 +356,16 @@ the next token. `PERF` indices:
 | 7 | `STALL_DRAIN` | cycles draining requant after the last beat of a GEMV |
 | 8 | `RD_BEATS` | read beats returned by QMEM (weight-port busy cycles) |
 | 9 | `RD_BYTES` | bytes in those beats |
-| 10 | `WT_BYTES` | weight bytes consumed: the tile bytes and the padded meta records (`ceil(N/WB)*WB*8` B) of every GEMV without POS-derived dimensions, plus the `k` table bytes and the 8 meta bytes an EMBED gathers; gammas, constants and the RoPE row are not counted. Equals `traffic.<program>.wt_bytes` in `layout.json` |
+| 10 | `WT_BYTES` | weight bytes consumed, **per participating row**: the tile bytes and the padded meta records (`ceil(N/WB)*WB*8` B) of every GEMV without POS-derived dimensions, plus the `k` table bytes and the 8 meta bytes an EMBED gathers, each multiplied by `popcount(rows)`; gammas, constants and the RoPE row are not counted. With one row this equals `traffic.<program>.wt_bytes` in `layout.json` |
 | 11 | `WR_BEATS` | write beats issued (KVWRITE, logit dump) |
 | 12 | `WR_BYTES` | bytes in those beats |
-| 13 | `MACS` | multiply-accumulates issued: `WB` lanes x beats for every GEMV, padded lanes and the attention GEMVs included. At position `POS` this is `traffic.<program>.macs + head_layers * (ceil((POS+1)/WB) * scores_macs_per_tile + (POS+1) * pv_macs_per_token)` with the three constants from `traffic.attention` in `layout.json` |
+| 13 | `MACS` | multiply-accumulates issued, **per participating row**: `popcount(rows) * ceil(N/WB) * WB * K` for every GEMV, padded lanes and the attention GEMVs included. With one row, at position `POS`, this is `traffic.<program>.macs + head_layers * (ceil((POS+1)/WB) * scores_macs_per_tile + (POS+1) * pv_macs_per_token)` with the three constants from `traffic.attention` in `layout.json` |
 | 14 | `DESCRIPTORS` | descriptors retired |
 | 15 | `FETCH_BEATS` | descriptor fetch beats |
 
-The harness asserts `BUSY = MAC_ACTIVE + STALL_MEM + STALL_VPU + STALL_KV +
-STALL_SEQ + STALL_DRAIN` and cross-checks the byte counters against its memory
-model. The ISA simulator counts `DESCRIPTORS`, `MACS` and `WT_BYTES`; the
-cycle and beat counters are the RTL's.
+Buckets 2 to 7 are exclusive: every cycle with `BUSY` high belongs to exactly
+one of them, by the priority in `docs/RTL.md` 3.5. The harness asserts
+`BUSY = MAC_ACTIVE + STALL_MEM + STALL_VPU + STALL_KV + STALL_SEQ +
+STALL_DRAIN` and cross-checks the byte counters against its memory model. The
+ISA simulator counts `DESCRIPTORS`, `MACS` and `WT_BYTES`; the cycle and beat
+counters are the RTL's.

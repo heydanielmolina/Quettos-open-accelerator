@@ -87,10 +87,18 @@
 `define QCORE_STATUS_BUSY 1
 `define QCORE_STATUS_STEP_HALTED 2
 `define QCORE_STATUS_ERR 3
+`define QCORE_STATUS_FAULT_LSB 4
+`define QCORE_STATUS_FAULT_W 4
+`define QCORE_STATUS_FAULT_OP_LSB 8
+`define QCORE_STATUS_FAULT_OP_W 8
+`define QCORE_FAULT_NONE 0
+`define QCORE_FAULT_OPCODE 1
+`define QCORE_FAULT_ROW 2
+`define QCORE_FAULT_PC_ALIGN 3
 `define QCORE_CSR_WORDS 64
 /// w1p: bit 0 START, bit 1 STEP, bit 2 ABORT
 `define QCORE_CSR_CTRL 0
-/// ro: bit 0 DONE, bit 1 BUSY, bit 2 STEP_HALTED, bit 3 ERR
+/// w1c: bit 0 DONE, bit 1 BUSY, bit 2 STEP_HALTED, bit 3 ERR, [7:4] FAULT, [15:8] FAULT_OP
 `define QCORE_CSR_STATUS 1
 /// rw: byte address of the next descriptor
 `define QCORE_CSR_PC 2

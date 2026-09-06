@@ -747,8 +747,55 @@ CSR_WORDS = 64  # the CSR window: 64 words = 256 bytes
 PERF_BASE = 16  # PERF[i] low half at PERF_BASE + 2 i, high half at PERF_BASE + 2 i + 1
 PERF_COUNT = 16
 
+
+class Fault(IntEnum):
+    """``STATUS.FAULT``: why the sequencer stopped the program (0 while it runs)."""
+
+    NONE = 0
+    OPCODE = 1  # the opcode byte is none of the twelve
+    ROW = 2  # a participating row addresses a VSRAM / SREG bank at or above B_MAX
+    PC_ALIGN = 3  # START or STEP with a PC that is not a multiple of DESC_BYTES
+
+
 CTRL_BITS: dict[str, int] = {"START": 0, "STEP": 1, "ABORT": 2}
 STATUS_BITS: dict[str, int] = {"DONE": 0, "BUSY": 1, "STEP_HALTED": 2, "ERR": 3}
+# multi-bit STATUS fields, valid while ERR is set: name -> (lsb, width)
+STATUS_FIELDS: dict[str, tuple[int, int]] = {"FAULT": (4, 4), "FAULT_OP": (8, 8)}
+
+
+def status_word(
+    *,
+    done: bool = False,
+    busy: bool = False,
+    step_halted: bool = False,
+    err: bool = False,
+    fault: Fault = Fault.NONE,
+    fault_op: int = 0,
+) -> int:
+    """The 32-bit ``STATUS`` word from its bits and fault fields (``docs/ISA.md``, CSR table)."""
+    if not 0 <= int(fault_op) < 256:
+        raise ValueError(f"fault_op = {fault_op} does not fit a byte")
+    word = 0
+    for name, value in (
+        ("DONE", done),
+        ("BUSY", busy),
+        ("STEP_HALTED", step_halted),
+        ("ERR", err),
+    ):
+        word |= int(bool(value)) << STATUS_BITS[name]
+    word |= int(Fault(fault)) << STATUS_FIELDS["FAULT"][0]
+    word |= int(fault_op) << STATUS_FIELDS["FAULT_OP"][0]
+    return word
+
+
+def status_fault(word: int) -> tuple[Fault, int]:
+    """``(fault, opcode byte)`` of a ``STATUS`` word; ``(Fault.NONE, 0)`` when no fault is set."""
+    lsb, width = STATUS_FIELDS["FAULT"]
+    code = Fault((word >> lsb) & ((1 << width) - 1))
+    lsb, width = STATUS_FIELDS["FAULT_OP"]
+    return code, (word >> lsb) & ((1 << width) - 1)
+
+
 PERF_INDEX: dict[str, int] = {
     "CYCLES": 0,
     "BUSY": 1,
@@ -779,7 +826,12 @@ def _perf_csrs() -> tuple[Csr, ...]:
 
 CSRS: tuple[Csr, ...] = (
     Csr("CTRL", 0, "w1p", "bit 0 START, bit 1 STEP, bit 2 ABORT"),
-    Csr("STATUS", 1, "ro", "bit 0 DONE, bit 1 BUSY, bit 2 STEP_HALTED, bit 3 ERR"),
+    Csr(
+        "STATUS",
+        1,
+        "w1c",
+        "bit 0 DONE, bit 1 BUSY, bit 2 STEP_HALTED, bit 3 ERR, [7:4] FAULT, [15:8] FAULT_OP",
+    ),
     Csr("PC", 2, "rw", "byte address of the next descriptor"),
     Csr("ROW_EN", 3, "rw", "bit r enables activation row r"),
     Csr("TOK", 4, "rw", "token id for EMBED"),
@@ -841,6 +893,9 @@ def definitions() -> list[tuple[str, int]]:
     defs += [(f"KVW_{fl.name}", fl.value) for fl in KvwriteFlag]
     defs += [(f"CTRL_{name}", bit) for name, bit in CTRL_BITS.items()]
     defs += [(f"STATUS_{name}", bit) for name, bit in STATUS_BITS.items()]
+    for name, (lsb, width) in STATUS_FIELDS.items():
+        defs += [(f"STATUS_{name}_LSB", lsb), (f"STATUS_{name}_W", width)]
+    defs += [(f"FAULT_{f.name}", f.value) for f in Fault]
     defs.append(("CSR_WORDS", CSR_WORDS))
     defs += [(f"CSR_{c.name}", c.word) for c in CSRS]
     defs += [("PERF_BASE", PERF_BASE), ("PERF_COUNT", PERF_COUNT)]
@@ -865,7 +920,13 @@ def check_tables() -> None:
     words = [c.word for c in CSRS]
     if len(set(words)) != len(words) or max(words) >= CSR_WORDS:
         raise AssertionError("CSR offsets collide or leave the window")
-    if any(c.access not in ("rw", "ro", "w1p") for c in CSRS):
+    if any(c.access not in ("rw", "ro", "w1p", "w1c") for c in CSRS):
         raise AssertionError("unknown CSR access")
+    taken = set(STATUS_BITS.values())
+    for name, (lsb, width) in STATUS_FIELDS.items():
+        bits = set(range(lsb, lsb + width))
+        if bits & taken or lsb + width > 32:
+            raise AssertionError(f"STATUS field {name} overlaps or leaves the word")
+        taken |= bits
     if sorted(PERF_INDEX.values()) != list(range(PERF_COUNT)):
         raise AssertionError("PERF_INDEX must enumerate 0 .. PERF_COUNT-1")

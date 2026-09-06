@@ -1,0 +1,26 @@
+# Yosys synth_xilinx (xc7) of qcore_seq_fetch on its own, in both
+# configurations. WB sets the beat width and with it the bytes per request:
+# 64 bytes (two descriptors in one beat) in the demo build, 32 bytes (one
+# descriptor over two beats) in the tiny one. DQ_DEPTH is the descriptor queue.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_seq_fetch.log -s syn/synth_seq_fetch.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_seq_fetch.md.
+
+# ---- demo: WB = 64, DQ_DEPTH = 8
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_seq_fetch.sv
+chparam -set WB 64 -set DQ_DEPTH 8 qcore_seq_fetch
+hierarchy -check -top qcore_seq_fetch
+synth_xilinx -family xc7 -top qcore_seq_fetch
+script syn/report.ys
+
+# ---- tiny: WB = 16, DQ_DEPTH = 8
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_seq_fetch.sv
+chparam -set WB 16 -set DQ_DEPTH 8 qcore_seq_fetch
+hierarchy -check -top qcore_seq_fetch
+synth_xilinx -family xc7 -top qcore_seq_fetch
+script syn/report.ys

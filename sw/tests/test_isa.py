@@ -1,6 +1,6 @@
 """Descriptor ISA: the documented bit layout, encode/decode round trips at every field extreme,
-the stability of the ``.lst`` disassembly, the opcode helpers and the CSR map against the
-generated SystemVerilog and C++ headers."""
+the stability of the ``.lst`` disassembly, the opcode helpers, the CSR map against the generated
+SystemVerilog and C++ headers, and the bring-up program on the ISA simulator."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import subprocess
 
 import numpy as np
 import pytest
-from quettos import cli, csrgen, isa
+from quettos import cli, csrgen, isa, isa_sim, synthetic
 from quettos.isa import Descriptor, Opcode, OutMode
 from quettos.numerics import SFloat
 
@@ -491,11 +491,31 @@ def test_csr_map() -> None:
     with pytest.raises(ValueError):
         isa.perf_words(16)
     assert isa.CSR_BY_NAME["CTRL"].access == "w1p" and isa.CSR_BY_NAME["PC"].access == "rw"
-    assert all(isa.CSR_BY_NAME[n].access == "ro" for n in ("STATUS", "SAT_REQ", "PERF3_HI"))
+    assert isa.CSR_BY_NAME["STATUS"].access == "w1c"
+    assert all(isa.CSR_BY_NAME[n].access == "ro" for n in ("ARGMAX_TOK", "SAT_REQ", "PERF3_HI"))
     assert isa.CTRL_BITS == {"START": 0, "STEP": 1, "ABORT": 2}
     assert isa.STATUS_BITS == {"DONE": 0, "BUSY": 1, "STEP_HALTED": 2, "ERR": 3}
+    assert isa.STATUS_FIELDS == {"FAULT": (4, 4), "FAULT_OP": (8, 8)}
     assert sorted(isa.PERF_INDEX.values()) == list(range(16))
     assert isa.PERF_INDEX["CYCLES"] == 0 and isa.PERF_INDEX["BUSY"] == 1
+
+
+def test_status_word_carries_the_fault_fields() -> None:
+    """STATUS packs the four sticky bits, the fault code and the faulting opcode byte."""
+    assert isa.status_word() == 0
+    assert isa.status_word(done=True, busy=True) == 0b11
+    assert isa.status_word(step_halted=True) == 1 << 2
+    word = isa.status_word(done=True, err=True, fault=isa.Fault.OPCODE, fault_op=0x77)
+    assert word == (1 << 0) | (1 << 3) | (1 << 4) | (0x77 << 8)
+    assert isa.status_fault(word) == (isa.Fault.OPCODE, 0x77)
+    assert isa.status_fault(isa.status_word(busy=True)) == (isa.Fault.NONE, 0)
+    for f in isa.Fault:
+        w = isa.status_word(err=True, fault=f, fault_op=int(Opcode.GEMV))
+        assert isa.status_fault(w) == (f, 0x10) and w >> 16 == 0
+    assert [f.value for f in isa.Fault] == [0, 1, 2, 3]
+    assert {f.name for f in isa.Fault} == {"NONE", "OPCODE", "ROW", "PC_ALIGN"}
+    with pytest.raises(ValueError):
+        isa.status_word(fault_op=256)
 
 
 def _parse(text: str, pattern: re.Pattern[str]) -> dict[str, int]:
@@ -520,6 +540,9 @@ def test_generated_headers_agree_with_isa() -> None:
     assert defs["CSR_CTRL"] == 0 and defs["CSR_PERF15_HI"] == 47 and defs["CSR_WORDS"] == 64
     assert defs["OP_GEMV"] == 0x10 and defs["DESC_SH1_LSB"] == 216 and defs["DESC_IMM32_W"] == 32
     assert defs["VQ_W8"] == 1 and defs["KVW_TRANSPOSED"] == 1 and defs["OUT_ARGMAX_DUMP"] == 2
+    assert defs["STATUS_ERR"] == 3 and defs["STATUS_FAULT_LSB"] == 4 and defs["STATUS_FAULT_W"] == 4
+    assert defs["STATUS_FAULT_OP_LSB"] == 8 and defs["STATUS_FAULT_OP_W"] == 8
+    assert defs["FAULT_NONE"] == 0 and defs["FAULT_OPCODE"] == 1 and defs["FAULT_PC_ALIGN"] == 3
     assert "KV_TILE_TOKENS" not in defs and defs["DUMP_ALIGN"] == 64
     # the include is macros only (a module or package restates what it uses), guarded, no imports
     sv_text = csrgen.svh_text()
@@ -616,3 +639,90 @@ def test_helpers_reject_out_of_range_fixed_point_classes() -> None:
         isa.vsilumul(vs_src=0, vs_aux=64, vs_dst=128, n=64, frac_gu=5, sh_h=10, sreg_dst=0)
     with pytest.raises(ValueError):
         isa.vsoftmax(vs_src=0, vs_dst=64, n=64, frac_s=3, addr_a=64, sreg_dst=0)
+
+
+# --------------------------------------------------------------------------- bring-up program
+
+
+def bringup_program(compiled) -> tuple[list[Descriptor], int]:
+    """The four descriptors of ``docs/ISA.md`` (bring-up program) and the address they load at.
+
+    EMBED and the ARGMAX LM-head GEMV come from the compiled ``decode.prog``;
+    the VQUANT between them turns the EMBED output into the activation the GEMV
+    reads and writes the scale into the SREG the GEMV names.  The program goes
+    into the program window behind ``prefill.prog``, so no other region moves.
+    """
+    compiler = pytest.importorskip("quettos.compiler")
+    layout = compiled.layout
+    descs = isa.parse((compiled.out_dir / "decode.prog").read_bytes())
+    embed = next(d for d in descs if d.opcode is Opcode.EMBED)
+    lm = next(d for d in descs if d.opcode is Opcode.GEMV and d.out_mode is OutMode.ARGMAX)
+    vs = {entry["name"]: entry for entry in layout["vsram"]["map"]}
+    quant = isa.vquant(
+        vs_src=embed.vs_dst,
+        vs_dst=lm.vs_src,
+        n=embed.k,
+        width=16,
+        frac_in=layout["frac"]["X"],
+        sreg_dst=lm.sreg_src,
+    )
+    assert (quant.vs_src, quant.vs_dst) == (vs["X"]["start"], vs["A"]["start"])
+    prefill = layout["programs"]["prefill"]
+    addr = compiler.align_up(prefill["addr"] + prefill["size"])
+    return [embed, quant, lm, isa.halt()], addr
+
+
+def test_bringup_program_runs_on_the_isa_simulator(tmp_path) -> None:
+    """Four descriptors over a tiny model: the argmax of a tied LM head is the token itself."""
+    compiler = pytest.importorskip("quettos.compiler")
+    shape = synthetic.SHAPES[0]
+    syn = synthetic.build(shape, seed=0, out_dir=tmp_path / "syn")
+    compiled = compiler.compile(
+        syn.quant, syn.spec, out_dir=tmp_path / "img", max_ctx=64, wb=64, a_bits=16
+    )
+    program, addr = bringup_program(compiled)
+    assert [d.opcode for d in program] == [Opcode.EMBED, Opcode.VQUANT, Opcode.GEMV, Opcode.HALT]
+    blob = isa.assemble(program)
+    assert len(blob) == 4 * isa.DESC_BYTES and addr % isa.PROGRAM_ALIGN == 0
+    assert isa.parse(blob) == program
+
+    m = isa_sim.Machine.from_file(compiled.image_path, wb=64)
+    m.mem[addr : addr + len(blob)] = blob
+    for tok in range(shape.vocab):
+        m.csr["TOK"], m.csr["POS"], m.csr["ROW_EN"] = tok, 0, 1
+        assert isa_sim.run_program(m, None, pc=addr) == 4
+        assert m.status("DONE") and not m.status("ERR")
+        assert m.fault_state() == (isa.Fault.NONE, 0)
+        assert m.csr["PC"] == addr + len(blob)
+        assert m.csr["ARGMAX_TOK"] == tok, f"token {tok} -> {m.csr['ARGMAX_TOK']}"
+        assert m.argmax_val() > 0
+        assert [m.csr[c] for c in ("SAT_REQ", "SAT_VPU", "ERR_SHIFT", "ERR_BOUNDS")] == [0] * 4
+        assert m.perf_value("DESCRIPTORS") == 4
+        tiles = -(-shape.vocab // 64)
+        assert m.perf_value("MACS") == tiles * 64 * shape.hidden
+        assert m.perf_value("WT_BYTES") == (
+            shape.hidden + isa.META_BYTES + tiles * shape.hidden * 64 + tiles * 64 * isa.META_BYTES
+        )
+
+
+def test_bringup_program_reports_an_unknown_opcode(tmp_path) -> None:
+    """A byte no opcode uses halts the bring-up program with FAULT = OPCODE and PC on it."""
+    compiler = pytest.importorskip("quettos.compiler")
+    syn = synthetic.build(synthetic.SHAPES[0], seed=0, out_dir=tmp_path / "syn")
+    compiled = compiler.compile(
+        syn.quant, syn.spec, out_dir=tmp_path / "img", max_ctx=64, wb=64, a_bits=16
+    )
+    program, addr = bringup_program(compiled)
+    blob = isa.assemble(program[:2]) + bytes([0x7F]) + bytes(isa.DESC_BYTES - 1)
+    m = isa_sim.Machine.from_file(compiled.image_path, wb=64)
+    m.mem[addr : addr + len(blob)] = blob
+    m.csr["TOK"], m.csr["POS"], m.csr["ROW_EN"] = 3, 0, 1
+    assert isa_sim.run_program(m, None, pc=addr) == 2
+    assert m.status("ERR") and m.status("DONE")
+    assert m.fault_state() == (isa.Fault.OPCODE, 0x7F)
+    assert m.csr["PC"] == addr + 2 * isa.DESC_BYTES, "PC stays on the descriptor that faulted"
+    assert m.csr["STATUS"] == isa.status_word(
+        done=True, err=True, fault=isa.Fault.OPCODE, fault_op=0x7F
+    )
+    m.start()
+    assert m.csr["STATUS"] == 0 and m.fault_state() == (isa.Fault.NONE, 0)

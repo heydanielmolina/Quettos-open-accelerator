@@ -1,7 +1,9 @@
-# Quettos Core nightly. Skeleton: every job is gated with `if: false`
-# until its deliverable lands (docs/ROADMAP.md). Jobs listed per
-# docs/VERIFICATION.md layer 8: full-top synth + reports, ECP5 (optional),
-# Qwen 4+1 end-to-end, `--x-initial unique`, quality regeneration.
+# Quettos Core nightly: the checks that are too long for a pull request
+# (docs/VERIFICATION.md layer 8). Each job is held by `if: false` until the
+# piece it runs on is in the tree; the gate names that condition and the job's
+# own step repeats it, so a manual run reports what the job is waiting for.
+# The whole-core xc7 synthesis is not here: `make synth` runs it on every pull
+# request and rewrites syn/reports/qcore_top.md from the run.
 name: nightly
 
 on:
@@ -13,50 +15,42 @@ env:
   OSS_CAD_SUITE_VERSION: "2026-09-01"
 
 jobs:
-  synth-full-xc7:
-    if: false   # planned: full qcore_top synth_xilinx -flatten + syn/reports/xc7.md
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
-
   synth-ecp5:
-    if: false   # planned: synth_ecp5 stat + yowasp-nextpnr-ecp5 fmax
+    if: false   # runs with the ECP5 target: synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+      - run: echo "synth-ecp5 runs with the ECP5 target -- synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)"
 
   e2e-qwen-4plus1:
-    if: false   # planned: Qwen2.5-0.5B-Instruct 4 prompt + 1 generated token, RTL == isa_sim == golden
+    if: false   # Qwen2.5-0.5B-Instruct 4 prompt + 1 generated token, RTL == isa_sim == golden; the compiled program's six vector opcodes run on qcore_vpu_top
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+      - run: echo "e2e-qwen-4plus1 runs Qwen 4+1 end to end; the compiled program's six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
 
   e2e-smollm2-8plus4:
-    if: false   # planned: SmolLM2 8+4 on WB=64 (here if the PR job exceeds 15 min)
+    if: false   # SmolLM2 8+4 on WB=64, here rather than in the PR matrix when that job would exceed 15 minutes; its six vector opcodes run on qcore_vpu_top
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+      - run: echo "e2e-smollm2-8plus4 runs SmolLM2 8+4 on WB=64; the compiled program's six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
 
   x-initial-unique:
-    if: false   # planned: determinism under Verilator --x-initial unique
+    if: false   # determinism of a whole program under Verilator --x-initial unique; that program's six vector opcodes run on qcore_vpu_top
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+      - run: echo "x-initial-unique replays a whole program under --x-initial unique; its six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
 
   quality-regen:
-    if: false   # planned: >= 32k WikiText-2 tokens, golden vs HF fp32 (installs the optional 'ref' group)
+    if: false   # golden vs HF fp32 over >= 32k WikiText-2 tokens (installs the optional 'ref' group); runs when `uv run quettos check` scores a set wider than the calibration corpus (docs/ROADMAP.md, v1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - run: echo "not implemented yet (see docs/ROADMAP.md)"
+      - run: echo "quality-regen scores >= 32k WikiText-2 tokens against HF fp32; uv run quettos check takes the wider set with the v1.1 quality work (docs/ROADMAP.md)"

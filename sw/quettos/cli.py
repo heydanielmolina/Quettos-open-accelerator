@@ -1,7 +1,8 @@
 """Command-line entry point: ``quettos <command>`` (installed by ``pyproject.toml``).
 
 Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
-``quantize``, ``compile``, ``golden``, ``isa-sim``, ``check``, ``csr-defs``.
+``quantize``, ``compile``, ``golden``, ``isa-sim``, ``compare``, ``check``,
+``csr-defs``.
 Each command is a thin wrapper over the module of the same name; the file
 formats they read and write are described in ``docs/``.
 """
@@ -305,6 +306,12 @@ def _cmd_isa_sim(args: argparse.Namespace) -> int:
     return status
 
 
+def _cmd_compare(args: argparse.Namespace) -> int:
+    from quettos import compare
+
+    return compare.run(args)
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
@@ -459,6 +466,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--quant", default=None, help="quantized model .npz for --compare")
     p.set_defaults(func=_cmd_isa_sim)
+
+    from quettos import compare
+
+    p = sub.add_parser("compare", help="RTL against the ISA simulator on the bring-up program")
+    compare.add_arguments(p)
+    p.set_defaults(func=_cmd_compare)
 
     p = sub.add_parser("check", help="quality of the integer golden model against fp32")
     p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")

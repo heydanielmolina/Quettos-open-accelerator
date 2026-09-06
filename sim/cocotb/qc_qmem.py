@@ -4,7 +4,9 @@
 ports from a byte-addressed sparse memory: fixed read latency, one beat per
 cycle (``bw_div`` beats every ``bw_div`` cycles), in-order return across
 tags, an in-flight window that throttles ``rd_req_ready``, write acks after
-the same latency.  Everything is sampled and driven on falling clock edges.
+the same latency.  A read takes its bytes when the request is accepted, so a
+write accepted while the burst is in flight leaves the returned data alone.
+Everything is sampled and driven on falling clock edges.
 Counters mirror the PERF byte counters (``rd_beats``, ``rd_bytes``,
 ``wr_beats``, ``wr_bytes`` = strobed bytes).
 """
@@ -24,7 +26,7 @@ PAGE = 4096
 @dataclass
 class _Beat:
     deliver: int  # rising-edge index at which the DUT samples the beat
-    addr: int
+    data: int  # the beat as memory held it when the request was accepted
     tag: int
     last: bool
 
@@ -135,7 +137,7 @@ class QmemModel:
             deliver = max(self._t + self.latency + i, self._last_deliver + self.bw_div)
             self._last_deliver = deliver
             self._pending.append(
-                _Beat(deliver, s.rd_addr + i * self.wb, s.rd_tag, i == s.rd_len - 1)
+                _Beat(deliver, self.beat(s.rd_addr + i * self.wb), s.rd_tag, i == s.rd_len - 1)
             )
 
     def _accept_write(self, s: _Sample) -> None:
@@ -167,7 +169,7 @@ class QmemModel:
             if self._pending and self._pending[0].deliver <= nxt:
                 b = self._pending.popleft()
                 self._sig("rd_data_valid").value = 1
-                self._sig("rd_data").value = self.beat(b.addr)
+                self._sig("rd_data").value = b.data
                 self._sig("rd_data_tag").value = b.tag
                 self._sig("rd_data_last").value = int(b.last)
                 self.rd_beats += 1

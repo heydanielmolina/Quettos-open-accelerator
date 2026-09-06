@@ -1,0 +1,29 @@
+# Yosys synth_xilinx (xc7) of the whole core, in both configurations. The
+# design is flattened so that `ltp` walks real cells: an unflattened module
+# instance is one node whose every input reaches every output, and the control
+# loop between the dispatcher and the units would then read as a cycle.
+# qcore_vpu_top is not instantiated, so the vector unit is absent from these
+# numbers; the GEMV, EMBED and KVWRITE datapath and the whole control path are
+# in them.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_top.log -s syn/synth_top.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_top.md.
+
+# ---- demo: WB = 64, B_MAX = 1, VSRAM_WORDS = 4096
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_csr.sv rtl/qcore_kv_writer.sv rtl/qcore_mac_lane_group.sv rtl/qcore_mem_arb.sv rtl/qcore_perf.sv rtl/qcore_requant.sv rtl/qcore_row.sv rtl/qcore_seq_dispatch.sv rtl/qcore_seq_fetch.sv rtl/qcore_stream_ctrl.sv rtl/qcore_vsram.sv rtl/qcore_top.sv
+chparam -set WB 64 -set B_MAX 1 -set VSRAM_WORDS 4096 -set FIFO_BEATS 128 -set ACC_W 40 -set META_FIFO_BEATS 16 -set MAX_BURST 64 -set DQ_DEPTH 8 qcore_top
+hierarchy -check -top qcore_top
+synth_xilinx -family xc7 -flatten -top qcore_top
+script syn/report.ys
+
+# ---- tiny: WB = 16, B_MAX = 2, VSRAM_WORDS = 2048
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_csr.sv rtl/qcore_kv_writer.sv rtl/qcore_mac_lane_group.sv rtl/qcore_mem_arb.sv rtl/qcore_perf.sv rtl/qcore_requant.sv rtl/qcore_row.sv rtl/qcore_seq_dispatch.sv rtl/qcore_seq_fetch.sv rtl/qcore_stream_ctrl.sv rtl/qcore_vsram.sv rtl/qcore_top.sv
+chparam -set WB 16 -set B_MAX 2 -set VSRAM_WORDS 2048 -set FIFO_BEATS 128 -set ACC_W 40 -set META_FIFO_BEATS 16 -set MAX_BURST 64 -set DQ_DEPTH 8 qcore_top
+hierarchy -check -top qcore_top
+synth_xilinx -family xc7 -flatten -top qcore_top
+script syn/report.ys

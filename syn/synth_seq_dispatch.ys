@@ -1,0 +1,29 @@
+# Yosys synth_xilinx (xc7) of qcore_seq_dispatch on its own, in both
+# configurations. WB is the GEMV tile width the executed N is rounded up to,
+# B_MAX the number of rows the per-row event sums run over.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_seq_dispatch.log -s syn/synth_seq_dispatch.ys
+# The dumps build/synth/qcore_seq_dispatch_dsp{,_tiny}.txt list the DSP48E1 with
+# its parameters and pins: it is the MACS / WT_BYTES product N_pad * K.
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_seq_dispatch.md.
+
+# ---- demo: WB = 64, B_MAX = 1
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_seq_dispatch.sv
+chparam -set WB 64 -set B_MAX 1 qcore_seq_dispatch
+hierarchy -check -top qcore_seq_dispatch
+synth_xilinx -family xc7 -top qcore_seq_dispatch
+tee -q -o build/synth/qcore_seq_dispatch_dsp.txt dump t:DSP48E1
+script syn/report.ys
+
+# ---- tiny: WB = 16, B_MAX = 2
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_seq_dispatch.sv
+chparam -set WB 16 -set B_MAX 2 qcore_seq_dispatch
+hierarchy -check -top qcore_seq_dispatch
+synth_xilinx -family xc7 -top qcore_seq_dispatch
+tee -q -o build/synth/qcore_seq_dispatch_dsp_tiny.txt dump t:DSP48E1
+script syn/report.ys

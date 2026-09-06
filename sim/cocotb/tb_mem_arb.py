@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 import cocotb
 import qc_stream
 from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge, RisingEdge
+from cocotb.triggers import FallingEdge, RisingEdge, Timer
 from cocotb.types import Logic
 from qc_qmem import QmemModel
 from qc_stream import ValidReadyDriver
@@ -323,10 +323,18 @@ async def routing_lat200_gaps(dut):
 
 
 def _writes(rng: random.Random, base: int, count: int) -> list[tuple[int, int, int]]:
-    return [
+    # The first two strobes are the extremes: every byte and one byte. A random
+    # draw reaches an all-ones strobe about once in 2**WB writes, so a truncated
+    # byte count would otherwise pass the whole bench.
+    writes = [
         (base + i * 64 + rng.randrange(0, 48), rng.getrandbits(DW), rng.randrange(1, 1 << WB))
         for i in range(count)
     ]
+    if count > 0:
+        writes[0] = (writes[0][0], writes[0][1], (1 << WB) - 1)
+    if count > 1:
+        writes[1] = (writes[1][0], writes[1][1], 1)
+    return writes
 
 
 @cocotb.test()
@@ -366,8 +374,44 @@ async def write_mux_priority_and_acks(dut):
 
 
 @cocotb.test()
+async def wr_idle_falls_in_the_cycle_the_write_is_accepted(dut):
+    """A read granted in the cycle a write is accepted must not pass it, so wr_idle is already low.
+
+    The stage registers an accepted write on the next edge, so a wr_idle built from the stage and
+    the ack counters alone still reads idle in the cycle it takes the write -- and the descriptor
+    fetch that wr_idle releases is granted in that same cycle, ahead of the write.
+    """
+    bench, rng = await _setup(dut, latency=32)
+    await FallingEdge(dut.clk)
+    assert _val(dut.wr_idle) == 1, "the write path is not idle before any write"
+    for p in "kd":
+        addr, data, strb = _writes(rng, WRITE_BASE + (0x10000 if p == "d" else 0), 1)[0]
+        getattr(dut, f"{p}_wr_addr").value = addr
+        getattr(dut, f"{p}_wr_data").value = data
+        getattr(dut, f"{p}_wr_strb").value = strb
+        getattr(dut, f"{p}_wr_valid").value = 1
+        await Timer(1, unit="ns")  # the same cycle, before the edge that takes the write
+        assert _val(getattr(dut, f"{p}_wr_ready")) == 1, f"the stage did not take the {p} write"
+        assert _val(dut.wr_idle) == 0, (
+            f"wr_idle high in the cycle the {p} write is accepted: a fetch granted now "
+            "would pass the write"
+        )
+        await FallingEdge(dut.clk)
+        getattr(dut, f"{p}_wr_valid").value = 0
+        assert _val(dut.wr_idle) == 0, "wr_idle high with the write in the stage"
+        for _ in range(200):
+            await FallingEdge(dut.clk)
+            if _val(dut.wr_idle) == 1:
+                break
+        else:
+            raise AssertionError(f"wr_idle never rose again after the {p} write")
+    await bench.drain()
+    assert bench.model.wr_beats == 2, f"{bench.model.wr_beats} writes reached the memory"
+
+
+@cocotb.test()
 async def wr_idle_timing(dut):
-    """wr_idle falls the cycle after a write is accepted and rises the cycle after its ack."""
+    """wr_idle is low from the cycle a write is accepted and rises the cycle after its ack."""
     bench, rng = await _setup(dut, latency=32)
     assert _val(dut.wr_idle) == 1
     w = _writes(rng, WRITE_BASE, 1)[0]

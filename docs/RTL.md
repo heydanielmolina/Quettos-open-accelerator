@@ -76,14 +76,63 @@ are outputs of `qcore_seq_dispatch`.
 | `cmd_sx_m`, `cmd_sx_e` | `B_MAX*16`, `B_MAX*8` | per row `r`: `SREG[src_row+r][sreg_src]` as an sfloat, read at issue (GEMV, KVWRITE); `{2^15, -15}` for EMBED |
 | `cmd_sreg_u32` | `B_MAX*32` | the same word as a u32 (VQUANT `USE_TRACKED` absmax) |
 
-Issue timing: the dispatcher pops a descriptor, decodes it (1 cycle), waits for
-the auto-fence when the opcode reads QMEM, reads one SREG word per
-participating row (2 cycles each), then pulses `cmd_valid_*`. The unit's
-`done` pulse retires the descriptor the following cycle; the next issue is at
-least 3 cycles after `done` and, for GEMV and EMBED, waits for
-`qcore_stream_ctrl.busy` to fall (the padded meta beats of a partial last
-tile may still be draining after the requant's `done`). A GEMV or EMBED with
-`N == 0` or `K == 0` retires in the dispatcher without an issue pulse.
+Issue timing: the dispatcher pops a descriptor, decodes it (1 cycle), waits
+for the auto-fence when the opcode reads QMEM, reads one SREG word per
+participating row (2 cycles each), then pulses `cmd_valid_*`. Exactly one
+descriptor is in flight: the next descriptor is popped only after the current
+one has retired, and its issue pulse follows at least 3 cycles later. Every
+`cmd_*` field holds from the issue pulse to the retire.
+
+| Opcode | Waits for before the issue | Issue pulse | Retires on |
+|---|---|---|---|
+| NOP | nothing | none | the decode cycle |
+| HALT | `wr_idle` | none | the cycle `wr_idle` is high |
+| FENCE | `wr_idle` | none | the cycle `wr_idle` is high |
+| GEMV | `wr_idle`, then `SREG[src_row + r][sreg_src]` of every participating row | `cmd_valid_gemv` | `done_gemv` **and** `qcore_stream_ctrl.busy` low |
+| EMBED | `wr_idle` | `cmd_valid_gemv` | `done_gemv` **and** `qcore_stream_ctrl.busy` low |
+| VRMSNORM, VROPE, VSOFTMAX, VSUBC | `wr_idle` | `cmd_valid_vpu` | `done_vpu` |
+| VQUANT | `SREG[src_row + r][sreg_src]` of every participating row, with `USE_TRACKED` and not `GROUP` | `cmd_valid_vpu` | `done_vpu` |
+| VSILUMUL | nothing | `cmd_valid_vpu` | `done_vpu` |
+| KVWRITE | `SREG[src_row + r][sreg_src]` of every participating row | `cmd_valid_kv` | `done_kv` |
+
+Auto-fence: GEMV, EMBED, VRMSNORM, VROPE, VSOFTMAX and VSUBC read QMEM and wait
+for `wr_idle`, and so do FENCE and HALT. The descriptor prefetch takes the same
+fence through `fetch_hold` (3.4). No read of any kind therefore passes a KV or
+dump write of an earlier descriptor, and `STATUS.DONE` means every write the
+program issued has been acknowledged -- on the HALT, the fault and the ABORT
+path alike (3.5). NOP, VQUANT, VSILUMUL and KVWRITE read no QMEM and never
+wait.
+
+A GEMV or EMBED retires only once `done_gemv` has pulsed and
+`qcore_stream_ctrl.busy` is low: the padded meta beats of a partial last tile
+can still be in flight after the requant's `done`, and the next descriptor may
+be a V op that shares the arbiter. Those cycles count as `STALL_DRAIN`.
+
+Zero work: the dispatcher retires a descriptor without an issue pulse when the
+participating set `row_mask & ROW_EN` (bits at or above `B_MAX` dropped) is
+empty, when a GEMV or EMBED has `N == 0` or `K == 0`, and when a V op has
+`n == 0`. The rows, the requant and the VPU stay idle; `DESCRIPTORS` counts the
+descriptor and nothing else changes, except that the decode cycle still raises
+the `err_bounds_inc` of the POS derivation, which describes the descriptor
+rather than its work. `sw/quettos/isa_sim.py` follows the same rule.
+
+POS-derived fields: the dispatcher derives three scalar extents from `POS` and
+hands the units `cmd_pos` and `cmd_tok`, the CSRs as they stood at the issue.
+
+| Value | Rule | Reference in `sw/quettos/isa_sim.py` |
+|---|---|---|
+| `cmd_n` (GEMV) | `n_from_pos`: `min(roundup(POS + 1, WB), n)`; otherwise the `n` field | `gemv_dims(d, POS, WB)[0]` |
+| `cmd_k` (GEMV) | `k_from_pos`: `min(POS + 1, k)`; otherwise the `k` field | `gemv_dims(d, POS, WB)[1]` |
+| `cmd_n`, `cmd_k` (EMBED) | both the `k` field | `_exec_embed` |
+| `cmd_len` (VSOFTMAX) | `len_from_pos ? POS + 1 : imm32`, clamped into `[1, n]` | `softmax_len(d, POS)` |
+| `cmd_k_stride` | the raw `k` field: the GEMV tile stride, the KVWRITE token capacity | `_stream_gemv` (`k_cap`), `_exec_kvwrite` |
+| `err_bounds_inc` | once per participating row per event: `POS + 1 > n` with `n_from_pos`, `POS + 1 > k` with `k_from_pos`, a clamped VSOFTMAX `len` | `gemv_dims(...)[2]`, `softmax_len(...)[1]` |
+
+Every position-dependent address is formed in the unit that issues the request,
+not in the dispatcher: `qcore_stream_ctrl` builds the EMBED table base
+`addr_a + (TOK/WB)*K*WB` and record address `addr_m + TOK*8` (3.7),
+`qcore_vpu_top` the RoPE row `addr_a + POS*128` (3.12), and
+`qcore_kv_writer` the K^T, V and meta addresses (3.17).
 
 ### 2.3 Weight stream (`qcore_stream_ctrl` to every `qcore_row`)
 
@@ -170,7 +219,10 @@ One bank of 32 x 32-bit registers per row inside `qcore_row`; one read port
 above 32 reads 0, drops the write and raises the bank's `sreg_err` pulse
 (once per access). Reads are registered (data the cycle after `sreg_rd_en`).
 Writes land the cycle after `sreg_wr_en`; the dispatcher reads only between
-descriptors, so no bypass exists.
+descriptors, so no bypass exists. The banks are memories and carry no reset, so
+a register holds nothing until a descriptor writes it: every program writes the
+scale a later GEMV, KVWRITE or VQUANT reads, which is what the VQUANT before
+each GEMV does.
 
 ### 2.8 Event strobes
 
@@ -179,7 +231,7 @@ descriptors, so no bypass exists.
 | `SAT_REQ` | `requant.sat_inc[2:0]`: a per-cycle count, `0..4`, one per saturating `sat40` / `sat32` stage of the element leaving the pipeline (stage-1, stage-2, bias add, accumulate add) |
 | `SAT_VPU` | `vpu_top.sat_inc[7:0]`: per lane per cycle, one per saturating `sat32` (VRMSNORM output, VROPE outputs, VSILUMUL output, VSUBC) |
 | `ERR_SHIFT` | `requant.err_shift_inc[1:0]`: a per-cycle count, `0..2`, per element `sh0 > 63` (every element) and stage-2 `S` outside `[0, 63]` (elements with both scales non-zero); `vpu_top.err_shift_inc[7:0]`: per element, VRMSNORM `S1 < 0`, VRMSNORM `G` and VSILUMUL `sh_h` outside `[0, 63]` (`sh1` is i8: negative values clamp to 0) |
-| `ERR_BOUNDS` | `seq_dispatch.err_bounds_inc[3:0]`: `n_from_pos` / `k_from_pos` above capacity and VSOFTMAX `len` outside `[1, n]`, each once per participating row; `kv_writer.err_bounds_inc[1:0]`: `POS >= k` once per row; the VSRAM range pulses of `row`, `requant`, `vpu_top`, `kv_writer`; the `sreg_err` pulses of the banks |
+| `ERR_BOUNDS` | `seq_dispatch.err_bounds_inc[3:0]`: `n_from_pos` / `k_from_pos` above capacity and VSOFTMAX `len` outside `[1, n]`, each once per participating row, counted when the descriptor commits (3.5); `kv_writer.err_bounds_inc[1:0]`: `POS >= k` once per row; the VSRAM range pulses of `row`, `requant`, `vpu_top`, `kv_writer`; the `sreg_err` pulses of the banks |
 
 The requant's three ports (and `err_bounds_inc[1:0]`, `0..2`) are counts,
 added arithmetically into the CSR increments; the other sources are one-bit
@@ -195,7 +247,11 @@ cycle after the beat; `ev_wr_bytes` is 0 in cycles without `ev_wr_beat`);
 ## 3. Modules
 
 Port tables list name, direction (from the module), width and meaning.
-Parameters are named as in section 1.
+Parameters are named as in section 1. Sections 3.1 to 3.11, 3.17 and 3.18
+specify the thirteen modules `rtl/` holds; 3.12 to 3.16 specify the vector unit
+and its lookup tables, which land with `qcore_vpu_top` (`docs/ROADMAP.md`) and
+are built to the contract given here. What the other sections specify is in
+`rtl/`, and `make cocotb`, `make gatesim` and `make bringup-sweep` exercise it.
 
 ### 3.1 `qcore_pkg`
 
@@ -213,10 +269,11 @@ in use so a module that calls it stays clean under `-Wall`.
 
 ### 3.2 `qcore_top`
 
-Parameters: `WB`, `B_MAX`, `VL`, `VSRAM_WORDS`, `FIFO_BEATS`, `ACC_W`,
-`META_FIFO_BEATS`, `VPU_FIFO_BEATS`, `MAX_BURST`, `DQ_DEPTH`,
-`ROM_FILE_EXP2`, `ROM_FILE_SIGMOID`, `ROM_FILE_RSQRT`, `ROM_FILE_RECIP`
-(each `parameter ROM_FILE_<TABLE> = ""`, forwarded to the ROMs).
+Parameters: `WB`, `B_MAX`, `VSRAM_WORDS`, `FIFO_BEATS`, `ACC_W`,
+`META_FIFO_BEATS`, `MAX_BURST`, `DQ_DEPTH` — what the modules it contains take.
+`VL`, `VPU_FIFO_BEATS` and the four `ROM_FILE_<TABLE>` image paths (each
+`parameter ROM_FILE_<TABLE> = ""`, forwarded to the ROMs) arrive with
+`qcore_vpu_top`.
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
@@ -226,31 +283,91 @@ Parameters: `WB`, `B_MAX`, `VL`, `VSRAM_WORDS`, `FIFO_BEATS`, `ACC_W`,
 | QMEM | | | section 2.1 |
 
 Contains one `qcore_vsram` and one `qcore_row` per row (generate loop
-`g_row[r]`), the crossbar of section 2.6, the SREG write mux, the event
-adders of section 2.8, and single instances of every other module. No logic
-of its own beyond muxes and adders. `sim/cocotb/wrappers/qcore_gemv_wrap.sv`
-assembles the GEMV path (arbiter, stream controller, rows with their VSRAMs,
-requant, crossbar, SREG write mux, event adders) exactly as this section wires
-it; the block tests elaborate it in the three configurations and run
-descriptors through it against the QMEM bus model.
+`g_row[r]`), the crossbar of section 2.6, the SREG read select and write mux,
+the event adders of section 2.8, and single instances of `qcore_csr`,
+`qcore_seq_fetch`, `qcore_seq_dispatch`, `qcore_perf`, `qcore_mem_arb`,
+`qcore_stream_ctrl`, `qcore_requant` and `qcore_kv_writer`. Its own logic is
+the muxes and adders below and the vector stop at the end of this section.
+`sim/cocotb/wrappers/qcore_gemv_wrap.sv` assembles the GEMV path (arbiter,
+stream controller, rows with their VSRAMs, requant, crossbar, SREG write mux,
+event adders) exactly as this section wires it; the block tests elaborate it in
+the three configurations and run descriptors through it against the QMEM bus
+model.
+
+| Mux | Rule |
+|---|---|
+| VSRAM port A | bank `src_row + r` takes row `r`'s `vsa_en` / `vsa_addr` while `cmd_rows[r]`, and the row reads that bank's `rd_a` |
+| VSRAM port B | the KV writer owns the port while its `busy` is high (bank `src_row + vsb_row`, reads only), the requant otherwise (bank `dst_row + vsb_row`, reads and strobed writes); `wd_b` is the requant's and the addressed bank's `rd_b` returns to the owner |
+| SREG read | bank `sreg_rd_row` takes the dispatcher's enable and returns its word one cycle later |
+| SREG write | bank `dst_row + sreg_wr_row` takes the requant's write |
+| Returned beat | `rdd_data` / `rdd_last` fan out to the fetch unit and the stream controller; `rdf_valid` / `rdw_valid` / `rdm_valid` say which sink the beat belongs to |
+| `ROW_EN` | the dispatcher receives bits `[B_MAX-1:0]`; the rest name rows the core does not have |
+| `acc_tile`, `acc_nvalid`, `acc_last` | from the lowest participating row, which the lockstep of 2.3 makes the whole handoff |
+| Event counts | `SAT_REQ` the requant's `sat_inc`, `ERR_SHIFT` its `err_shift_inc`, `ERR_BOUNDS` the dispatcher's, the requant's and the KV writer's counts plus each row's `err_bounds` and `sreg_err` (2.8) |
+
+The control path is one loop: the host port reaches `qcore_csr`, whose
+`start` / `step` / `abort_run` pulses and `pc_q`, `row_en_q`, `tok_q`,
+`pos_q` registers drive `qcore_seq_dispatch`; the dispatcher drives
+`qcore_seq_fetch`, the three `cmd_valid_*` groups, and back into `qcore_csr`
+the `pc_set` update, the three status pulses and the fault fields; `qcore_perf`
+takes `perf_clear` / `perf_snapshot` and the event strobes and returns
+`perf_snap`. `qcore_top` adds the per-cycle event counts of the units, the rows
+and the SREG banks into the four `*_inc` inputs of `qcore_csr` (section 2.8). `STATUS.BUSY` is the dispatcher's `busy` alone; the
+units' own `busy` outputs go to the dispatcher, which folds them into the
+retire conditions of section 2.2.
+
+Vector processor: the six V opcodes run on `qcore_vpu_top`. This top carries
+the GEMV, EMBED and KVWRITE units, and it refuses a V descriptor at the queue
+head: `qcore_top` holds the `dq_valid` / `dq_ready` handshake so the descriptor
+is never popped, raises the dispatcher's `abort_run`, and drives `qcore_csr`'s
+`err_set` with `FAULT = OPCODE` and `FAULT_OP` = the opcode byte in the cycle
+the dispatcher ends the run. The descriptor in flight retires first, then the
+run ends on the write fence of 3.5: the fetch queue is flushed, the PERF
+counters are snapshotted, `DONE` and `ERR` are set together, `busy` drops and
+`PC` names the refused descriptor. Nothing is issued and nothing is counted for
+it. This is the `OPCODE` fault of `docs/ISA.md` in its second form -- a defined
+opcode whose unit the build does not carry.
+
+Simulation checks (`` `ifndef SYNTHESIS ``): no V descriptor reaches an issue
+pulse, the arbiter's VPU port returns no beat, the requant and the KV writer
+never own port B in the same cycle, and no VSRAM word is read on port A and
+written on port B in one cycle (2.6).
 
 ### 3.3 `qcore_csr`
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
 | host `csr_*` | | | as `qcore_top` |
-| `start`, `step`, `abort` | o | 1 | w1p pulses, the cycle after the CTRL write; `start` and `step` are suppressed while `busy_i` |
+| `start`, `step`, `abort_run` | o | 1 | w1p pulses, the cycle after the CTRL write |
 | `pc_q` | o | 32 | `PC` |
 | `pc_set`, `pc_set_val` | i | 1, 32 | dispatcher update (retire: `+32`); takes precedence over a host write in the same cycle |
 | `row_en_q`, `tok_q`, `pos_q` | o | 32 | the rw registers |
 | `busy_i` | i | 1 | `STATUS.BUSY` |
-| `done_set`, `step_halted_set`, `err_set` | i | 1 | set pulses; `start` and `step` clear the three bits |
+| `done_set`, `step_halted_set`, `err_set` | i | 1 | set pulses for the three sticky bits |
+| `fault_code`, `fault_op` | i | 4, 8 | latched into `STATUS.FAULT` and `STATUS.FAULT_OP` in the cycle of `err_set` |
 | `argmax_we`, `argmax_tok`, `argmax_val` | i | 1, 32, 32 | ARGMAX CSR write |
-| `sat_req_inc`, `sat_vpu_inc`, `err_shift_inc`, `err_bounds_inc` | i | 8 each | per-cycle increments; the four counters wrap at 32 bits and clear on `start` |
+| `sat_req_inc`, `sat_vpu_inc`, `err_shift_inc`, `err_bounds_inc` | i | 8 each | per-cycle counts (2.8); the four counters wrap at 32 bits and clear on `start` |
 | `perf_snap` | i | 1024 | `PERF[i]` at bits `[64i +: 64]` |
 
-Reads return the word the cycle after `csr_re`; unmapped words read 0; writes
-to ro words are ignored. `ISA_VERSION` is the generated constant.
+The port name is `abort_run` because Verilator reserves `abort`.
+
+Register behaviour, one row per access class of the CSR table in
+`docs/ISA.md`:
+
+| Register | Behaviour |
+|---|---|
+| `CTRL` (w1p) | a one in bit `START`, `STEP` or `ABORT` produces that pulse the cycle after the write. `START` and `STEP` act only while `busy_i` is low, `ABORT` only while it is high, and `START` wins over `STEP` in one write, so a write produces at most one pulse. Reads return 0 |
+| `STATUS` (w1c) | `DONE`, `STEP_HALTED` and `ERR` are set by their pulses and stay set; `BUSY` is the live `busy_i`; `FAULT` and `FAULT_OP` latch on `err_set`. `start` and `step` clear the three bits and both fault fields, and so does writing a one to a bit (a one in `ERR` clears `FAULT` and `FAULT_OP` with it). A set pulse in the cycle of such a write wins |
+| `PC`, `ROW_EN`, `TOK`, `POS` (rw) | a host write lands only while `busy_i` is low, so the values a descriptor sees cannot change under it; the host reads a register back to confirm. `pc_set` overrides a host write of `PC` in the same cycle and is the only writer while the core runs |
+| `ARGMAX_TOK`, `ARGMAX_VAL` (ro) | written together by `argmax_we`; kept across `start` |
+| `SAT_REQ`, `SAT_VPU`, `ERR_SHIFT`, `ERR_BOUNDS` (ro) | `+= inc` every cycle, wrapping at 32 bits; cleared by `start`, kept by `step` |
+| `ISA_VERSION` (ro) | the generated constant |
+| `PERF<i>_LO`, `PERF<i>_HI` (ro) | the two halves of `perf_snap` counter `i` |
+| unmapped words | read 0; writes are ignored, as they are to every ro word |
+
+Reads are registered: `csr_rdata` carries the addressed word the cycle after
+`csr_re` and holds it until the next read. A read and a write of the same word
+in one cycle return the value before the write.
 
 ### 3.4 `qcore_seq_fetch`
 
@@ -261,20 +378,36 @@ Parameters: `WB`, `DQ_DEPTH`.
 | `fetch_start`, `fetch_pc` | i | 1, 32 | restart at `fetch_pc` (32-byte aligned) |
 | `fetch_step` | i | 1 | level: fetch exactly one descriptor |
 | `fetch_flush` | i | 1 | drop the queue; beats of requests still in flight are discarded on return |
+| `fetch_hold` | i | 1 | level: issue no new request while it is high (the dispatcher drives `!wr_idle`) |
 | `f_req_valid`, `f_req_ready`, `f_req_addr`, `f_req_len`, `f_req_tag` | o, i, o, o, o | 1, 1, 32, 8, 4 | read requests, `tag = TAG_FETCH` |
 | `fd_valid`, `fd_data`, `fd_last` | i | 1, `DW`, 1 | routed `TAG_FETCH` beats |
 | `dq_valid`, `dq_desc`, `dq_ready` | o, o, i | 1, 256, 1 | queue head; pop on `dq_valid && dq_ready` |
 | `dq_count` | o | 4 | descriptors queued |
 | `ev_fetch_beat` | o | 1 | a `TAG_FETCH` beat returned |
 
+`fetch_pc` is always a multiple of 32: the dispatcher faults a `START` or
+`STEP` with a misaligned `PC` before any request is issued (3.5).
+
 Requests: `WB >= 32`: one beat at `ptr & ~(WB-1)` holding `WB/32`
 descriptors (those before `ptr` in the beat are dropped, so a `PC` left at a
 32-byte boundary by STEP resumes correctly); `WB < 32`: `32/WB` consecutive
 beats per descriptor, assembled least-significant beat first. A request is
-issued only when the queue has room for the whole burst and fewer than 2
-bursts are outstanding; in step mode only one descriptor is fetched. Queue
-depth `DQ_DEPTH` = 8 descriptors. Descriptor bit `i` is bit `i` of the
-assembled 256-bit word (byte `i/8`, bit `i%8` of the beat bytes).
+issued only when the queue has room for the whole burst, fewer than 2 bursts
+are outstanding and `fetch_hold` is low; in step mode only one descriptor is
+fetched. A request already on `f_req_valid` keeps its valid asserted until it
+is granted, as section 1 requires. Queue depth `DQ_DEPTH` = 8 descriptors.
+Descriptor bit `i` is bit `i` of the assembled 256-bit word (byte `i/8`, bit
+`i%8` of the beat bytes).
+
+`fetch_hold` puts the prefetch under the same fence every QMEM-reading
+descriptor takes, so no descriptor read is issued while a KV or dump write is
+unacknowledged. That orders the bus, not the program: descriptors already in the
+queue or in a burst in flight are not re-read, so a program that writes into its
+own descriptor stream must keep those writes outside the prefetch window, which
+is up to `DQ_DEPTH` queued descriptors plus the two bursts the unit keeps
+outstanding (`max(WB, 32)` bytes each). A write that lands ahead of that window
+is read back by the fetch that follows it, because the fence holds every new
+fetch request behind the acknowledgement.
 
 ### 3.5 `qcore_seq_dispatch`
 
@@ -282,45 +415,133 @@ Parameters: `WB`, `B_MAX`.
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
-| `start`, `step`, `abort` | i | 1 | from `qcore_csr` |
-| `pc_q`, `row_en_q`, `tok_q`, `pos_q` | i | 32 | CSRs |
+| `start`, `step`, `abort_run` | i | 1 | from `qcore_csr` |
+| `pc_q`, `tok_q`, `pos_q` | i | 32 | CSRs |
+| `row_en_q` | i | `B_MAX` | `ROW_EN` bits `[B_MAX-1:0]`; `qcore_top` drops the rest, which name rows the core does not have |
 | `pc_set`, `pc_set_val` | o | 1, 32 | retire update |
-| `busy` | o | 1 | `STATUS.BUSY`: high from the cycle after `start` / `step` until DONE or STEP_HALTED is set |
+| `busy` | o | 1 | `STATUS.BUSY`: high from the cycle after `start` / `step` until `DONE`, `STEP_HALTED` or `ERR` is set |
 | `done_set`, `step_halted_set`, `err_set` | o | 1 | status pulses |
-| `perf_clear`, `perf_snapshot` | o | 1 | on `start`; on HALT retire and on an unknown opcode |
-| `fetch_start`, `fetch_pc`, `fetch_step`, `fetch_flush` | o | 1, 32, 1, 1 | to `qcore_seq_fetch` |
+| `fault_code`, `fault_op` | o | 4, 8 | the fault and the opcode byte, valid with `err_set` |
+| `perf_clear`, `perf_snapshot` | o | 1 | `perf_clear` on `start`; `perf_snapshot` on a HALT retire, and at the end of a STEP, an ABORT or a fault, which is the first cycle `wr_idle` is high |
+| `fetch_start`, `fetch_pc`, `fetch_step`, `fetch_flush`, `fetch_hold` | o | 1, 32, 1, 1, 1 | to `qcore_seq_fetch`; `fetch_hold` is `!wr_idle` |
 | `dq_valid`, `dq_desc`, `dq_ready` | i, i, o | 1, 256, 1 | queue head |
 | `sreg_rd_en`, `sreg_rd_row`, `sreg_rd_idx`, `sreg_rd_data` | o, o, o, i | 1, `RW`, 8, 32 | SREG read of bank `sreg_rd_row` (the physical bank, `src_row + r`) |
 | `cmd_*`, `cmd_valid_*`, `done_*` | | | section 2.2 |
 | `wr_idle` | i | 1 | every issued QMEM write acknowledged |
 | `gemv_beat` | i | 1 | a GEMV weight beat was accepted by the rows this cycle (the OR of the rows' `ev_beat`, combinational) |
 | `stream_done` | i | 1 | `qcore_stream_ctrl` delivered its last beat |
+| `stream_busy` | i | 1 | `qcore_stream_ctrl.busy`: requests outstanding or beats undelivered, the second half of the GEMV / EMBED retire condition |
 | `ev_bucket` | o | 6 | one-hot per busy cycle: `{STALL_DRAIN, STALL_SEQ, STALL_KV, STALL_VPU, STALL_MEM, MAC_ACTIVE}` |
 | `ev_desc` | o | 1 | descriptor retired |
 | `ev_macs_valid`, `ev_macs` | o | 1, 40 | at issue of a GEMV: `popcount(rows) * ceil(N/WB) * WB * K` |
 | `ev_wt_valid`, `ev_wt_bytes` | o | 1, 40 | at issue: GEMV without `n_from_pos` / `k_from_pos`: `popcount(rows) * (ceil(N/WB)*K*WB + (unit_meta ? 0 : ceil(N/WB)*WB*8))`; EMBED: `popcount(rows) * (K + 8)` |
-| `err_bounds_inc` | o | 4 | section 2.8 |
+| `err_bounds_inc` | o | 4 | section 2.8; pulsed at the descriptor's commit -- its issue, or the retire of one that does no work -- so a descriptor an ABORT stops before its issue counts nothing |
 
-Sequencing per descriptor: pop, decode (1 cycle; an unknown opcode raises
-`err_set` and `done_set`, flushes, snapshots PERF, leaves `PC`; nothing is
-counted), NOP / HALT / FENCE / empty participating set retire without an
-issue (FENCE and every QMEM-reading opcode — GEMV, EMBED, VRMSNORM, VROPE,
-VSOFTMAX, VSUBC — first wait for `wr_idle`), otherwise the SREG reads
-(GEMV: `sreg_src`; VQUANT with `USE_TRACKED` and not `GROUP`: `sreg_src`;
-KVWRITE: `sreg_src`; one read per participating row), POS-derived values
-(`gemv_dims`, `softmax_len` of `isa_sim.py`; EMBED `cmd_n = k`), then the
-issue pulse. Retire on `done`: `pc_set (+32)`, `ev_desc`; HALT: `perf_snapshot`,
-`done_set`, `fetch_flush`, `busy` low. STEP: one descriptor, then
-`step_halted_set` (`done_set` for HALT). ABORT: no further issue; the in-flight
-descriptor retires; then `fetch_flush`, `done_set`, `busy` low.
+Sequencing per descriptor: pop, decode (1 cycle), check the faults below, wait
+for the auto-fence, read one SREG word per participating row, derive the
+POS-dependent extents, pulse `cmd_valid_*`, retire. Section 2.2 holds the
+per-opcode table of what is waited for and what retires, the zero-work rule and
+the POS derivations; this section holds what the dispatcher does around them.
 
-Bucket per busy cycle, first match wins: `MAC_ACTIVE` when `gemv_beat`
-(GEMV only); `STALL_DRAIN` when a GEMV / EMBED is in flight and `stream_done`;
-`STALL_MEM` when a GEMV / EMBED is in flight otherwise; `STALL_VPU` when a V
-op is in flight; `STALL_KV` when a KVWRITE is in flight or the dispatcher waits
-for `wr_idle` (auto-fence or FENCE); `STALL_SEQ` for every other busy cycle
-(fetch wait, decode, SREG reads, retire). `BUSY` therefore equals the bucket
-sum by construction; `CYCLES` counts the same cycles.
+Retire: `pc_set` with `pc_q + 32`, `ev_desc`, and the bucket of that cycle.
+HALT additionally pulses `perf_snapshot`, `done_set` and `fetch_flush` and
+drops `busy`; it comes out of the fence, so it needs no further wait.
+
+ABORT stops further issue on the cycle the pulse is seen. It is acted on in the
+fetch, decode, prepare, fence and SREG-read states, so a descriptor already
+popped but not issued does not run: it is not retired, not counted -- nothing of
+it reaches `ERR_BOUNDS` either -- and `PC` is left on it. A descriptor already
+in flight retires normally. The run then ends on the write fence below.
+
+Faults: a descriptor the hardware cannot execute stops the program instead of
+running on. `fault_code`, `fault_op` and `PC` are fixed at the faulting cycle,
+so `STATUS` names the fault and the opcode and `PC` names the address. Nothing
+is issued and nothing is counted for it. The run ends on the write fence below.
+
+The end of a run: a fault, an ABORT and a STEP retire declare the run over only
+once every issued write has been acknowledged, which is the guarantee
+`docs/ISA.md` attaches to `STATUS.DONE` and to `STATUS.STEP_HALTED`, and the one
+a HALT retire already carries out of the fence. State `S_STOP` holds the
+dispatcher while `wr_idle` is low, `busy` stays high and those cycles count as
+`STALL_KV`; on the first cycle `wr_idle` is high the dispatcher pulses
+`done_set` -- `step_halted_set` instead when the run ends on a step, `err_set`
+with `fault_code` and `fault_op` as well on the fault path -- then `fetch_flush`
+and `perf_snapshot`, and drops `busy`. A stepped HALT ends on `DONE` at its
+retire, out of the auto-fence it has just left, and an `ABORT` written during a
+step ends on `DONE` too.
+
+| `FAULT` | Name | Raised when | `FAULT_OP` |
+|---|---|---|---|
+| 0 | `NONE` | no fault | 0 |
+| 1 | `OPCODE` | the opcode byte is none of the twelve, or it names a unit the build does not carry (3.2, vector processor) | that byte |
+| 2 | `ROW` | a participating row's `src_row + r` or `dst_row + r` is at or above `B_MAX` | the opcode |
+| 3 | `PC_ALIGN` | `start` or `step` with `PC` not a multiple of 32 | 0 |
+
+`PC_ALIGN` is checked in the cycle after the pulse, before the first fetch
+request; `OPCODE` and `ROW` in the decode cycle, before the auto-fence and the
+SREG reads. The compiler cannot emit a `ROW` descriptor (`docs/ISA.md`, rows)
+and `sw/quettos/isa_sim.py` rejects one; the fault is what the hardware does
+when it meets one anyway.
+
+Step mode: the host single-steps a program through `CTRL` and `STATUS`.
+
+1. While `BUSY` is low, write `PC` (a multiple of 32), `TOK`, `POS` and
+   `ROW_EN`; they are ignored while `BUSY`.
+2. Write `CTRL.STEP`. The pulse clears `DONE`, `STEP_HALTED`, `ERR` and the
+   fault fields, pulses `fetch_flush` and `fetch_start` at `PC` with
+   `fetch_step` high so exactly one descriptor is fetched, and raises `busy`.
+3. That descriptor is issued and retired like any other, and `PC` advances by
+   32. On the first cycle `wr_idle` is high after the retire — the same write
+   fence a fault and an `ABORT` end on — `perf_snapshot` copies the live
+   counters into the PERF halves, the core sets `STEP_HALTED` and `busy` drops.
+   A stepped `KVWRITE` or dump is therefore acknowledged in memory before the
+   host reads it back. A HALT sets `DONE` at its retire instead, and a fault
+   `ERR` with its fault code at the fence.
+4. The host polls `STATUS` until one of `STEP_HALTED`, `DONE` and `ERR` is set,
+   then reads `PC`, `ARGMAX_TOK` / `ARGMAX_VAL`, the four event counters and
+   the PERF halves, and dumps VSRAM and QMEM through the harness.
+5. Writing the observed bits back clears them, so the next poll is unambiguous.
+   Repeat from 2 until `DONE`.
+
+A fault in a stepped descriptor ends the run on the write fence above. An
+`ABORT` written before the stepped descriptor retires ends the run the same way
+and sets `DONE`; one written after it retires finds the step complete, so the
+core reports `STEP_HALTED` and the abort takes effect at the next `STEP`.
+
+`STEP` clears no counter, so the event and PERF counters run from the last
+`START` (or from reset) and the value of one descriptor is the difference
+between two consecutive steps. `START` is the free run: it clears the same
+status bits, pulses `perf_clear`, and executes from `PC` to HALT. Both restart
+the fetch at `PC`, so the host may move `PC` between steps.
+
+PERF buckets: every cycle with `busy` high belongs to exactly one bucket and no
+cycle with `busy` low belongs to any, so `BUSY = MAC_ACTIVE + STALL_MEM +
+STALL_VPU + STALL_KV + STALL_SEQ + STALL_DRAIN` holds cycle by cycle. A
+descriptor is *in flight* between its issue pulse and its retire. The first
+matching row owns the cycle:
+
+| Priority | Bucket | Condition | Owner |
+|---|---|---|---|
+| 1 | `MAC_ACTIVE` | a GEMV is in flight and `gemv_beat` | the rows (`qcore_row.ev_beat`) |
+| 2 | `STALL_DRAIN` | a GEMV or EMBED is in flight, `stream_done`, and this is not the issue cycle | the requant, still draining after the last beat |
+| 3 | `STALL_MEM` | a GEMV or EMBED is in flight | `qcore_stream_ctrl`, waiting for beats |
+| 4 | `STALL_VPU` | a V op is in flight | `qcore_vpu_top` |
+| 5 | `STALL_KV` | a KVWRITE is in flight, or the dispatcher waits for `wr_idle` -- the auto-fence, a FENCE, or the fence a fault, an ABORT or a step ends on | `qcore_kv_writer`, `qcore_mem_arb` |
+| 6 | `STALL_SEQ` | every other busy cycle | the dispatcher: fetch wait, decode, SREG reads, issue setup, retire |
+
+Only the first three rows can be true together, since one descriptor is in
+flight at a time: the last beat of a GEMV is `MAC_ACTIVE`, not `STALL_DRAIN`.
+An EMBED never reaches `MAC_ACTIVE` — its rows accept pseudo-beats but multiply
+nothing — so its cycles are `STALL_MEM` and then `STALL_DRAIN`. The auto-fence
+and FENCE cycles are `STALL_KV` even when the waiting descriptor is a GEMV,
+because nothing has been issued yet. `ev_cycle` is `busy`, so `CYCLES` counts
+the same cycles as `BUSY`.
+
+The issue cycle is excluded from `STALL_DRAIN` because `qcore_stream_ctrl`
+re-evaluates `stream_done` at the registered command pulse: in that one cycle
+the level still describes the previous descriptor while the dispatcher already
+counts the new one as in flight. The cycle belongs to `STALL_MEM`, which is what
+it is -- the descriptor waiting for its first beat.
 
 ### 3.6 `qcore_mem_arb`
 
@@ -336,7 +557,7 @@ Parameters: `WB`, `MAX_BURST`.
 | `rdd_data`, `rdd_last` | o | `DW`, 1 | the payload of every returned beat, fanned out unchanged to the sinks' `rd_data` / `rd_data_last` |
 | `k_wr_*`, `d_wr_*` | | | two write requesters (`valid` i, `ready` o, `addr` 32, `data` `DW`, `strb` `WB` i): KV writer, dump |
 | `wr_*`, `wr_ack` | | | QMEM write, section 2.1 |
-| `wr_idle` | o | 1 | writes issued == acks received |
+| `wr_idle` | o | 1 | no write presented, held in the stage, or unacknowledged |
 | `ev_rd_beat`, `ev_wr_beat`, `ev_wr_bytes` | o | 1, 1, 8 | registered, the cycle after a returned beat; after an accepted write, with `popcount(strb)` |
 
 One request per cycle through a registered output stage (requester
@@ -344,8 +565,11 @@ One request per cycle through a registered output stage (requester
 `rd_req_ready`; a granted request appears on `rd_req_*` the next cycle). Priority stream, VPU, fetch; the fetch
 requester wins instead when at least `MAX_BURST` stream beats have been
 granted since the last fetch grant and `dq_count < 4`. Writes: KV writer over
-dump (never concurrent), same registered stage. The two 32-bit counters
-`issued` and `acked` give `wr_idle`.
+dump (never concurrent), same registered stage. `wr_idle` is the two 32-bit
+counters `issued` and `acked` agreeing, and the stage and both write valids
+low with them: a write a requester presents this cycle holds `wr_idle` low
+from that cycle, so a descriptor fetch the fence releases cannot be granted
+ahead of it.
 
 ### 3.7 `qcore_stream_ctrl`
 
@@ -518,7 +742,7 @@ the old word (READ_FIRST). One instance per row; `mem` is `verilator
 public_flat_rd` for zero-cycle dumps. Yosys `synth_xilinx` maps the 4096 x 256
 default to 32 RAMB36E1 (the 2048-word tiny configuration to 16).
 
-### 3.12 `qcore_vpu_top`
+### 3.12 `qcore_vpu_top` (lands with the vector unit)
 
 Parameters: `WB`, `B_MAX`, `VL`, `VSRAM_WORDS`, `VPU_FIFO_BEATS`, `MAX_BURST`,
 the four `ROM_FILE_*`.
@@ -563,7 +787,7 @@ write; VSOFTMAX: the `len` read and the `n` write); SREG indices through the
 banks' `sreg_err`. `ERR_SHIFT` and `SAT_VPU` as in section 2.8; VQUANT and
 softmax clips are not events.
 
-### 3.13 `qcore_vpu_lane`
+### 3.13 `qcore_vpu_lane` (lands with the vector unit)
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
@@ -582,7 +806,7 @@ b*c2, sh))`; `L_ROPE_B` `y = sat32(round_shift49(a*c + b*c2, sh))`; `L_SUB`
 signed. Clips, maxima and absmax are computed in `qcore_vpu_top` from `y`.
 One element per cycle.
 
-### 3.14 `qcore_vpu_scalar`
+### 3.14 `qcore_vpu_scalar` (lands with the vector unit)
 
 Parameters: `ROM_FILE_RSQRT`, `ROM_FILE_RECIP` (owns those two ROMs and
 their interpolators).
@@ -609,7 +833,7 @@ FRAC_in}`, then `sfloat_mul` with `scale_mul`. `SOFTMAX_NORM`: `e_s =
 bitlen(total) - 16`, `sum_hi = norm_hi16(total)`, `inv = recip(sum_hi)`,
 `shift = 7 + e_s`. One request in flight.
 
-### 3.15 `qcore_lut_rom`
+### 3.15 `qcore_lut_rom` (lands with the vector unit)
 
 Parameters: `ENTRIES` (256 or 512), `ROM_FILE` (`parameter ROM_FILE = ""`,
 the absolute image path set by the build; Yosys 0.65 rejects `parameter
@@ -622,7 +846,7 @@ initial block in the synthesizable RTL. `qcore_vpu_top` instantiates
 `ceil(VL/2)` exp2 and `ceil(VL/2)` sigmoid ROMs; `qcore_vpu_scalar` one rsqrt
 and one recip ROM.
 
-### 3.16 `qcore_lut_interp`
+### 3.16 `qcore_lut_interp` (lands with the vector unit)
 
 Ports: `clk`, `rst`, `in_valid`, `v[15:0]`, `dv[15:0]` (i16), `frac8[7:0]`,
 `out_valid`, `y[15:0]`. `y = v + ((dv * frac8 + 128) >>> 8)` in 25-bit signed
@@ -662,8 +886,23 @@ the meta beat at `addr_m + POS*8`: lanes `0..7` = `{bias 0, m, e, 0}`, `strb =
 | `ev_desc`, `ev_fetch_beat` | i | 1 | `DESCRIPTORS`, `FETCH_BEATS` |
 | `perf_snap` | o | 1024 | the snapshot, `PERF[i]` at `[64i +: 64]` |
 
-Sixteen 64-bit live counters, wrapping; `ev_cycle` is `busy` from the
-dispatcher, so `CYCLES == BUSY` in v1 and `BUSY` equals the bucket sum.
+Sixteen 64-bit live counters, wrapping, and sixteen snapshot registers behind
+them. `clear` zeroes both sets, `snapshot` copies live into snapshot, and
+`perf_snap` presents the snapshot; the dispatcher pulses them as section 3.5
+says, so the halves the host reads are stable while it works between a HALT or
+a step and the next `START`. `ev_cycle` is `busy` from the dispatcher, so
+`CYCLES == BUSY` in v1.
+
+`ev_bucket` is one-hot while `ev_busy` is high and zero otherwise (3.5);
+bit `i` increments counter `2 + i`, so `BUSY` equals the sum of indices 2 to 7.
+`ev_wt_bytes` and `ev_macs` are bulk adds at the issue of a GEMV or EMBED and
+count **per participating row**, exactly as `sw/quettos/isa_sim.py` counts
+`WT_BYTES` and `MACS`. `ev_wr_bytes` is a count of strobed bytes and is 0 in a
+cycle without `ev_wr_beat`; `sat_*_inc`, `err_*_inc` and the requant's event
+ports are per-cycle counts too, added arithmetically rather than OR-ed
+(section 2.8). The `SAT_*` and `ERR_*` counters themselves live in `qcore_csr`,
+not here. A `` `ifndef SYNTHESIS `` check asserts the one-hot rule and that
+the six bucket counters sum to `BUSY` at every `snapshot`.
 
 ## 4. Resolved decisions
 
@@ -682,14 +921,23 @@ dispatcher, so `CYCLES == BUSY` in v1 and `BUSY` equals the bucket sum.
 | Rows in the requant | rows drained ascending within each tile; per-row absmax and argmax; CSR and SREG writes at the descriptor end, last row last |
 | Fetch and beat width | `WB >= 32`: one beat holds `WB/32` descriptors; `WB = 16`: two beats per descriptor |
 | Fetch reservation | fetch wins the arbiter after `MAX_BURST` stream beats when fewer than 4 descriptors are queued |
-| Auto-fence | every QMEM-reading opcode and FENCE wait for `wr_idle` (KV and dump writes alike); KVWRITE does not |
+| Auto-fence | every QMEM-reading opcode, FENCE and HALT wait for `wr_idle` (KV and dump writes alike); NOP, VQUANT, VSILUMUL and KVWRITE do not. The descriptor prefetch takes the same fence through `fetch_hold`, so no read of any kind passes an unacknowledged write |
+| End of a run | HALT retires out of the fence; a fault, an ABORT and a step retire wait for `wr_idle` in `S_STOP` first, so `STATUS.DONE` and `STATUS.STEP_HALTED` both imply every write was acknowledged, on every path |
+| Descriptors in flight | one; the next descriptor is popped only after the current one retires |
+| GEMV / EMBED retire | `done_gemv` **and** `qcore_stream_ctrl.busy` low; the cycles between them are `STALL_DRAIN` |
+| Zero work | an empty participating set, a GEMV / EMBED with `N == 0` or `K == 0`, and a V op with `n == 0` retire without an issue pulse |
+| Fault stop | `STATUS.ERR` with `FAULT` and `FAULT_OP`, `PC` left on the descriptor that faulted; codes `OPCODE`, `ROW`, `PC_ALIGN` (3.5) |
+| `PERF` snapshot | on a HALT retire, and the cycle a STEP, an ABORT or a fault closes its write fence; `perf_clear` only on `start` |
+| Step-mode counters | `STEP` clears no counter; a descriptor's contribution is the difference between two consecutive steps |
+| `STATUS` clearing | `start`, `step`, or writing a one to the bit; a set pulse in the same cycle wins |
+| Returned beat payload | `qcore_mem_arb` presents it as `rdd_data` / `rdd_last`; `qcore_top` fans both out to the sinks' `rd_data` / `rd_data_last` |
 | Exponents | i8 everywhere; `S` is formed in 10 bits and clamped |
 | SREG absmax | a u32 (`2^31` for an output of `-2^31`) |
 | VSOFTMAX intermediate | `e_t` parked in `vs_dst[0..len)` between pass 2 and pass 3 |
 | `USE_TRACKED` with `GROUP` | `USE_TRACKED` ignored |
 | SREG bank location | inside `qcore_row`, one read port and one write port |
 | CSR read latency | one cycle |
-| `PC` while BUSY | written by the hardware only; the host writes it before START |
+| rw CSRs while BUSY | `PC`, `ROW_EN`, `TOK` and `POS` ignore host writes while `BUSY`; `PC` is the hardware's, the other three are written before START |
 | Padded meta records | `qcore_stream_ctrl` drops them; the meta stream carries `nvalid` records per tile |
 | Meta records with several rows | the first participating row consumes the stream; the requant replays the tile's records from its `WB`-record buffer |
 | EMBED request order | the meta beat before the weight bursts |
@@ -697,9 +945,9 @@ dispatcher, so `CYCLES == BUSY` in v1 and `BUSY` equals the bucket sum.
 
 ## 5. Lint patterns
 
-Every file passes `verilator --lint-only -Wall -Wpedantic`, the Yosys check
-and Icarus on its own (`make lint` runs each `rtl/*.sv` as its own top with
-all files on the command line). The patterns that keep a module clean:
+Every file in `rtl/` passes `verilator --lint-only -Wall -Wpedantic`, the Yosys
+check and Icarus on its own (`make lint` runs each `rtl/*.sv` as its own top
+with all files on the command line). The patterns that keep a module clean:
 
 - Extract descriptor fields only through `qcore_pkg::desc_<field>(d)`; a
   register holding the raw descriptor stays fully used. Test flag bits with a
@@ -727,3 +975,9 @@ all files on the command line). The patterns that keep a module clean:
   (`scripts/lint.sh` and `sim/cocotb/qc_runner.py` order it so).
 - An input a module does not read is an UNUSEDSIGNAL error, so a payload
   that only passes through becomes an output (`qcore_mem_arb.rdd_*`).
+- A unary operator on a size cast is parenthesized: `~(25'(WB - 1))`, never
+  `~25'(WB - 1)`. Yosys 0.65 binds the operator to the size literal and reads
+  the second form as the mask itself, where Verilator and Icarus read the
+  complement; `scripts/lint.sh` greps for `~ & | ^ - + !` in front of a bare
+  size cast and fails on it, and `make gatesim` compares the netlist against
+  the source that produced it.

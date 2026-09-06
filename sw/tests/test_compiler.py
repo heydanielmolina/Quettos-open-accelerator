@@ -199,6 +199,8 @@ def test_outputs_regions_and_hashes(
         lay["isa_version"] == isa.ISA_VERSION == 1 and lay["wb"] == 64 and lay["max_ctx"] == SYN_CTX
     )
     assert lay["frac"] == q.frac and lay["calib_tokens_sha256"] == q.calib_tokens_sha256
+    # the model block names the end-of-sequence ids the harness stops on
+    assert lay["model"]["eos_ids"] == syn.spec.eos_ids == []
     assert lay["constants"]["gemvs"] == program.build(q).as_dict()["gemvs"]
     assert lay["constants"]["max_ctx"] == program.MAX_CTX
     assert lay["csr"]["registers"] == {c.name: c.word for c in isa.CSRS}
@@ -719,6 +721,7 @@ def test_two_layer_real_model(
     _check_round_trip(Image(out), qmodel2, program.MAX_CTX)
     assert (len(c.decode), len(c.prefill)) == compiler.descriptor_counts(qmodel2)
     assert lay["max_ctx"] == 2048 and by["rope"]["size"] == 256 * 1024
+    assert lay["model"]["eos_ids"] == spec.eos_ids and lay["model"]["eos_ids"] != []
     assert compiler.kv_sizes(2048, 64) == {
         "kt": 131072,
         "v": 131072,

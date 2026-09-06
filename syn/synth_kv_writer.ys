@@ -1,0 +1,25 @@
+# Yosys synth_xilinx (xc7) of qcore_kv_writer on its own, in both
+# configurations. WB is the write-beat width and with it the number of V beats
+# per row, B_MAX the rows one KVWRITE walks, VSRAM_WORDS the read address width.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_kv_writer.log -s syn/synth_kv_writer.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_kv_writer.md.
+
+# ---- demo: WB = 64, B_MAX = 1, VSRAM_WORDS = 4096
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_kv_writer.sv
+chparam -set WB 64 -set B_MAX 1 -set VSRAM_WORDS 4096 qcore_kv_writer
+hierarchy -check -top qcore_kv_writer
+synth_xilinx -family xc7 -top qcore_kv_writer
+script syn/report.ys
+
+# ---- tiny: WB = 16, B_MAX = 2, VSRAM_WORDS = 2048
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_kv_writer.sv
+chparam -set WB 16 -set B_MAX 2 -set VSRAM_WORDS 2048 qcore_kv_writer
+hierarchy -check -top qcore_kv_writer
+synth_xilinx -family xc7 -top qcore_kv_writer
+script syn/report.ys

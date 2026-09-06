@@ -7,7 +7,8 @@ the VSRAM element map and the scale registers, emits ``decode.prog`` and
 ``prefill.prog`` from the :mod:`quettos.isa` helpers with the requant constants
 of :mod:`quettos.program`, and writes ``layout.json``, ``dump_plan.json``, the
 listings, ``tokens.bin`` and ``prompt.tokens``.  Every output is a pure
-function of the model and the parameters.  :class:`Image` reads an image back.
+function of the model and the parameters.  :class:`Image` reads an image back
+and :func:`build_bringup` lifts the bring-up program out of a compiled model.
 Address map and file formats: ``docs/MEMORY_MAP.md``; descriptors: ``docs/ISA.md``.
 """
 
@@ -23,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from quettos import golden, isa, numerics, program
+from quettos import golden, isa, isa_sim, numerics, program
 from quettos.isa import Descriptor, Opcode, OutMode, VquantFlag
 from quettos.model import BUILD_DIR, REPO_ROOT, ModelSpec
 from quettos.quantize import QuantLinear, QuantModel, QuantNorm
@@ -1074,6 +1075,7 @@ def compile(
             "vocab": model.vocab,
             "has_qkv_bias": model.has_qkv_bias,
             "rope_theta": model.rope_theta,
+            "eos_ids": [] if spec is None else [int(e) for e in spec.eos_ids],
         },
         "calib_tokens_sha256": model.calib_tokens_sha256,
         "a_bits": a_bits,
@@ -1213,3 +1215,90 @@ class Image:
     def program(self, which: str) -> list[Descriptor]:
         """The descriptors of ``decode`` or ``prefill`` as stored in the image."""
         return isa.parse(self.read(f"prog.{which}"))
+
+
+# --------------------------------------------------------------------------- bring-up program
+
+
+@dataclass(frozen=True)
+class Bringup:
+    """The bring-up program: its descriptors, where they load, and the one scale the host loads."""
+
+    program: tuple[Descriptor, ...]
+    addr: int
+    tok: int
+    shift: int
+    sreg: tuple[tuple[int, int, int], ...]  # (bank, index, 32-bit word)
+    ranges: tuple[tuple[int, int, int], ...]  # (bank, start, count)
+    dump: tuple[int, int]  # the GEMV's DUMP region: (address, bytes)
+    blob: bytes
+
+    @property
+    def descriptors(self) -> int:
+        return len(self.program)
+
+
+def _embed_absmax(
+    image_path: Path, embed: Descriptor, addr: int, tok: int, widths: dict[str, int]
+) -> int:
+    """The largest magnitude the unshifted EMBED writes for ``tok``."""
+    m = isa_sim.Machine.from_file(image_path, **widths)
+    m.mem[addr : addr + isa.DESC_BYTES] = isa.encode(embed)
+    m.csr["TOK"], m.csr["POS"], m.csr["ROW_EN"] = tok, 0, 1
+    isa_sim.execute(m, embed)
+    return int(np.abs(m.vsram[0, embed.vs_dst : embed.vs_dst + embed.k]).max())
+
+
+def build_bringup(
+    image_dir: Path | str,
+    tok: int,
+    *,
+    wb: int = WB,
+    b_max: int = 1,
+    vsram_words: int = VSRAM_WORDS,
+) -> Bringup:
+    """Assemble the bring-up program for one token of a compiled model.
+
+    Descriptor 0 is ``decode.prog``'s ``EMBED`` writing into the LM head's
+    activation slot, with its output shift raised by ``q`` so the gathered row
+    lands inside the int16 window a GEMV activation is read through; descriptor
+    1 is the ARGMAX LM-head ``GEMV`` in ARGMAX_DUMP mode, so every logit is
+    compared and not only the argmax; descriptor 2 is ``HALT``.  The host
+    supplies ``SREG[0][sreg_src] = 2**-(frac_X + q)``, the activation scale that
+    pairs with that shift.  The program loads behind ``prefill.prog`` and dumps
+    behind itself, both inside the image's program window.
+    """
+    image_dir = Path(image_dir)
+    widths = {"wb": wb, "b_max": b_max, "vsram_words": vsram_words}
+    layout = load_layout(image_dir)
+    if layout["wb"] != wb:
+        raise ValueError(f"{image_dir} was compiled for WB={layout['wb']}, not {wb}")
+    descs = isa.parse((image_dir / FILES["decode"]).read_bytes())
+    embed = next(d for d in descs if d.opcode is Opcode.EMBED)
+    lm = next(d for d in descs if d.opcode is Opcode.GEMV and d.out_mode is OutMode.ARGMAX)
+    prefill = layout["programs"]["prefill"]
+    addr = align_up(prefill["addr"] + prefill["size"])
+    image_path = image_dir / layout["image"]["file"]
+
+    absmax = _embed_absmax(
+        image_path, dataclasses.replace(embed, vs_dst=lm.vs_src), addr, tok, widths
+    )
+    q = max(0, int(absmax).bit_length() - 15)
+    dump_addr = align_up(addr + 3 * isa.DESC_BYTES, isa.DUMP_ALIGN)
+    prog = (
+        dataclasses.replace(embed, vs_dst=lm.vs_src, sh1=embed.sh1 + q),
+        dataclasses.replace(lm, out_mode=OutMode.ARGMAX_DUMP, imm32=dump_addr),
+        isa.halt(),
+    )
+    scale = numerics.SFloat(1 << 15, -(layout["frac"]["X"] + q) - 15)
+    used = int(layout["vsram"]["used"])
+    return Bringup(
+        program=prog,
+        addr=addr,
+        tok=tok,
+        shift=q,
+        sreg=((0, lm.sreg_src, isa.sfloat_imm(scale)),),
+        ranges=tuple((b, 0, used) for b in range(b_max)),
+        dump=(dump_addr, 4 * lm.n),
+        blob=isa.assemble(list(prog)),
+    )

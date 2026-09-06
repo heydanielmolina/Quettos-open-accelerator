@@ -484,6 +484,35 @@ def test_bounds_counter_and_pos_derived_fields(built) -> None:
     assert len(isa_sim.written_ranges(kv, 0)) == 64 + 1
 
 
+def test_a_gemv_with_no_inputs_is_zero_work(built) -> None:
+    """K == 0 with N > 0 retires with the bounds events counted and nothing else touched."""
+    b = built(0)
+    m = b.machine()
+    isa_sim.run_token(m, b.programs.decode, b.ids[0], 0)
+    gemv = next(
+        x
+        for x in b.programs.decode
+        if x.opcode == Opcode.GEMV
+        and x.out_mode == OutMode.VSRAM
+        and not x.n_from_pos
+        and not x.k_from_pos
+    )
+    zero = Descriptor(**{**gemv.__dict__, "k": 0})
+    before = m.vsram.copy()
+    counters = {name: m.perf_value(name) for name in isa_sim.PERF_COUNTED}
+    bounds = m.err_bounds
+    m.log = []
+    isa_sim.step(m, zero)
+    assert m.log == [], "a zero-work descriptor writes nothing"
+    assert np.array_equal(m.vsram, before)
+    assert m.err_bounds == bounds
+    assert m.perf_value("MACS") == counters["MACS"]
+    assert m.perf_value("WT_BYTES") == counters["WT_BYTES"]
+    assert m.perf_value("DESCRIPTORS") == counters["DESCRIPTORS"] + 1
+    assert isa_sim.written_ranges(zero, 0) == set()
+    assert isa_sim.written_ranges(gemv, 0) == {("vsram", 0, gemv.vs_dst, gemv.n)}
+
+
 def test_sreg_holds_scales_or_tracked_absmax(built) -> None:
     b = built(0)
     m = b.machine()

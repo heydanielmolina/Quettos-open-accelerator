@@ -5,11 +5,13 @@
 ``rtl/qcore_pkg.sv`` on the tiny configuration (``TINY``), runs the
 ``@cocotb.test`` coroutines of ``test_module`` (a ``tb_*.py`` file in this
 directory) and raises on any failed test.  Build products live under
-``build/cocotb/<top>/``.
+``build/cocotb/<top>/<key>/``, where ``key`` is a digest of the sources and the
+parameters, so two configurations of one top never share object files.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -68,6 +70,12 @@ def _rom_params(top_file: Path) -> dict[str, str]:
     return out
 
 
+def build_key(top: str, paths: Sequence[Path], params: Mapping[str, object]) -> str:
+    """Digest of one build: the top, its sources and the parameters it is elaborated with."""
+    material = [top, *(str(p) for p in paths), *(f"{k}={v}" for k, v in sorted(params.items()))]
+    return hashlib.sha256("\n".join(material).encode("utf-8")).hexdigest()[:12]
+
+
 def build(
     top: str,
     sources: Sequence[str],
@@ -88,7 +96,7 @@ def build(
     params: dict[str, object] = dict(_rom_params(top_file))
     if parameters:
         params.update(parameters)
-    build_dir = BUILD / top
+    build_dir = BUILD / top / build_key(top, paths, params)
     build_dir.mkdir(parents=True, exist_ok=True)
     runner = get_runner("verilator")
     runner.build(

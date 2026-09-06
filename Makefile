@@ -1,6 +1,6 @@
 # Quettos Core -- top-level Makefile. Everything runs from the repo root.
-# lint / test / cocotb / synth / probe / clean are implemented; demo, perf and
-# waves land with the end-to-end integration (see docs/ROADMAP.md).
+# Every target runs except demo, demo-toolcall, demo-qwen and regen-prefix,
+# which execute the six vector opcodes of qcore_vpu_top (see docs/ROADMAP.md).
 
 UV       := uv
 VERILATOR := verilator
@@ -10,25 +10,36 @@ IVERILOG := iverilog
 MODEL    ?= qwen
 TOPS     ?=
 
-.PHONY: all help demo demo-toolcall demo-qwen regen-prefix ci test lint cocotb synth perf waves probe clean
+# The compiled model the Verilator harness runs and the flags it runs with
+# (sim/verilator, docs/PERFORMANCE.md). HARNESS_CFG selects the RTL widths.
+IMAGE       ?= build/images/qwen2.5-0.5b-instruct-l2
+HARNESS_CFG ?= WB=64 B_MAX=1 VL=4 VSRAM_WORDS=4096
+PERF_ARGS   ?= --traffic --max-new 1
+
+.PHONY: all help demo demo-toolcall demo-qwen regen-prefix ci test lint cocotb synth gatesim perf waves probe harness harness-csr bringup bringup-sweep clean
 
 all: help
 
 help:
 	@echo "Quettos Core targets:"
-	@echo "  make lint          three-parser lint over rtl/*.sv (scripts/lint.sh)"
+	@echo "  make lint          three-parser lint over rtl/*.sv and sim/cocotb/wrappers/*.sv (scripts/lint.sh)"
 	@echo "  make test          uv run pytest -q sw/tests"
-	@echo "  make cocotb        cocotb unit tests on the tiny RTL configuration (sim/cocotb)"
+	@echo "  make cocotb        cocotb block tests on the tiny RTL configuration (sim/cocotb)"
 	@echo "  make probe         Verilator speed probe (sim/probe)"
+	@echo "  make harness       build the Verilator harness (sim/verilator)"
+	@echo "  make harness-csr   run the harness CSR driver against rtl/qcore_csr.sv"
+	@echo "  make bringup       RTL vs isa_sim on the tiny configuration (sw/quettos/compare.py)"
+	@echo "  make bringup-sweep the same over random shapes at WB=64 and WB=128"
 	@echo "  make clean         remove build/ and Verilator obj_dir directories"
-	@echo "  make demo          (not implemented yet)"
-	@echo "  make demo-toolcall (not implemented yet)"
-	@echo "  make demo-qwen     (not implemented yet)"
-	@echo "  make regen-prefix  (not implemented yet)"
-	@echo "  make ci            (not implemented yet)"
-	@echo "  make synth         Yosys synth_xilinx of every syn/*.ys block script; logs in build/synth/"
-	@echo "  make perf          (not implemented yet)"
-	@echo "  make waves         (not implemented yet)"
+	@echo "  make demo          Qwen 32+20 end to end; runs the vector opcodes on qcore_vpu_top"
+	@echo "  make demo-toolcall tool-call demo with prefix-KV reuse; runs on qcore_vpu_top"
+	@echo "  make demo-qwen     the recorded Qwen demo; runs on qcore_vpu_top"
+	@echo "  make regen-prefix  regenerate the 512-token demo prefix; runs on qcore_vpu_top"
+	@echo "  make ci            the CI job set, run locally"
+	@echo "  make synth         Yosys synth_xilinx of every syn/synth_*.ys script; logs in build/synth/, and every syn/reports/*.md has to still reproduce"
+	@echo "  make gatesim       gate-level equivalence: each Yosys netlist against the source it came from (sim/gatesim)"
+	@echo "  make perf          run the harness on IMAGE and write build/perf/perf.json"
+	@echo "  make waves         a VCD of a harness run into build/waves (rebuilds with tracing)"
 
 lint:
 	@TOPS="$(TOPS)" VERILATOR=$(VERILATOR) YOSYS=$(YOSYS) IVERILOG=$(IVERILOG) bash scripts/lint.sh
@@ -48,36 +59,69 @@ clean:
 	find . -type d -name 'obj_dir*' -prune -exec rm -rf {} +
 
 demo:
-	@echo "make demo: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@echo "make demo: the Qwen 32+20 run executes the six vector opcodes, which belong to qcore_vpu_top (docs/ROADMAP.md)"; exit 1
 
 demo-toolcall:
-	@echo "make demo-toolcall: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@echo "make demo-toolcall: the tool-call run executes the six vector opcodes, which belong to qcore_vpu_top (docs/ROADMAP.md)"; exit 1
 
 demo-qwen:
-	@echo "make demo-qwen: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@echo "make demo-qwen: the recorded Qwen run executes the six vector opcodes, which belong to qcore_vpu_top (docs/ROADMAP.md)"; exit 1
 
 regen-prefix:
-	@echo "make regen-prefix: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@echo "make regen-prefix: regenerating the demo prefix executes the six vector opcodes, which belong to qcore_vpu_top (docs/ROADMAP.md)"; exit 1
 
-ci:
-	@echo "make ci: not implemented yet (see docs/ROADMAP.md)"; exit 1
+ci: lint test cocotb synth gatesim harness-csr bringup
+	@echo "ci: OK (the job set of .github/workflows/ci.yml, run locally)"
 
-# One block per syn/*.ys script (run from the repo root; each script names its
-# block and configuration). The stat table sits at the end of build/synth/<script>.log;
-# syn/reports/ holds the recorded tables.
-SYN_SCRIPTS := $(wildcard syn/*.ys)
-
+# One block per syn/synth_*.ys script (run from the repo root; each script names
+# its block and its configurations, and ends every configuration with
+# `script syn/report.ys`). scripts/synth_report.py runs them, leaves the logs in
+# build/synth/ and writes syn/reports/<block>.md from what the tools printed;
+# --check regenerates into a temporary directory and fails on any difference, so
+# a report that no longer reproduces fails this target. Rewrite the reports with
+#   uv run python scripts/synth_report.py
 synth:
-	@mkdir -p build/synth
-	@for s in $(SYN_SCRIPTS); do \
-	  n=$$(basename $$s .ys); echo "synth: $$s -> build/synth/$$n.log"; \
-	  $(YOSYS) -q -l build/synth/$$n.log -s $$s >/dev/null 2>build/synth/$$n.err || { cat build/synth/$$n.err; echo "synth: $$s FAILED"; exit 1; }; \
-	  grep -v 'Resizing cell port' build/synth/$$n.err || true; \
-	done
-	@echo "synth: OK"
+	$(UV) run python scripts/synth_report.py --check
+
+# Gate-level equivalence (docs/VERIFICATION.md, layer 1). Yosys maps each block
+# to Xilinx 7-series cells and writes the netlist; one Icarus bench then drives
+# the source module and that netlist from the same stimulus and compares every
+# output every cycle against Yosys's own cell models. A construct the two front
+# ends read differently is a mismatch, and any mismatch fails the target.
+# GATESIM_ARGS passes flags through, e.g. GATESIM_ARGS="--only seq_fetch_wb64".
+GATESIM_ARGS ?=
+
+gatesim:
+	$(UV) run python sim/gatesim/gatesim.py $(GATESIM_ARGS)
+
+harness:
+	$(MAKE) -C sim/verilator build $(HARNESS_CFG)
+
+harness-csr:
+	$(MAKE) -C sim/verilator csr-check
+
+# The bring-up comparison: EMBED / GEMV(ARGMAX) / HALT over a random tiny model,
+# run on qcore_top and on sw/quettos/isa_sim.py and compared element by element.
+# BRINGUP_TINY is the CI configuration; BRINGUP_ARGS is the wider sweep.
+BRINGUP_TINY ?= --sweep --shapes 2 --widths 16 --seed 0 --tokens 2
+BRINGUP_ARGS ?= --sweep --shapes 5 --widths 64,128 --seed 0 --tokens 2
+
+bringup:
+	$(UV) run python -m quettos.compare $(BRINGUP_TINY)
+
+bringup-sweep:
+	$(UV) run python -m quettos.compare $(BRINGUP_ARGS)
 
 perf:
-	@echo "make perf: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@test -f $(IMAGE)/layout.json || { \
+	  echo "make perf: $(IMAGE)/layout.json not found (uv run quettos compile <model>)"; exit 1; }
+	$(MAKE) -C sim/verilator run $(HARNESS_CFG) IMAGE=$(IMAGE) ARGS="$(PERF_ARGS)"
+
+# A VCD of one harness run. The trace build is separate from the fast one, so
+# this rebuilds with TRACE=1 and leaves the waveform in build/waves/.
+WAVE ?= build/waves/qcore.vcd
 
 waves:
-	@echo "make waves: not implemented yet (see docs/ROADMAP.md)"; exit 1
+	@mkdir -p $(dir $(WAVE))
+	$(MAKE) -C sim/verilator run $(HARNESS_CFG) TRACE=1 IMAGE=$(IMAGE) ARGS="$(PERF_ARGS) --trace $(abspath $(WAVE))"
+	@echo "waves: $(WAVE)"

@@ -1,0 +1,24 @@
+# Yosys synth_xilinx (xc7) of qcore_perf on its own, in both configurations.
+# WB is the only parameter: it is the constant RD_BYTES adds per read beat.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_perf.log -s syn/synth_perf.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_perf.md.
+
+# ---- demo: WB = 64
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_perf.sv
+chparam -set WB 64 qcore_perf
+hierarchy -check -top qcore_perf
+synth_xilinx -family xc7 -top qcore_perf
+script syn/report.ys
+
+# ---- tiny: WB = 16
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_perf.sv
+chparam -set WB 16 qcore_perf
+hierarchy -check -top qcore_perf
+synth_xilinx -family xc7 -top qcore_perf
+script syn/report.ys

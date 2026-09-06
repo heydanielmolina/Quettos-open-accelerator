@@ -81,6 +81,12 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   constants, dynamic arrays, queues.
 - Lint waivers of any kind (`/* verilator lint_off */`). `UNOPTFLAT` must be
   fixed, not silenced.
+- **A unary operator on a bare size cast**: write `~(25'(WB - 1))`, never
+  `~25'(WB - 1)`. Yosys 0.65 binds the operator to the size literal, so the
+  second form synthesizes the mask itself where Verilator and Icarus simulate
+  its complement; the same goes for `& | ^ - + !`. `scripts/lint.sh` greps for
+  it and `make gatesim` compares the netlist against the source, so the two
+  tools cannot quietly disagree.
 - Any fixed-point format knowledge in RTL. **Numerics conventions live only in
   `sw/quettos/numerics.py`**; every shift, exponent and constant reaches the
   RTL as a descriptor field. If you want to change rounding, change
@@ -96,29 +102,39 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 
 ## 4. Three-parser lint recipe
 
-`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` as its own
-top (`qcore_pkg.sv` always first on the command line, since Yosys and Icarus
-resolve `qcore_pkg::` references only after parsing the package):
+`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` module and
+every `sim/cocotb/wrappers/*.sv` block assembly as its own top (`qcore_pkg.sv`
+always first on the command line, since Yosys and Icarus resolve `qcore_pkg::`
+references only after parsing the package):
 
 ```sh
-verilator --lint-only -Wall -Wpedantic -Irtl --top-module <mod> rtl/qcore_pkg.sv rtl/*.sv
-yosys -q -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv; hierarchy -check -top <mod>; proc; opt; check -assert"
-iverilog -g2012 -Irtl -s <mod> -o /dev/null rtl/qcore_pkg.sv rtl/*.sv
+verilator --lint-only -Wall -Wpedantic -Irtl --top-module <mod> rtl/qcore_pkg.sv rtl/*.sv [sim/cocotb/wrappers/*.sv]
+yosys -q -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv [...]; hierarchy -check -top <mod>; proc; opt; check -assert"
+iverilog -g2012 -Irtl -s <mod> -o /dev/null rtl/qcore_pkg.sv rtl/*.sv [...]
 ```
 
-followed by greps that fail on the forbidden constructs listed above. The
-unpacked-port check is a heuristic (a port declaration whose identifier is
-followed by a `[..]` range); see the comment in `scripts/lint.sh`.
+A wrapper top is elaborated with the `rtl/*.sv` files plus the wrappers on the
+command line; a module top is elaborated with the `rtl/*.sv` files alone. The
+forbidden-construct greps cover both directories. Two of them are heuristics
+with a comment in `scripts/lint.sh` explaining the shape they match: the
+unpacked-port check (a port declaration whose identifier is followed by a `[..]`
+range) and `unary operator on a bare size cast (write ~(N'(x)); Yosys 0.65 binds
+it to N)`, which greps the comment-stripped line with its whitespace removed.
+
+The lint proves the three tools accept the RTL. `make gatesim` proves two of
+them read it the same way: Yosys maps each block to Xilinx cells and one Icarus
+bench drives the source and that netlist from the same stimulus, comparing every
+output every cycle (`sim/gatesim/README.md`).
 
 `make lint TOPS="qcore_row qcore_requant"` restricts the run to named tops.
 
-The glob is `rtl/*.sv`: the generated include `rtl/qcore_csr_defs.svh` is
-linted through the modules that include it, checked against `isa.py` by
-`uv run quettos csr-defs --check`, and run through all three parsers on an
-include wrapper by `sw/tests/test_isa.py` (skipped when the tools are not on
-`PATH`).
+The glob is `rtl/*.sv` plus `sim/cocotb/wrappers/*.sv`: the generated include
+`rtl/qcore_csr_defs.svh` is linted through the modules that include it, checked
+against `isa.py` by `uv run quettos csr-defs --check`, and run through all three
+parsers on an include wrapper by `sw/tests/test_isa.py` (skipped when the tools
+are not on `PATH`).
 
-Run it on the day you write a module. It is fast.
+Run it as you write a module. It is fast.
 
 ## 5. Pre-commit hook
 
@@ -133,8 +149,12 @@ If `uv` is not on PATH the pytest step is skipped with a message.
 ## 6. Measured numbers (README rule)
 
 - Every performance, synthesis or quality number in `README.md` comes from a
-  command in this repository (`make perf`, `make synth`, `uv run quettos check`)
-  and the row names that command.
+  command in this repository (`make perf`, `make synth`, `make bringup-sweep`,
+  `uv run quettos check`) and the row names that command.
+- Synthesis numbers are never typed by hand: `scripts/synth_report.py` writes
+  each `syn/reports/*.md` from the Yosys log of the run that produced it, and
+  `make synth` regenerates them and fails on any difference. A wall-clock figure
+  is a median with its range and the number of runs.
 - Analytical projections live in `docs/`, labeled **estimate**.
 - FPGA tokens/s figures state the clock and memory bandwidth they are derived
   from (100 MHz and 6.4 GB/s for WB=64).
@@ -146,8 +166,10 @@ If `uv` is not on PATH the pytest step is skipped with a message.
 - `uv run pytest -q sw/tests` must pass without network access once models are
   cached. Tests that need a downloaded model skip with a clear reason when the
   model is missing.
-- New RTL needs either a cocotb unit test on the tiny config or a step-mode
-  per-op compare against `isa_sim.py`. New numerics need a property test in
+- New RTL needs either a cocotb block test on the tiny config or a step-mode
+  per-op compare against `isa_sim.py`. It also needs a case in
+  `sim/gatesim/gatesim.py`, or a line in `sim/gatesim/README.md` saying which
+  primitive keeps it out. New numerics need a property test in
   `sw/tests/test_numerics.py`.
 - Tests marked `slow` need the quantized models under `build/quant/` (from
   `uv run quettos quantize <alias>`), write the compiled images to

@@ -1,10 +1,25 @@
-# Yosys synth_xilinx (xc7) of qcore_vsram on its own, default configuration
-# (WORDS = 4096, W = 256, NE = 8). Run from the repo root:
-#   mkdir -p build/synth && yosys -q -l build/synth/qcore_vsram_xc7.log -s syn/synth_vsram.ys
-# The log ends with the cell table (stat -tech xilinx); the memory_libmap
-# lines above it show the RAM mapped as a true-dual-port block RAM.
-# Override the depth before hierarchy with `chparam -set WORDS 2048 qcore_vsram`.
+# Yosys synth_xilinx (xc7) of qcore_vsram on its own, in both configurations.
+# WORDS is the depth (4096 words in the demo build, 2048 in the tiny one); W is
+# the word width and NE the number of byte-group strobes, the same in both.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_vsram.log -s syn/synth_vsram.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_vsram.md.
+
+# ---- demo: WORDS = 4096, W = 256, NE = 8
+log ==== qreport config demo
 read_verilog -sv -defer -Irtl rtl/qcore_vsram.sv
+chparam -set WORDS 4096 -set W 256 -set NE 8 qcore_vsram
 hierarchy -check -top qcore_vsram
 synth_xilinx -family xc7 -top qcore_vsram
-stat -tech xilinx
+script syn/report.ys
+
+# ---- tiny: WORDS = 2048, W = 256, NE = 8
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_vsram.sv
+chparam -set WORDS 2048 -set W 256 -set NE 8 qcore_vsram
+hierarchy -check -top qcore_vsram
+synth_xilinx -family xc7 -top qcore_vsram
+script syn/report.ys
