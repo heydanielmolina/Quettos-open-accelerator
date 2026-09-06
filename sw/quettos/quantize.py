@@ -4,12 +4,16 @@ Every integer is produced by a :mod:`quettos.numerics` primitive, so the
 dequantized values are exactly what the hardware reconstructs: per-channel int8
 weights with sfloat scales grouped as the programs stream them, QKV biases in
 ``FRAC_QKV``, the V bias folded into the ``o_proj`` bias, int16 gammas,
-K-centering rows and the descriptor constants.  :func:`save` and :func:`load`
-round-trip the model through one ``.npz``.  Formats: ``docs/NUMERICS.md``.
+K-centering rows and the descriptor constants.  The pairwise Q/K smoothing
+factors of ``calib.json`` are folded into ``W_q``/``b_q``, ``W_k``/``b_k`` and
+the K-centering rows before quantization (:func:`smooth_qk`).  :func:`save` and
+:func:`load` round-trip the model through one ``.npz``.  Formats and the fold:
+``docs/NUMERICS.md``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from dataclasses import dataclass, field
@@ -19,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from quettos import numerics
-from quettos.calibrate import NUMERICS_VERSION, load_calib
+from quettos.calibrate import NUMERICS_VERSION, load_calib, pair_to_channels, tile_factors
 from quettos.model import BUILD_DIR, ModelSpec
 from quettos.numerics import SFloat
 from quettos.reference_np import LayerWeights, load_embedding, load_final_norm, load_layer
@@ -95,7 +99,8 @@ class QuantModel:
     embed: QuantLinear
     k_center: np.ndarray  # int32 [layers, kv_heads, head_dim] in FRAC_QKV
     numerics_version: int = NUMERICS_VERSION
-    extra: dict[str, Any] = field(default_factory=dict)  # "absmax": calibration maxima per class
+    # "absmax": calibration maxima per class; "qk_smoothing": alpha, cap and factor range
+    extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def n_layers(self) -> int:
@@ -137,6 +142,47 @@ def tile_v_bias(b_v: np.ndarray, heads: int, kv_heads: int, head_dim: int) -> np
 def fold_v_bias(w_o: np.ndarray, b_v: np.ndarray, heads: int, kv_heads: int, head_dim: int):
     """Real-valued ``W_o @ tile(b_v)`` (float64), the exact V-bias fold into ``o_proj``."""
     return np.asarray(w_o, dtype=np.float64) @ tile_v_bias(b_v, heads, kv_heads, head_dim)
+
+
+def smooth_qk(
+    w: LayerWeights, factors: np.ndarray, heads: int, kv_heads: int, head_dim: int
+) -> LayerWeights:
+    """Fold one layer's pairwise Q/K smoothing factors ``[kv_heads, head_dim/2]`` into its weights.
+
+    Rows ``d`` and ``d + head_dim/2`` of ``W_k`` and ``b_k`` (KV head ``g``) are
+    divided by ``factors[g, d]``; the same rows of ``W_q`` and ``b_q`` of every
+    query head ``g`` serves are multiplied by it.  ``q . k`` is unchanged in
+    exact arithmetic, and because a factor is constant over a RoPE pair the fold
+    commutes with RoPE.  The four arrays come back as float64; everything else
+    is passed through.
+    """
+    s_k, s_q = tile_factors(factors, heads, kv_heads, head_dim)
+    return dataclasses.replace(
+        w,
+        wq=np.asarray(w.wq, dtype=np.float64) * s_q[:, None],
+        bq=None if w.bq is None else np.asarray(w.bq, dtype=np.float64) * s_q,
+        wk=np.asarray(w.wk, dtype=np.float64) / s_k[:, None],
+        bk=None if w.bk is None else np.asarray(w.bk, dtype=np.float64) / s_k,
+    )
+
+
+def smoothing_factors(calib: dict[str, Any], spec: ModelSpec) -> np.ndarray:
+    """The ``qk_smoothing`` factors of ``calib`` as float64 ``[layers, kv_heads, head_dim/2]``.
+
+    Rejects a report without the block, with the wrong shape, or with a factor
+    outside ``[1/cap, cap]`` or not finite.
+    """
+    block = calib.get("qk_smoothing")
+    if block is None:
+        raise ValueError("calib.json has no qk_smoothing block; rerun `quettos calibrate`")
+    f = np.asarray(block["factors"], dtype=np.float64)
+    want = (spec.layers, spec.kv_heads, spec.head_dim // 2)
+    if f.shape != want:
+        raise ValueError(f"calib.json qk_smoothing factors shape {f.shape} is not {want}")
+    cap = float(block["cap"])
+    if not np.all(np.isfinite(f)) or np.any(f < 1.0 / cap) or np.any(f > cap):
+        raise ValueError(f"calib.json qk_smoothing factors leave [1/{cap:g}, {cap:g}]")
+    return f
 
 
 def quantize_layer(spec: ModelSpec, w: LayerWeights, frac: dict[str, int]) -> QuantLayer:
@@ -184,12 +230,16 @@ def build_quant_model(
     *,
     layers: int | None = None,
 ) -> QuantModel:
-    """Quantize ``spec`` with the formats and K-centering rows of ``calib``.
+    """Quantize ``spec`` with the formats, K-centering rows and smoothing factors of ``calib``.
 
-    ``layers`` keeps only the first ``layers`` decoder layers (for fast tests);
-    the norm, embedding and constants are always produced.  The calibration
-    maxima per class travel with the model in ``extra["absmax"]`` so the
-    program constants (:mod:`quettos.program`) derive from the ``.npz`` alone.
+    Every layer's ``W_q``/``b_q`` and ``W_k``/``b_k`` are folded with
+    :func:`smooth_qk` and its K-centering row divided by the same per-channel
+    factors before quantization.  ``layers`` keeps only the first ``layers``
+    decoder layers (for fast tests); the norm, embedding and constants are
+    always produced.  The calibration maxima per class travel with the model in
+    ``extra["absmax"]`` so the program constants (:mod:`quettos.program`)
+    derive from the ``.npz`` alone; ``extra["qk_smoothing"]`` records the
+    smoothing rule's ``alpha``, ``cap`` and the factor range.
     """
     if not isinstance(calib, dict):
         calib = load_calib(calib)
@@ -202,11 +252,17 @@ def build_quant_model(
     frac = {k: int(v) for k, v in calib["frac"].items()}
     check_fracs(frac)
     n_layers = spec.layers if layers is None else min(layers, spec.layers)
+    factors = smoothing_factors(calib, spec)
+    h, kv, d = spec.heads, spec.kv_heads, spec.head_dim
 
-    q_layers = [quantize_layer(spec, load_layer(spec, i), frac) for i in range(n_layers)]
+    q_layers = [
+        quantize_layer(spec, smooth_qk(load_layer(spec, i), factors[i], h, kv, d), frac)
+        for i in range(n_layers)
+    ]
     k_center = np.asarray(calib["k_center"], dtype=np.float64)[:n_layers]
-    if k_center.shape != (n_layers, spec.kv_heads, spec.head_dim):
+    if k_center.shape != (n_layers, kv, d):
         raise ValueError(f"calib.json k_center shape {k_center.shape} does not match the model")
+    k_center = k_center / pair_to_channels(factors[:n_layers])
     eps_c = numerics.eps_const(spec.rms_norm_eps, spec.hidden, frac["X"])
     absmax = {k: float(v) for k, v in calib["absmax"].items()}
     return QuantModel(
@@ -231,7 +287,15 @@ def build_quant_model(
         norm_final=quantize_norm(load_final_norm(spec)),
         embed=quantize_linear(load_embedding(spec).astype(np.float64)),
         k_center=numerics.to_fixed(k_center, frac["QKV"]).astype(np.int32),
-        extra={"absmax": absmax},
+        extra={
+            "absmax": absmax,
+            "qk_smoothing": {
+                "alpha": float(calib["qk_smoothing"]["alpha"]),
+                "cap": float(calib["qk_smoothing"]["cap"]),
+                "factor_min": float(factors.min()),
+                "factor_max": float(factors.max()),
+            },
+        },
     )
 
 

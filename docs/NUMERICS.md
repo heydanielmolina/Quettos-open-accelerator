@@ -63,8 +63,9 @@ gets `q = 0` and the zero scale. Rows are grouped the way the programs stream
 them: `wqkv = [q; k; v]`, `wgu = [gate; up]`, `wo`, `wdown`, and the tied
 embedding / LM-head table row by row. Tiled `[N/WB][K][WB]`; zero-padded
 partial tiles allowed. Per-channel meta is 8 B little-endian
-`{i32 bias_q, u16 Sw_m, i8 Sw_e, u8 pad = 0}`. No block scales, no
-SmoothQuant.
+`{i32 bias_q, u16 Sw_m, i8 Sw_e, u8 pad = 0}`. No block scales; the one
+offline rescaling is the pairwise Q/K smoothing fold of the K-centering
+section, which leaves `q . k` unchanged.
 
 - `bias_q`: `to_fixed(bias, FRAC_QKV)` (round half up, saturating to int32)
   for the Q and K rows of `wqkv`; 0 for the V rows.
@@ -180,23 +181,27 @@ SmolLM2-135M-Instruct):
 | GEMV | `K` | `acc_bits` | `s1` | `sbias` | `S` window | hard minimum |
 |---|---|---|---|---|---|---|
 | EMBED | 896 / 576 | 32 / 32 | 16 / 16 | -8 / -6 | [32, 35] / [31, 33] | 32 / 31 |
-| QKV | 896 / 576 | 33 / 33 | 11 / 12 | -27 / -28 | [17, 48] / [17, 41] | 10 / 5 |
+| QKV | 896 / 576 | 33 / 33 | 9 / 12 | -25 / -28 | [17, 50] / [17, 42] | 10 / 5 |
 | o_proj | 896 / 576 | 33 / 33 | 16 / 16 | -32 / -30 | [18, 42] / [17, 40] | 6 / 5 |
 | gate\|up | 896 / 576 | 33 / 33 | 12 / 11 | -28 / -27 | [17, 44] / [17, 40] | 10 / 5 |
 | down | 4864 / 1536 | 36 / 34 | 12 / 10 | -28 / -24 | [15, 45] / [15, 45] | 10 / 11 |
 | LM head | 896 / 576 | 33 / 33 | 14 / 14 | -30 / -30 | [17, 43] / [17, 37] | 10 / 5 |
-| scores | 64 / 64 | 29 / 29 | 9 / 9 | -25 / -25 | [17, 60] / [23, 60] | 0 / 0 |
-| PV | 2048 / 2048 | 34 / 34 | 11 / 14 | -27 / -30 | [17, 39] / [17, 36] | 9 / 6 |
+| scores | 64 / 64 | 29 / 29 | 9 / 9 | -25 / -25 | [18, 60] / [21, 60] | 0 / 0 |
+| PV | 2048 / 2048 | 34 / 34 | 10 / 14 | -26 / -30 | [17, 40] / [17, 36] | 10 / 6 |
 
 Every window lies in `[0, 63]` and every hard minimum is at or above 0. The
 down GEMV is the one class where the 40-bit bound (`s1 >= acc_bits - 24`)
 beats the precision bound, so its smallest window shift is 15; the scores GEMV
 is the one where the hard bound lowers `s1` (both operands at int32 saturation
-give exactly `S = 0`). The W8A8 programs lower `s1` by 6 to 9 on the weight
-GEMVs (int8 activations carry a larger scale exponent) with the same hard
-minima and the smallest window shift again at 15 (down). The PV constants use
-`K = MAX_CTX = 2048` whatever the size of a golden run's cache, so a short run
-executes the compiled program's shifts.
+give exactly `S = 0`). The QKV row follows the weight window of the smoothed
+`W_q` rows (Qwen's largest QKV weight exponent is -20, its smallest -30), the
+scores row the exponents of the smoothed q and centered K, and the PV row the
+`SREG` window derived from the `QKV` class maximum, which bounds the V scales.
+The W8A8 programs lower `s1` by 7 to 8 on the weight GEMVs (int8 activations
+carry a larger scale exponent), keep the smallest window shift at 15 (down)
+and keep every hard minimum at or above 5 there, with scores at 0 as above.
+The PV constants use `K = MAX_CTX = 2048` whatever the size of a golden run's
+cache, so a short run executes the compiled program's shifts.
 
 ## Per-tensor-class formats
 
@@ -225,7 +230,7 @@ tokens and layers, in real units) and the resulting formats:
 | Class | Qwen2.5-0.5B-Instruct | SmolLM2-135M-Instruct |
 |---|---|---|
 | `FRAC_X` (residual `X`, norm output `XN`) | 16 (`X` 1710.84, `XN` 336.443) | 14 (`X` 25982.0, `XN` 47.5371) |
-| `FRAC_QKV` (Q/K/V after projection, bias and RoPE; centered K 57.68 / 15.46) | 16 (221.359) | 16 (22.1061) |
+| `FRAC_QKV` (Q/K/V after projection, bias, RoPE and the Q/K smoothing fold; centered K 16.56 / 15.95) | 16 (332.84) | 16 (24.3374) |
 | `FRAC_S` (log2-domain scores of centered K, `q . (k - c)`) | 16 (90.1764; raw `q . k` 2466.37) | 16 (54.5107; raw 88.3937) |
 | `FRAC_GU` (gate, up) | 16 (101.81) | 16 (78.5393) |
 | `FRAC_H` (`silu(gate) * up`) | 16 (1817.01) | 16 (3164.41) |
@@ -291,44 +296,74 @@ entry equals float64 `floor(cos(angle) * 2^14 + 0.5)` exactly, and the
 float32 `cos`/`sin` of the reference forward agree with the table within 2 LSB
 at every position.
 
-## K-centering (VSUBC)
+## K-centering (VSUBC) and Q/K smoothing
 
 `k' = sat32(k - c[layer][kvh])`, with `c` the mean post-RoPE K vector per
 (layer, KV head) over the calibration tokens, stored as int32 in `FRAC_QKV`.
 Exact for the softmax since `q . c` is constant over `t`; it conditions the
 int8 K cache against Qwen's large `k_proj` biases.
 
+Pairwise Q/K smoothing is the second conditioning step and is folded into the
+weights offline (`quantize.smooth_qk`). For every (layer, KV head, RoPE pair
+`p = (d, d + 32)`) the calibration pass computes one factor
+
+```
+s_p = (max |k_c|_p / max |q|_p) ^ (1/2)
+```
+
+with the maxima over both dimensions of the pair and all calibration tokens,
+`k_c` the centered post-RoPE K of the head and `q` the post-RoPE Q of the
+query heads it serves; each (layer, KV head) row is divided by its geometric
+mean and clipped to `[1/16, 16]`. Rows `d` and `d + 32` of `W_k`, `b_k` and
+the K-centering row are divided by `s_p`; the same rows of `W_q`, `b_q` of
+every served query head are multiplied by it. `q . k` is unchanged in exact
+arithmetic, and because `s_p` is constant over a RoPE pair the fold commutes
+with RoPE, so it applies to the projections as stored. The factors are
+recorded in `calib.json` under `qk_smoothing` (`[layers, kv_heads, 32]` at six
+significant digits, applied as stored, with `alpha`, `cap` and the rule), and
+the `QKV` and `K_centered` maxima of `calib.json` are those of the smoothed
+model, so the program constants above are proven for the weights the hardware
+streams. Measured factors: Qwen `[0.178, 13.6]`, where layer 0 spans the whole
+range and layers 1 to 23 stay within `[0.44, 1.82]`; SmolLM2 `[0.54, 1.80]`.
+The class maxima move from 221.4 to 332.8 (`QKV`) and from 57.7 to 16.6
+(`K_centered`) on Qwen and from 22.1 to 24.3 and 15.5 to 16.0 on SmolLM2;
+every `FRAC` is unchanged.
+
 Gate (`k_centering_gate` in `calib.json`): post-RoPE K quantized to int8 per
-(token, KV head) with an `absmax/127` scale, and the error of the resulting
-`q . k` scores over the causal window, in two units: relative to the RMS of the
-exact scores, and absolute in the log2 domain the softmax consumes
-(`q . k / sqrt(d) * log2(e)`; one unit halves a token's weight), as RMS and
-as the largest single error:
+(token, KV head) with an `absmax/127` scale, as projected (raw), after
+centering, and after centering divided by the smoothing factors, and the
+error of the resulting `q . k` scores over the causal window, in two units:
+relative to the RMS of the exact scores, and absolute in the log2 domain the
+softmax consumes (`q . k / sqrt(d) * log2(e)`; one unit halves a token's
+weight), as RMS and as the largest single error:
 
 | Model | int8 K | relative RMS | RMS (log2 units) | max (log2 units) |
 |---|---|---|---|---|
 | Qwen2.5-0.5B-Instruct | raw | 0.503% | 0.613 | 22.2 |
 | Qwen2.5-0.5B-Instruct | centered | 0.149% | 0.181 | 8.01 |
+| Qwen2.5-0.5B-Instruct | centered + smoothed | 0.0257% | 0.0313 | 0.706 |
 | SmolLM2-135M-Instruct | raw | 0.780% | 0.0657 | 0.615 |
 | SmolLM2-135M-Instruct | centered | 0.306% | 0.0258 | 0.429 |
+| SmolLM2-135M-Instruct | centered + smoothed | 0.290% | 0.0244 | 0.398 |
 
-Centering is enabled for both models. The relative figure flatters Qwen: its
+Both steps are enabled for both models. The relative figure flatters Qwen: its
 raw scores are dominated by the constant `q . c` term (absmax 2466 against 90
 for the centered scores), so the absolute error is the one to read. Per layer
-(`layer_rms_error_log2_centered`), Qwen's centered error is 0.868 log2 units
-on layer 0 and between 0.020 and 0.069 on layers 1 to 23; SmolLM2 stays
-between 0.010 and 0.039 on every layer. Layer 0 of Qwen is the dominant error
-source of its W8A16 rows in the Quality section; the KL against fp32 is
-largest on the shortest prompt, where a few tokens carry most of the
-attention.
+(`layer_rms_error_log2_centered` and `_smoothed`), Qwen's centered error is
+0.868 log2 units on layer 0 and between 0.020 and 0.069 on layers 1 to 23;
+smoothing brings layer 0 to 0.054 and layers 1 to 23 to between 0.019 and
+0.046. SmolLM2 stays between 0.009 and 0.034 on every layer (0.010 to 0.039
+with centering alone). Layer 0 of Qwen, whose K pairs span two orders of
+magnitude around the mean, is where the fold does its work; the Quality
+section gives the end-to-end effect.
 
 ## KV cache
 
-K int8 per (token, kv head) + sfloat scale, transposed in 64-token tiles; V
-int8 (`v_raw`, without its bias) per (token, kv head) + scale, row-major; 8 B
-meta each. The compiler writes zero K/V meta for the whole `MAX_CTX` range into
+K int8 per (token, kv head) + sfloat scale, transposed in `WB`-token tiles; V
+int8 (`v_raw`, without its bias) per (token, kv head) + scale, tiled with the
+64 dimensions as channels (one row per token at `WB = 64`); 8 B meta each. The compiler writes zero K/V meta for the whole `MAX_CTX` range into
 `image.bin`; the harness zero-fills the KV region at sequence start and before
-prefix restore; `compare.py` masks score elements `>= len`.
+prefix restore; the comparison (`isa_sim.compare_sequence`) masks score elements `>= len`.
 
 ## Scores
 
@@ -474,23 +509,27 @@ written to `models/<name>/quality.json`; the token ids are the ones hashed in
 
 | Model | Config | Tokens | top-1 vs fp32 | mean KL (nats) | delta-NLL +/- SE (nats) | PPL fp32 -> int |
 |---|---|---|---|---|---|---|
-| Qwen2.5-0.5B-Instruct | W8A16 | 1308 | 93.65% (1225) | 0.0556 | +0.0492 +/- 0.0132 | 34.97 -> 36.73 |
-| Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.01% (1125) | 0.109 | +0.0302 +/- 0.0242 | 34.97 -> 36.04 |
-| SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00464 | +0.0052 +/- 0.0028 | 35.91 -> 36.09 |
-| SmolLM2-135M-Instruct | W8A8 | 1175 | 87.15% (1024) | 0.0468 | -0.0185 +/- 0.0101 | 35.91 -> 35.25 |
+| Qwen2.5-0.5B-Instruct | W8A16 | 1308 | 95.57% (1250) | 0.0124 | +0.0026 +/- 0.0066 | 34.97 -> 35.06 |
+| Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.39% (1130) | 0.110 | +0.0111 +/- 0.0208 | 34.97 -> 35.36 |
+| SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00485 | -0.0023 +/- 0.0030 | 35.91 -> 35.82 |
+| SmolLM2-135M-Instruct | W8A8 | 1175 | 89.19% (1048) | 0.0454 | +0.0302 +/- 0.0113 | 35.91 -> 37.01 |
 
 W8A16 is the default (int16 activations into every weight GEMV, int8 K/V
-cache, table-driven nonlinearities); W8A8 feeds int8 activations to the weight
-GEMVs with everything else unchanged. `sat` and `err_shift` are 0 on every
-row; the VQUANT and softmax clip counts are 246540 / 196472 on Qwen (W8A16 /
-W8A8) and 169416 / 138576 on SmolLM2. On Qwen the KL is concentrated in the
-two short prompts (0.274 per position at T = 36 and 0.101 at T = 180, W8A16)
-while the four longer sequences lie between 0.023 and 0.059; on SmolLM2 every
-sequence lies between 0.0040 and 0.0069. The W8A8 rows lose 7.6 (Qwen) and
-8.5 (SmolLM2) points of top-1 and raise the KL 2x and 10x, while their
-delta-NLL stays within two standard errors of zero: the int8 activations
-perturb the distribution far more than they shift the likelihood of the true
-token.
+cache, table-driven nonlinearities, K-centering and the Q/K smoothing fold);
+W8A8 feeds int8 activations to the weight GEMVs with everything else
+unchanged. `sat` and `err_shift` are 0 on every row; the VQUANT and softmax
+clip counts are 243621 / 194390 on Qwen (W8A16 / W8A8) and 171687 / 140157 on
+SmolLM2. With K-centering alone (every smoothing factor 1, everything else
+equal) the Qwen W8A16 row measures 93.65% top-1, KL 0.0556 and delta-NLL
++0.0492 +/- 0.0132 (PPL 36.73), so the fold recovers 1.9 points of top-1 and
+4.5x in KL on the model with large `k_proj` biases and leaves SmolLM2 within
+noise (95.66%, KL 0.00464 with centering alone). On Qwen the KL is largest on
+the two short prompts (0.038 per position at T = 36 and 0.034 at T = 180,
+W8A16) while the four longer sequences lie between 0.0054 and 0.0117; on
+SmolLM2 every sequence lies between 0.0040 and 0.0080. The W8A8 rows lose 9.2
+(Qwen) and 6.5 (SmolLM2) points of top-1 and raise the KL about 9x, with
+delta-NLL +0.011 +/- 0.021 and +0.030 +/- 0.011: the int8 activations perturb
+the distribution far more than they shift the likelihood of the true token.
 
 `sw/tests/test_quality.py` gates SmolLM2 W8A16 on this set at `KL <= 0.02`
 nats and `top-1 >= 93%`, and checks that `quality.json` agrees with a fresh

@@ -21,7 +21,7 @@
   Verilator with the C++ harness, `make demo` as one command, CI green.
 - **Synthesis.** Yosys `synth_xilinx` (xc7) report for the demo configuration
   with the exact command and tool version; ECP5 and a nextpnr fmax
-  only if time allows.
+  follow in a later release.
 - **Results.** Performance tables produced only by `make perf` from RTL
   counters, a quality table from the overnight run, the tool-call demo with
   prefix-KV reuse, README, docs, architecture diagram and a recorded GIF.

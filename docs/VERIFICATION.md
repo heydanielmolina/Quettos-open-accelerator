@@ -13,8 +13,10 @@ golden.py         op-by-op integer forward, float64 BLAS for exact integer GEMV 
 quality.py        golden vs fp32 over the calibration set (uv run quettos check <alias>):
    |              top-1, KL, delta-NLL +/- SE, PPL -> models/<name>/quality.json
    |
-isa_sim.py        executes decode.prog / prefill.prog on image.bin exactly as the RTL does
-   |  bit-exact  (== golden on both models and random tiny shapes)
+isa_sim.py        executes decode.prog / prefill.prog on image.bin at value level, with
+   |  bit-exact  numerics.py as its only arithmetic; == golden (every descriptor, KV byte and
+   |             counter) on synthetic shapes at WB 16 / 64 / 128, two-layer real models and
+   |             the complete models over prefill + decode (sw/tests/test_isa_sim.py)
    v
 RTL (Verilator)   qcore_top, all three configurations
 ```
@@ -47,8 +49,9 @@ delta**, reported with standard errors at the calibration-set lengths (up to 520
    `ERR == 0` at `POS in {0, 1, 63, 64}`.
 4. **Op-level RTL vs isa_sim.** `--layers N` truncated models (1-2 layers of
    both) and random tiny shapes (hidden 64-192, vocab 128-256, kv_heads 1-3;
-   >= 5 shapes, >= 10 if time) -> step-mode per-op blobs (VSRAM range + SREG +
-   memory range from `dump_plan.json`) -> `compare.py` bit-exact, first
+   at least 5 shapes) -> step-mode per-op blobs (VSRAM range + SREG +
+   memory range from `dump_plan.json`) -> compared bit-exact against
+   `isa_sim.compare_sequence`, first
    mismatch reported at (op index, opcode, `.lst` line, element); the full KV
    region is compared after every token in truncated tests.
 5. **End-to-end.** RTL tokens == isa_sim == golden on both models (CI: SmolLM2
@@ -61,15 +64,19 @@ delta**, reported with standard errors at the calibration-set lengths (up to 520
    delta-NLL +/- SE, KL, top-1 and PPL for W8A16 and W8A8 on both models,
    written to `models/<name>/quality.json` and tabulated in `NUMERICS.md`.
    CI gate on SmolLM2 W8A16 (`KL <= 0.02 nats`, `top-1 >= 93%`; measured
-   0.0046 and 95.66%); Qwen is reported (W8A16 measured `KL 0.0556`, `top-1
-   93.65%`, with the int8 K cache on layer 0 as the dominant term, see the
-   K-centering section of `NUMERICS.md`). Saturation and shift-error
+   0.0049 and 95.66%); Qwen is reported (W8A16 measured `KL 0.0124`, `top-1
+   95.57%`, with the int8 K cache conditioned by K-centering and the
+   pairwise Q/K smoothing fold, see the K-centering section of
+   `NUMERICS.md`). Saturation and shift-error
    counters are zero on every reported run. The table covers the calibration set; `docs/ROADMAP.md` lists the
    longer WikiText-2 run.
 7. **Perf counters.** The harness asserts `busy = mac_active + stall_mem +
    stall_vpu + stall_kv + stall_seq + stall_drain`; byte counters are
-   cross-checked against the C++ memory model; weight bytes/token ==
-   `layout.json` total; MACs issued == compiler count.
+   cross-checked against the C++ memory model; `WT_BYTES` ==
+   `layout.json` `traffic.<program>.wt_bytes`; `MACS` == `traffic.<program>.macs`
+   plus the attention term of `traffic.attention` at the token's position
+   (`ISA.md`, PERF table); `isa_sim.py` counts the same three and is the
+   reference for them.
 8. **CI.** `.github/workflows/ci.yml` (ubuntu-latest, 4 vCPU) and
    `nightly.yml`: `YosysHQ/setup-oss-cad-suite@v4` pinned to a dated release
    (tool versions printed into `syn/reports`), `actions/cache` for the suite,

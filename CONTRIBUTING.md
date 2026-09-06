@@ -12,8 +12,8 @@ README can be traced to a command that produced it.
   the change (the commands, verbatim).
 - Commit messages: a short imperative subject line (under 72 characters), a
   blank line, then the why. One logical change per commit.
-- CI must be green (`make lint`, `uv run pytest -q sw/tests`, and the RTL jobs
-  once they exist) before a PR is reviewed.
+- CI must be green (`make lint`, `uv run pytest -q sw/tests`, and the RTL jobs)
+  before a PR is reviewed.
 - Never commit anything under `build/`. Model weights are downloaded at build
   time and are not redistributed (see `NOTICE`).
 
@@ -53,6 +53,14 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 - ROM initialization only through a `ROM_FILE` string parameter with **no
   default**, set to an **absolute path** by the Makefile / `.ys` script:
   `$readmemh(ROM_FILE, mem);`.
+- ISA constants (opcodes, flag masks, descriptor field positions, CSR offsets,
+  PERF indices) come from the generated include `rtl/qcore_csr_defs.svh`
+  (`uv run quettos csr-defs`), which defines one `` `define QCORE_<NAME> ``
+  macro per constant; a module or package restates the ones it uses as
+  `localparam` (`` localparam int OP_GEMV = `QCORE_OP_GEMV; ``). Macros rather
+  than `localparam` in the include because Verilator `-Wall` reports every
+  unused `localparam`, in module and package scope alike, and waivers are not
+  allowed.
 
 ### Forbidden (each one is a lint failure or a Yosys hard error)
 
@@ -98,6 +106,12 @@ followed by greps that fail on the forbidden constructs listed above. The
 unpacked-port check is a heuristic (a port declaration whose identifier is
 followed by a `[..]` range); see the comment in `scripts/lint.sh`.
 
+The glob is `rtl/*.sv`: the generated include `rtl/qcore_csr_defs.svh` is
+linted through the modules that include it, checked against `isa.py` by
+`uv run quettos csr-defs --check`, and run through all three parsers on an
+include wrapper by `sw/tests/test_isa.py` (skipped when the tools are not on
+`PATH`).
+
 Run it on the day you write a module. It is fast.
 
 ## 5. Pre-commit hook
@@ -130,5 +144,6 @@ If `uv` is not on PATH the pytest step is skipped with a message.
   per-op compare against `isa_sim.py`. New numerics need a property test in
   `sw/tests/test_numerics.py`.
 - Tests marked `slow` need the quantized models under `build/quant/` (from
-  `uv run quettos quantize <alias>`) and take a few minutes;
+  `uv run quettos quantize <alias>`), write the compiled images to
+  `build/images/<name>/` and take a few minutes;
   `uv run pytest -q sw/tests -m "not slow"` is the quick loop.

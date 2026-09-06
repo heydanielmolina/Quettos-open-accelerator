@@ -1,7 +1,9 @@
-"""Command-line entry point: ``quettos <command>``.
+"""Command-line entry point: ``quettos <command>`` (installed by ``pyproject.toml``).
 
 Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
-``quantize``, ``golden``, ``check``.
+``quantize``, ``compile``, ``golden``, ``isa-sim``, ``check``, ``csr-defs``.
+Each command is a thin wrapper over the module of the same name; the file
+formats they read and write are described in ``docs/``.
 """
 
 from __future__ import annotations
@@ -74,6 +76,60 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_compile(args: argparse.Namespace) -> int:
+    import time
+    from pathlib import Path
+
+    from quettos import calibrate, compiler, quantize
+
+    spec = load_spec(args.model)
+    qpath = Path(args.quant) if args.quant else quantize.default_path(spec.name)
+    t0 = time.perf_counter()
+    if qpath.is_file():
+        model = quantize.load(qpath)
+        if args.layers is not None:
+            if args.layers > model.n_layers:
+                print(
+                    f"{qpath} holds {model.n_layers} layers, fewer than {args.layers}",
+                    file=sys.stderr,
+                )
+                return 1
+            model = compiler.truncate_layers(model, args.layers)
+    elif args.layers is not None:
+        model = quantize.build_quant_model(spec, calibrate.calib_path(spec), layers=args.layers)
+    else:
+        print(f"{qpath} not found; run: uv run quettos quantize {args.model}", file=sys.stderr)
+        return 1
+    suffix = "" if model.n_layers == spec.layers else f"-l{model.n_layers}"
+    out = Path(args.out) if args.out else compiler.IMAGES_DIR / f"{spec.name}{suffix}"
+    t1 = time.perf_counter()
+    result = compiler.compile(
+        model,
+        spec,
+        out_dir=out,
+        max_ctx=args.max_ctx,
+        wb=args.wb,
+        a_bits=args.a_bits,
+        prompt=args.prompt,
+    )
+    t2 = time.perf_counter()
+    lay = result.layout
+    summary = {
+        "model": spec.repo_id,
+        "layers": model.n_layers,
+        "out": str(out),
+        "image_bytes": lay["image"]["size"],
+        "image_sha256": lay["image"]["sha256"],
+        "descriptors": {k: v["descriptors"] for k, v in lay["programs"].items()},
+        "vsram_elements_used": lay["vsram"]["used"],
+        "stream_bytes_per_token": {k: lay["traffic"][k]["total"] for k in ("decode", "prefill")},
+        "load_seconds": round(t1 - t0, 2),
+        "compile_seconds": round(t2 - t1, 2),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def _cmd_golden(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
@@ -133,6 +189,122 @@ def _cmd_golden(args: argparse.Namespace) -> int:
     return 0
 
 
+def _isa_sim_prompt(args, spec, layout, programs, image_path, model, table, key, ids) -> int:
+    """Generate for one prompt on a fresh machine; returns 1 on any mismatch."""
+    import time
+
+    from quettos import golden, isa_sim
+    from quettos.model import REPO_ROOT
+    from quettos.numerics import Stats
+
+    wb, max_ctx, a_bits = int(layout["wb"]), int(layout["max_ctx"]), int(layout["a_bits"])
+    m = isa_sim.Machine.from_file(image_path, wb=wb)
+    clock = [time.perf_counter()]
+    total = Stats()
+
+    def on_token(j: int, pos: int, tok: int) -> None:
+        now = time.perf_counter()
+        ms = 1000.0 * (now - clock[0])
+        clock[0] = now
+        st = m.stats()
+        total.sat, total.err_shift, total.clip = (
+            total.sat + st.sat,
+            total.err_shift + st.err_shift,
+            total.clip + st.clip,
+        )
+        text = table[tok].decode("utf-8", errors="replace")
+        print(f"{key}: step {j:3d} pos {pos:4d} argmax {tok:6d} {text!r} ({ms:.0f} ms)")
+
+    t0 = time.perf_counter()
+    gen = isa_sim.generate(
+        m,
+        programs.decode,
+        programs.prefill,
+        ids,
+        args.max_new,
+        eos_ids=spec.eos_ids,
+        on_token=on_token,
+    )
+    elapsed = time.perf_counter() - t0
+    text = b"".join(table[i] for i in gen).decode("utf-8", errors="replace")
+    print(f"{key}: {len(ids)} prompt tokens -> {len(gen)} generated: {text!r}")
+    print(f"  ids {gen} sha256 {golden.ids_sha256(gen)}")
+    print(
+        f"  decode steps: sat={total.sat} err_shift={total.err_shift} clip={total.clip} "
+        f"ERR_BOUNDS={m.csr['ERR_BOUNDS']} MACS={m.perf_value('MACS')} "
+        f"WT_BYTES={m.perf_value('WT_BYTES')} seconds={elapsed:.1f}"
+    )
+    status = 0
+    stored = REPO_ROOT / "models" / spec.name / "expected_tokens.json"
+    if stored.is_file() and int(layout["model"]["layers"]) == spec.layers:
+        expected = json.loads(stored.read_text(encoding="utf-8"))
+        if key in expected.get("prompts", {}) and expected.get("max_new") == args.max_new:
+            want = expected["prompts"][key]["generated_ids"]
+            print(f"  expected_tokens.json: {'match' if want == gen else 'MISMATCH ' + str(want)}")
+            status |= int(want != gen)
+    if model is not None:
+        t1 = time.perf_counter()
+        cmp = isa_sim.compare_generate(
+            model,
+            image_path,
+            programs,
+            ids,
+            args.max_new,
+            eos_ids=spec.eos_ids,
+            a_bits=a_bits,
+            max_ctx=max_ctx,
+            wb=wb,
+        )
+        secs = time.perf_counter() - t1
+        if cmp.ok:
+            print(
+                f"  golden: every descriptor matches over {cmp.positions} positions ({secs:.1f} s)"
+            )
+        else:
+            print(f"  golden: MISMATCH {cmp.mismatch}")
+            status |= 1
+    return status
+
+
+def _cmd_isa_sim(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from quettos import compiler, golden, isa_sim, quantize
+    from quettos.model import REPO_ROOT
+    from quettos.tokenizer_io import token_bytes
+
+    spec = load_spec(args.model)
+    out_dir = Path(args.dir) if args.dir else compiler.IMAGES_DIR / spec.name
+    layout_path = out_dir / compiler.FILES["layout"]
+    if not layout_path.is_file():
+        print(f"{layout_path} not found; run: uv run quettos compile {args.model}", file=sys.stderr)
+        return 1
+    layout = compiler.load_layout(out_dir)
+    layers = int(layout["model"]["layers"])
+    programs = isa_sim.Programs.from_dir(out_dir)
+    image_path = out_dir / layout["image"]["file"]
+    model = None
+    if args.compare:
+        qpath = Path(args.quant) if args.quant else quantize.default_path(spec.name)
+        if not qpath.is_file():
+            print(f"{qpath} not found; run: uv run quettos quantize {args.model}", file=sys.stderr)
+            return 1
+        model = quantize.load(qpath)
+        if model.n_layers < layers:
+            print(f"{qpath} holds {model.n_layers} layers, the image {layers}", file=sys.stderr)
+            return 1
+        if model.n_layers > layers:
+            model = compiler.truncate_layers(model, layers)
+    table = token_bytes(spec)
+    prompts = args.prompt or [str(REPO_ROOT / f) for f in golden.EXPECTED_PROMPT_FILES]
+    status = 0
+    for f in prompts:
+        ids = prompt_tokens(spec, f)
+        key = golden.prompt_key(f)
+        status |= _isa_sim_prompt(args, spec, layout, programs, image_path, model, table, key, ids)
+    return status
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
@@ -178,6 +350,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
     else:
         print(quality.quality_json_text(rep), end="")
     return 0
+
+
+def _cmd_csr_defs(args: argparse.Namespace) -> int:
+    from quettos import csrgen
+
+    return csrgen.main(["--check"] if args.check else [])
 
 
 def _cmd_download(args: argparse.Namespace) -> int:
@@ -235,6 +413,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layers", type=int, default=None, help="keep only the first N layers")
     p.set_defaults(func=_cmd_quantize)
 
+    p = sub.add_parser("compile", help="lay out image.bin, the descriptor programs and layout.json")
+    p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
+    p.add_argument("--layers", type=int, default=None, help="compile only the first N layers")
+    p.add_argument("--out", default=None, help="output directory (default build/images/<name>)")
+    p.add_argument("--max-ctx", type=int, default=2048, help="KV positions in the image")
+    p.add_argument("--wb", type=int, default=64, help="weight-port width in bytes (tile width)")
+    p.add_argument("--a-bits", type=int, default=16, choices=(8, 16), help="activation width")
+    p.add_argument("--quant", default=None, help="quantized model .npz (default build/quant/)")
+    p.add_argument("--prompt", default=None, help="prompt file whose ids go to prompt.tokens")
+    p.set_defaults(func=_cmd_compile)
+
     p = sub.add_parser("golden", help="greedy generation with the bit-exact integer golden model")
     p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
     p.add_argument(
@@ -253,6 +442,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=_cmd_golden)
 
+    p = sub.add_parser("isa-sim", help="run the compiled programs on the ISA simulator")
+    p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
+    p.add_argument(
+        "--dir", default=None, help="compiler output directory (default build/images/<name>)"
+    )
+    p.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        help="prompts/*.json file (repeatable; default: the two expected_tokens prompts)",
+    )
+    p.add_argument("--max-new", type=int, default=20, help="tokens to generate (default 20)")
+    p.add_argument(
+        "--compare", action="store_true", help="check every descriptor against the golden model"
+    )
+    p.add_argument("--quant", default=None, help="quantized model .npz for --compare")
+    p.set_defaults(func=_cmd_isa_sim)
+
     p = sub.add_parser("check", help="quality of the integer golden model against fp32")
     p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
     p.add_argument(
@@ -265,6 +472,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quant", default=None, help="quantized model .npz (default build/quant/)")
     p.add_argument("--out", default=None, help="output path (default models/<name>/quality.json)")
     p.set_defaults(func=_cmd_check)
+
+    p = sub.add_parser("csr-defs", help="write the ISA/CSR headers for the RTL and the harness")
+    p.add_argument(
+        "--check", action="store_true", help="compare against the checked-in files; write nothing"
+    )
+    p.set_defaults(func=_cmd_csr_defs)
     return parser
 
 

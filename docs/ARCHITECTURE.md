@@ -26,11 +26,12 @@ activations that do not exist. Quettos Core inverts the roles:
 So `cycles/token ~= bytes/token / WB + overhead` and `tokens/s = memory
 bandwidth / bytes-per-token`. The design's job is to keep the weight port busy.
 
-Attention is the same GEMV. K is stored transposed in 64-token tiles and
-streams as "weights" with per-token scales; V streams row-major against int16
-softmax weights. The row dimension `B_MAX` is the agent dimension (B activation
-rows ride one weight pass); v1 keeps it as an RTL parameter proven by a
-block-level B=2 test; end-to-end batched decode is the first roadmap item.
+Attention is the same GEMV. K is stored transposed in `WB`-token tiles and
+streams as "weights" with per-token scales; V is tiled with the 64 dimensions
+as channels and streams against int16 softmax weights. The row dimension
+`B_MAX` is the agent dimension (B activation rows ride one weight pass); v1
+keeps it as an RTL parameter proven by a block-level B=2 test; end-to-end
+batched decode is the first roadmap item.
 
 ## v1 configuration
 
@@ -38,8 +39,7 @@ block-level B=2 test; end-to-end batched decode is the first roadmap item.
   `VL=4` vector lanes, heads processed sequentially, one descriptor in flight
   (fully serialized; cross-op weight prefetch is v1.1).
 - Tiny CI config: `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048`.
-- Simulation fallback: `WB=128`, same RTL, identical tokens by construction
-  once partial-last-tile support exists.
+- Simulation fallback: `WB=128`, same RTL, identical tokens (partial last tiles are zero-padded and drained per `docs/ISA.md`).
 
 See `rtl/cfg/README.md` for how parameters are passed.
 
@@ -51,7 +51,7 @@ external memory model is also C++ and sits outside the design boundary.
 
 ```
  host: C++ Verilator harness (tokenizer I/O, memory model, printing) / cocotb unit tests
-       | CSR port (32b): CTRL, STATUS, PC, TOK, POS, ARGMAX_TOK/VAL, PERF[16]x64b, SAT/ERR counters
+       | CSR port (32b): CTRL, STATUS, PC, ROW_EN, TOK, POS, ARGMAX_TOK/VAL, ISA_VERSION, PERF[16]x64b, SAT/ERR counters
  +-----v---------------------------------------------------------------------------------+
  | qcore_top (WB, B_MAX, VL, VSRAM_WORDS, FIFO_BEATS)                                     |
  |  seq_fetch -> seq_dispatch --GEMV/EMBED--> stream_ctrl --64 int8 w/cycle + k tag--+    |
@@ -65,7 +65,7 @@ external memory model is also C++ and sits outside the design boundary.
  |            vpu_top       kv_writer                            vsram 4096x256b  requant |
  |  (VRMSNORM VQUANT VROPE  (K^T byte    port A: MAC act reads  <----------------(acc*Sw  |
  |   VSILUMUL VSOFTMAX      scatter,     port B: VPU + requant writes             >>s1*Sx |
- |   VSUBC; VL lanes;       V row, meta) SREG[32] sfloat                          >>S,+b, |
+ |   VSUBC; VL lanes;       V tiles, meta) SREG[32] x 32b per row                 >>S,+b, |
  |   scalar LOD/sfloat;                                                           RMW,    |
  |   lut_interp exp2/sigmoid/rsqrt/recip)                                        argmax) |
  |                 |            |                                                  | dump  |
@@ -88,7 +88,7 @@ Module list and responsibilities (all `rtl/qcore_*.sv`):
 
 | Module | Purpose |
 |---|---|
-| `qcore_pkg` | parameters, opcode/flag localparams, descriptor field ranges, sfloat typedefs, `round_shift`/`sat` functions (explicit `qcore_pkg::` scoping only) |
+| `qcore_pkg` | parameters, the ISA constants of `rtl/qcore_csr_defs.svh` restated as localparams (opcodes, flags, descriptor field ranges), sfloat typedefs, `round_shift`/`sat` functions (explicit `qcore_pkg::` scoping only) |
 | `qcore_top` | flat QMEM/CSR ports, instantiates everything, generate-for rows; parameter root |
 | `qcore_csr` | CTRL/STATUS/PC/ROW_EN/TOK/POS/ARGMAX/PERF halves/SAT+ERR counters |
 | `qcore_seq_fetch` | descriptor fetch, 8-deep queue, step-mode gating |
@@ -101,7 +101,7 @@ Module list and responsibilities (all `rtl/qcore_*.sv`):
 | `qcore_vsram` | true-dual-port 256-bit RAM wrapper, `verilator public_flat_rd` for zero-cycle dumps |
 | `qcore_vpu_top` / `_lane` / `_scalar` | the six V ops, VL lanes, LOD/sfloat/LUT scalar path |
 | `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation |
-| `qcore_kv_writer` | K^T byte scatter / V row / meta writes, issued-write tracking |
+| `qcore_kv_writer` | K^T byte scatter / V tile row / meta writes, issued-write tracking |
 | `qcore_perf` | 16 x 64-bit counters with exclusive stall buckets |
 
 ## Decode step dataflow
@@ -118,9 +118,9 @@ The host writes `TOK`, `POS`, `ROW_EN`, pulses `START`; the program runs to
    2 k heads; cos/sin row at `rope_base + POS*128`). `VQUANT(q, group 64,
    scale_mul = log2e/8)` -> int16 q + 14 scales. `VSUBC(k, kcenter[layer][kvh])`
    then `VQUANT(k, group 64, int8)`; `VQUANT(v_raw, group 64, int8)` (V bias
-   folded into the o_proj bias offline). `KVWRITE x4` (K^T byte scatter + meta;
-   V row + meta). Hardware auto-fences memory-reading ops while writes are
-   outstanding.
+   folded into the o_proj bias offline). Two `KVWRITE` per KV head (K^T byte
+   scatter + meta; V tile row + meta). Hardware auto-fences memory-reading ops
+   while writes are outstanding.
 3. **Attention per q head** (14 sequential): `GEMV(K^T region of kv head h/7,
    n_from_pos, K=64, per-token K-scale meta)` -> scores (log2 domain);
    `VSOFTMAX(len = POS+1, V-scale array)` -> `w` int16 + `SREG_out`;

@@ -42,10 +42,15 @@ decode, a paged KV cache and constrained decoding on the
 
 ## Status
 
-**2026-09-04:** the integer numerics, lookup tables, calibration, int8
+**2026-09-05:** the integer numerics, lookup tables, calibration, int8
 quantizer and the bit-exact integer golden model are in place; both models
 generate text from integer arithmetic (`models/*/expected_tokens.json`), and
-`models/*/quality.json` holds the measured quality against fp32. See
+`models/*/quality.json` holds the measured quality against fp32. The
+descriptor ISA (`sw/quettos/isa.py`, generated into `rtl/qcore_csr_defs.svh`
+and `sim/verilator/csr_defs.hpp`), the compiler (`image.bin`, `decode.prog`,
+`prefill.prog`, `layout.json`) and the ISA-level simulator are in place; the
+simulator reproduces the golden model bit for bit on both complete models
+(`uv run quettos isa-sim <alias> --compare`). See
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next and
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the speed-probe result and
 the locked demo configuration.
@@ -64,6 +69,9 @@ uv run quettos calibrate qwen       # activation ranges -> models/<name>/calib.j
 uv run quettos quantize qwen        # int8 weights + constants -> build/quant/<name>.npz
 uv run quettos golden qwen          # greedy generation on the integer golden model
 uv run quettos check qwen           # quality vs fp32 -> models/<name>/quality.json
+uv run quettos compile qwen         # image.bin, decode/prefill.prog, layout.json -> build/images/<name>/
+uv run quettos isa-sim qwen --compare   # run the programs on the ISA simulator, every descriptor vs golden
+uv run quettos csr-defs --check     # the generated ISA/CSR headers match sw/quettos/isa.py
 ```
 
 Requirements: Verilator 5.x, Yosys 0.65, Icarus Verilog 13, `uv` (Python 3.13

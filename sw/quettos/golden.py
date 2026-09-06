@@ -593,7 +593,8 @@ def ids_sha256(ids: Sequence[int]) -> str:
     ).hexdigest()
 
 
-def _prompt_key(path: Path | str) -> str:
+def prompt_key(path: Path | str) -> str:
+    """The repo-relative POSIX path of a prompt file (the key of ``expected_tokens.json``)."""
     p = Path(path).resolve()
     try:
         return p.relative_to(REPO_ROOT).as_posix()
@@ -621,7 +622,7 @@ def expected_tokens(
     prompts: dict[str, Any] = {}
     for f in prompt_files:
         ids = prompt_tokens(spec, f)
-        key = _prompt_key(f)
+        key = prompt_key(f)
 
         def report(j: int, pos: int, tok: int, key: str = key) -> None:
             if on_token is not None:
