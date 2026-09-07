@@ -138,7 +138,10 @@ delta**, reported with standard errors at the calibration-set lengths (up to 520
    cached. Five PR jobs with `timeout-minutes` each: lint + pytest, then the
    cocotb block tests, gate-level equivalence (`make gatesim`), the synthesis
    run (`make synth`: every block and the whole core in both configurations,
-   with every `syn/reports/*.md` regenerated and checked against the run) and
+   with every `syn/reports/*.md` regenerated and checked against the run; a
+   report written by a different Yosys build is held to its parameters and its
+   hard-block inventory, since LUT packing and path length belong to the build)
+   and
    the tiny-configuration bring-up comparison (`bringup-tiny`: `make
    harness-csr` then `make bringup`, 3.05 s locally from a cold Verilator
    build), the last four gated on the first. Nightly holds the long runs, each

@@ -350,7 +350,10 @@ def render(script: Path, log: Path, version: str, cfgs: list[Config], notes: str
         para(
             f"Every number below is read back out of `{log.relative_to(ROOT).as_posix()}` by "
             "`scripts/synth_report.py`, which `make synth` runs. The run comes first and this "
-            "page is written from it, so the two cannot disagree."
+            "page is written from it, so the two cannot disagree. `--check` regenerates the "
+            "page and requires it back byte for byte on the Yosys build named below; another "
+            "build has its own LUT packing and path lengths, so it is held to the parameters "
+            "and the hard-block inventory."
         )
     )
     out.append("")
@@ -459,6 +462,43 @@ def build(script: Path) -> tuple[str, str]:
     return name, render(script, log, version, cfgs, keep_notes(REPORT_DIR / name))
 
 
+# Cell types whose count is an inference outcome, not an optimization detail: a
+# different Yosys build may pack LUTs differently, but it must infer the same
+# DSPs and memories from the same source. `--check` holds these to an exact
+# match even when the tool that wrote the report was a different build.
+HARD_BLOCKS = (
+    "DSP48E1",
+    "RAMB36E1",
+    "RAMB18E1",
+    "RAM32M",
+    "RAM64M",
+    "RAM128X1D",
+)
+
+
+def tool_banner() -> str:
+    """The Yosys build this run uses, for the log."""
+    out = subprocess.run(["yosys", "-V"], capture_output=True, text=True, check=False)
+    return out.stdout.strip() or "yosys -V printed nothing"
+
+
+def recorded_tool(text: str) -> str:
+    """The tool version a recorded report was written with, empty if absent."""
+    m = re.search(r"^Tool: `(.+)`$", text, re.M)
+    return m.group(1) if m else ""
+
+
+def design_facts(text: str) -> list[str]:
+    """The lines a report must reproduce on any Yosys build."""
+    facts = []
+    for line in text.splitlines():
+        if line.startswith("# ") or line.startswith("## ") or line.startswith("Parameters: "):
+            facts.append(line)
+        elif line.startswith("| `") and any(f"`{b}`" in line for b in HARD_BLOCKS):
+            facts.append(line)
+    return facts
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument(
@@ -487,9 +527,13 @@ def main() -> int:
     started = time.monotonic()
     built: dict[str, str] = {}
     source: dict[str, Path] = {}
+    print(f"synth-report: {tool_banner()}")
     try:
         for script in scripts:
-            name, text = build(script)
+            try:
+                name, text = build(script)
+            except ReportError as exc:
+                raise ReportError(f"{script.name}: {exc}") from exc
             if name in built:
                 raise ReportError(
                     f"{script.name} and {source[name].name} both write syn/reports/{name}"
@@ -508,7 +552,8 @@ def main() -> int:
         print(f"synth: {len(scripts)} script(s), {elapsed:.1f} s, OK")
         return 0
 
-    failures = []
+    failures: list[str] = []
+    cross: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in built.items():
             fresh = Path(tmp) / name
@@ -517,16 +562,38 @@ def main() -> int:
             if not recorded.exists():
                 failures.append(f"syn/reports/{name} is missing")
                 continue
-            if recorded.read_text() != text:
-                failures.append(f"syn/reports/{name} does not match the run")
+            old_text = recorded.read_text()
+            was, now = recorded_tool(old_text), recorded_tool(text)
+            if was == now:
+                if old_text != text:
+                    failures.append(f"syn/reports/{name} does not match the run")
+                    sys.stdout.writelines(
+                        difflib.unified_diff(
+                            old_text.splitlines(keepends=True),
+                            text.splitlines(keepends=True),
+                            fromfile=f"syn/reports/{name} (recorded)",
+                            tofile=f"syn/reports/{name} (this run)",
+                        )
+                    )
+                continue
+            # A different Yosys build: cell packing and path lengths are its own,
+            # so hold it to the design facts and say what drifted.
+            old_facts, new_facts = design_facts(old_text), design_facts(text)
+            if old_facts != new_facts:
+                failures.append(
+                    f"syn/reports/{name}: this Yosys infers a different design than the "
+                    f"report records"
+                )
                 sys.stdout.writelines(
                     difflib.unified_diff(
-                        recorded.read_text().splitlines(keepends=True),
-                        text.splitlines(keepends=True),
-                        fromfile=f"syn/reports/{name} (recorded)",
-                        tofile=f"syn/reports/{name} (this run)",
+                        [f"{ln}\n" for ln in old_facts],
+                        [f"{ln}\n" for ln in new_facts],
+                        fromfile=f"syn/reports/{name} (recorded, {was})",
+                        tofile=f"syn/reports/{name} (this run, {now})",
                     )
                 )
+            else:
+                cross.append(name)
     if args.script is None:
         for stale in sorted(REPORT_DIR.glob("*.md")):
             if stale.name not in built:
@@ -540,6 +607,11 @@ def main() -> int:
             "to rewrite the reports from this run\n"
         )
         return 1
+    if cross:
+        print(
+            f"synth-report: {len(cross)} report(s) were written by another Yosys build; "
+            "their hard-block inventory and parameters match this one"
+        )
     print(f"synth: {len(scripts)} script(s), {elapsed:.1f} s, reports match, OK")
     return 0
 

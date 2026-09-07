@@ -2,7 +2,9 @@
 
 Every number below is read back out of `build/synth/synth_csr.log` by
 `scripts/synth_report.py`, which `make synth` runs. The run comes first and this page is
-written from it, so the two cannot disagree.
+written from it, so the two cannot disagree. `--check` regenerates the page and requires it
+back byte for byte on the Yosys build named below; another build has its own LUT packing and
+path lengths, so it is held to the parameters and the hard-block inventory.
 
 Tool: `Yosys 0.65 (git sha1 aec814bdf3071f7e0fd0fbe43f7f711e99d01e24, clang++ 21.0.0 -fPIC -O3)`
 
