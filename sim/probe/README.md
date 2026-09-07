@@ -2,8 +2,10 @@
 
 A Verilator cost model: a full-width skeleton of the Quettos Core datapath whose
 *per-cycle simulation cost* is representative of the final `qcore_top`, built
-first so the demo configuration could be locked before RTL integration. The real RTL lives in `rtl/` and shares no code with this directory. The measured numbers are in
-[`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md).
+first so the demo configuration could be chosen before RTL integration. The real
+RTL lives in `rtl/` and shares no code with this directory. The measured numbers
+are in [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md), which also measures
+how far a cycle here is from a cycle of the assembled core.
 
 ## What the probe is
 
@@ -44,9 +46,11 @@ beats the probe does not stream), 8.22M cycles at WB=64 and 4.34M at WB=128.
   what is measured.
 - Ideal memory. Fixed latency, one beat per cycle; `--lat` above the 64-beat
   window throttles the stream.
-- Its result feeds the demo-configuration decision in
-  [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md), derated by 0.65 as a
-  safety margin; README numbers come from `make perf` on the real top.
+- Its result priced a cycle of the design before `qcore_top` existed, which is
+  how the demo configuration was chosen. Now that both are measured,
+  [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md) states the distance
+  between them as a measured factor rather than an allowance, and every
+  headline number comes from `make perf` on the real top.
 
 ## Build and run
 

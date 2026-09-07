@@ -4,7 +4,9 @@ Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
 ``quantize``, ``compile``, ``golden``, ``isa-sim``, ``compare``, ``check``,
 ``csr-defs``.
 Each command is a thin wrapper over the module of the same name; the file
-formats they read and write are described in ``docs/``.
+formats they read and write are described in ``docs/``.  ``quantize`` and
+``check`` take ``--no-qk-smoothing``, which builds and scores the
+K-centering-only variant of the model into the ``-nosmooth`` quality rows.
 """
 
 from __future__ import annotations
@@ -55,7 +57,9 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
     spec = load_spec(args.model)
     calib_path = calibrate.calib_path(spec) if args.calib is None else args.calib
     t0 = time.perf_counter()
-    model = quantize.build_quant_model(spec, calib_path, layers=args.layers)
+    model = quantize.build_quant_model(
+        spec, calib_path, layers=args.layers, smoothing=args.smoothing
+    )
     t1 = time.perf_counter()
     path = quantize.save(model, args.out)
     t2 = time.perf_counter()
@@ -65,6 +69,7 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
         "out": str(path),
         "bytes": path.stat().st_size,
         "layers": model.n_layers,
+        "qk_smoothing": model.extra["qk_smoothing"],
         "weight_bytes": quantize.weight_bytes(model),
         "frac": model.frac,
         "eps_c": model.eps_c,
@@ -319,9 +324,15 @@ def _cmd_check(args: argparse.Namespace) -> int:
     from quettos import calibrate, quality, quantize
 
     spec = load_spec(args.model)
-    qpath = Path(args.quant) if args.quant else quantize.default_path(spec.name)
+    if args.quant:
+        qpath = Path(args.quant)
+    else:
+        qpath = quantize.default_path(spec.name, smoothing=args.smoothing)
     if not qpath.is_file():
-        print(f"{qpath} not found; run: uv run quettos quantize {args.model}", file=sys.stderr)
+        flag = "" if args.smoothing else " --no-qk-smoothing"
+        print(
+            f"{qpath} not found; run: uv run quettos quantize {args.model}{flag}", file=sys.stderr
+        )
         return 1
     model = quantize.load(qpath)
     if model.n_layers != spec.layers:
@@ -352,7 +363,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print("refusing to write: saturation or shift-error counters are non-zero", file=sys.stderr)
         return 1
     if args.a_bits is None:
-        path = quality.write_quality(rep, args.out)
+        out = Path(args.out) if args.out else quality.quality_path(model.name)
+        path = quality.write_quality(quality.merge_quality(rep, out), out)
         print(f"wrote {path}")
     else:
         print(quality.quality_json_text(rep), end="")
@@ -418,6 +430,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--calib", default=None, help="calib.json to use (default models/<name>/)")
     p.add_argument("--out", default=None, help="output .npz path (default build/quant/<name>.npz)")
     p.add_argument("--layers", type=int, default=None, help="keep only the first N layers")
+    p.add_argument(
+        "--no-qk-smoothing",
+        dest="smoothing",
+        action="store_false",
+        help="force every Q/K smoothing factor to 1 (K-centering alone); "
+        "writes build/quant/<name>-nosmooth.npz",
+    )
     p.set_defaults(func=_cmd_quantize)
 
     p = sub.add_parser("compile", help="lay out image.bin, the descriptor programs and layout.json")
@@ -483,6 +502,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluate one activation width and print the row (default: both, written to file)",
     )
     p.add_argument("--quant", default=None, help="quantized model .npz (default build/quant/)")
+    p.add_argument(
+        "--no-qk-smoothing",
+        dest="smoothing",
+        action="store_false",
+        help="score the build of `quantize --no-qk-smoothing` "
+        "(default build/quant/<name>-nosmooth.npz) into the -nosmooth rows",
+    )
     p.add_argument("--out", default=None, help="output path (default models/<name>/quality.json)")
     p.set_defaults(func=_cmd_check)
 

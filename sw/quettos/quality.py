@@ -5,8 +5,12 @@ through :func:`quettos.golden.forward_tokens` and
 :func:`quettos.reference_np.forward` and writes ``models/<name>/quality.json``:
 top-1 agreement, mean KL, paired delta-NLL with its standard error and
 perplexity for the W8A16 and W8A8 configurations, each with the golden
-counters of its run.  Entry point: :func:`evaluate`; :func:`report` assembles
-the file.  The measured table and the protocol: ``docs/NUMERICS.md`` (Quality).
+counters of its run.  A model built without the Q/K smoothing fold
+(``quantize.build_quant_model(..., smoothing=False)``) is scored by the same
+protocol and lands as a ``-nosmooth`` row beside them.  Entry point:
+:func:`evaluate`; :func:`report` assembles the file and :func:`merge_quality`
+keeps the rows of earlier runs.  The measured table and the protocol:
+``docs/NUMERICS.md`` (Quality).
 """
 
 from __future__ import annotations
@@ -24,9 +28,16 @@ from quettos import golden, program, reference_np
 from quettos.calibrate import FRAC_LOGITS, MODELS_OUT_DIR, canonical_json_text, token_ids_sha256
 from quettos.model import ModelSpec
 from quettos.numerics import Stats
-from quettos.quantize import QuantModel
+from quettos.quantize import NOSMOOTH_SUFFIX, QuantModel, smoothing_enabled
 
 CONFIGS: dict[int, str] = {16: "W8A16", 8: "W8A8"}  # activation width -> row name
+# Every row name a complete ``quality.json`` carries: each config for the
+# shipped model and for the smoothing-free ablation build.
+ROW_NAMES: tuple[str, ...] = tuple(CONFIGS.values()) + tuple(
+    name + NOSMOOTH_SUFFIX for name in CONFIGS.values()
+)
+# Fields a stored report shares with a fresh one of the same model and set.
+IDENTITY_KEYS = ("format", "numerics", "model", "calib_tokens_sha256", "protocol")
 LOGITS_FRAC = FRAC_LOGITS  # fixed-point class of the golden logits
 ROW_CHUNK = 64  # logit rows converted to float64 at a time (bounds the temporaries)
 
@@ -44,6 +55,17 @@ PROTOCOL = {
         "std(ddof=1) / sqrt(tokens); PPL is exp(mean NLL)"
     ),
 }
+
+
+def config_name(qmodel: QuantModel, a_bits: int) -> str:
+    """Row name of ``qmodel`` at ``a_bits``: the config, plus the ablation suffix.
+
+    A model built with ``smoothing=False`` carries ``-nosmooth``, so a row is
+    labelled by the build it came from and cannot be attributed to the other.
+    """
+    if a_bits not in CONFIGS:
+        raise ValueError(f"config_name: a_bits {a_bits} not in {sorted(CONFIGS)}")
+    return CONFIGS[a_bits] + ("" if smoothing_enabled(qmodel) else NOSMOOTH_SUFFIX)
 
 
 # --------------------------------------------------------------------------- metrics
@@ -177,7 +199,8 @@ def evaluate(
     and :func:`reference_np.forward` over the same number of layers (``ref``
     supplies precomputed reference logits); the positions are scored by
     :func:`score_sequence` and pooled.
-    Returns :meth:`TokenMetrics.summary` plus ``a_bits``, ``config``,
+    Returns :meth:`TokenMetrics.summary` plus ``a_bits``, ``config``
+    (:func:`config_name`, which names the build ``qmodel`` came from),
     ``stats`` (the golden ``sat`` / ``err_shift`` / ``clip`` counters of the
     run) and ``sequences`` (per-sequence ``tokens``, ``top1_percent``,
     ``kl_mean``, ``delta_nll``).
@@ -198,7 +221,7 @@ def evaluate(
         parts.append(score_sequence(r, out.logits, ids, frac=qmodel.frac["LOGITS"]))
     row = TokenMetrics.concat(parts).summary()
     row["a_bits"] = a_bits
-    row["config"] = CONFIGS[a_bits]
+    row["config"] = config_name(qmodel, a_bits)
     row["stats"] = {"sat": stats.sat, "err_shift": stats.err_shift, "clip": stats.clip}
     row["sequences"] = [
         {k: p.summary()[k] for k in ("tokens", "top1_percent", "kl_mean", "delta_nll")}
@@ -229,6 +252,24 @@ def report(
         },
         "rows": {row["config"]: row for row in rows},
     }
+
+
+def merge_quality(rep: dict[str, Any], path: Path | str) -> dict[str, Any]:
+    """``rep`` carrying forward the rows of the report at ``path`` it does not itself measure.
+
+    A row measured by an earlier run -- another activation width, or the
+    ``-nosmooth`` ablation -- survives only when the stored file describes the
+    same model, numerics and protocol (:data:`IDENTITY_KEYS`), so rows in one
+    file are always the same tokens scored the same way against the same
+    reference; a report of anything else is replaced outright, rows and all.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return rep
+    stored = load_quality(path)
+    if any(stored.get(k) != rep[k] for k in IDENTITY_KEYS):
+        return rep
+    return {**rep, "rows": {**stored["rows"], **rep["rows"]}}
 
 
 def quality_json_text(rep: dict[str, Any]) -> str:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -801,3 +802,201 @@ def test_complete_model_image(spec: ModelSpec, qmodel_full: quantize.QuantModel)
     exp = lay["expected_tokens"]
     if golden.expected_tokens_path(qmodel_full).is_file():
         assert exp is not None and set(exp["prompts"]) == set(golden.EXPECTED_PROMPT_FILES)
+
+
+def test_vector_overlap_rule() -> None:
+    """Equal or disjoint destination ranges pass; every partial overlap is named."""
+    silu = isa.vsilumul(vs_src=0, vs_aux=64, vs_dst=128, n=64, frac_gu=16, sh_h=16, sreg_dst=0)
+    for d in (
+        isa.vquant(vs_src=64, vs_dst=64, n=64, width=8, frac_in=16, sreg_dst=0),
+        isa.vquant(vs_src=64, vs_dst=128, n=64, width=8, frac_in=16, sreg_dst=0),
+        isa.vsubc(vs_src=0, vs_dst=64, n=64, addr_a=0x1000),
+        isa.vrope(vs_src=0, n=64, addr_a=0x1000),
+        silu,
+        dataclasses.replace(silu, vs_src=128),  # src == dst, aux disjoint
+        dataclasses.replace(silu, vs_aux=128),  # aux == dst, src disjoint
+    ):
+        assert compiler.vector_overlap(d) is None, compiler.vector_overlap(d)
+    for d, field in (
+        (isa.vquant(vs_src=64, vs_dst=65, n=64, width=8, frac_in=16, sreg_dst=0), "vs_src"),
+        (isa.vquant(vs_src=65, vs_dst=64, n=64, width=8, frac_in=16, sreg_dst=0), "vs_src"),
+        (isa.vsubc(vs_src=0, vs_dst=63, n=64, addr_a=0x1000), "vs_src"),
+        (dataclasses.replace(silu, vs_aux=127), "vs_aux"),
+        (dataclasses.replace(silu, vs_src=190), "vs_src"),
+    ):
+        msg = compiler.vector_overlap(d)
+        assert msg is not None and field in msg, (d, msg)
+
+
+def test_vector_overlap_rule_is_per_bank() -> None:
+    """Ranges that overlap in element index but not in bank are two memories.
+
+    Row ``r`` reads VSRAM bank ``src_row + r`` and writes bank ``dst_row + r``,
+    so the same pair of ranges is the rejected form with one row base and legal
+    with two.
+    """
+    quant = isa.vquant(vs_src=64, vs_dst=65, n=64, width=8, frac_in=16, sreg_dst=0)
+    silu = isa.vsilumul(vs_src=0, vs_aux=64, vs_dst=127, n=64, frac_gu=16, sh_h=16, sreg_dst=0)
+    for d in (quant, silu):
+        assert compiler.vector_overlap(d) is not None
+        assert compiler.vector_overlap(dataclasses.replace(d, dst_row=1)) is None
+        assert compiler.vector_overlap(dataclasses.replace(d, src_row=1)) is None
+        assert compiler.vector_overlap(dataclasses.replace(d, src_row=1, dst_row=1)) is not None
+
+
+def test_sreg_range_rule() -> None:
+    """Every SREG index a descriptor touches lies below the register file.
+
+    The group form is the one that can run off the end from fields that are each
+    in range on their own: ``sreg_dst`` is a byte and the group count comes from
+    ``n / vs_aux``.  ``isa.vquant`` refuses to build such a descriptor and this
+    is the same rule on one from anywhere.
+    """
+    fits = isa.vquant(vs_src=64, vs_dst=64, n=256, width=8, frac_in=16, sreg_dst=4, group=64)
+    assert compiler.sreg_range(fits) is None
+    assert compiler.sreg_range(isa.vsubc(vs_src=0, vs_dst=64, n=64, addr_a=0x1000)) is None
+    wide = Descriptor(
+        opcode=Opcode.VQUANT,
+        row_mask=1,
+        flags=int(VquantFlag.GROUP),
+        n=257,
+        vs_src=64,
+        vs_dst=64,
+        vs_aux=1,
+        sreg_dst=0,
+        sh0=16,
+    )
+    msg = compiler.sreg_range(wide)
+    assert msg is not None and "SREG[0..256]" in msg, msg
+    with pytest.raises(ValueError, match="past the 32 registers"):
+        isa.vquant(vs_src=64, vs_dst=64, n=257, width=8, frac_in=16, sreg_dst=0, group=1)
+    # the same rule on the single-register accesses
+    lm = isa.gemv(addr_a=0, addr_m=0, n=64, k=64, vs_src=0, vs_dst=64, sreg_src=0, s1=8, sbias=0)
+    assert compiler.sreg_range(dataclasses.replace(lm, sreg_src=isa.SREG_COUNT)) is not None
+    assert compiler.sreg_range(dataclasses.replace(lm, track_absmax=True, sreg_dst=40)) is not None
+
+
+def test_compile_rejects_a_group_form_past_the_scale_registers(
+    syn: synthetic.SyntheticModel, out_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group VQUANT that would write more scales than the file holds never reaches an image."""
+    real = compiler.build_programs
+
+    def widened(*args, **kwargs):
+        decode, prefill = real(*args, **kwargs)
+        for i, d in enumerate(decode.descs):
+            if d.opcode == Opcode.VQUANT and d.flags & VquantFlag.GROUP:
+                decode.descs[i] = dataclasses.replace(d, vs_aux=1)
+                break
+        else:
+            raise AssertionError("the decode program has no group VQUANT to widen")
+        return decode, prefill
+
+    monkeypatch.setattr(compiler, "build_programs", widened)
+    with pytest.raises(ValueError, match="registers the file holds"):
+        compiler.compile(syn.quant, syn.spec, out_dir=out_root / "sregs", max_ctx=SYN_CTX)
+
+
+def test_qcore_top_range_check_mirrors_the_vector_source_table() -> None:
+    """The RTL's V-op range check binds exactly the opcodes ``VECTOR_SOURCES`` names.
+
+    ``rtl/qcore_top.sv`` restates the table as ``v_has_dst`` and qualifies the
+    simulation-only check on it.  VROPE is in neither: it rewrites ``vs_src`` in
+    place and names no destination, so a value in its ``vs_dst`` field is not a
+    range and comparing the two would report an overlap that does not exist.
+    """
+    text = (REPO_ROOT / "rtl" / "qcore_top.sv").read_text(encoding="utf-8")
+    guard = re.search(r"assign\s+v_has_dst\s*=(.*?);", text, re.S)
+    assert guard is not None, "rtl/qcore_top.sv has no v_has_dst guard on the V-op range check"
+    named = set(re.findall(r"cmd_op\s*==\s*OP_(\w+)", guard.group(1)))
+    assert named == {op.name for op in compiler.VECTOR_SOURCES}
+    assert Opcode.VROPE.name not in named
+    for field, qualifier in (("vs_src", "v_has_dst"), ("vs_aux", "OP_VSILUMUL")):
+        head, sep, _ = text.partition(f'$error("qcore_top: vs_dst %0d partially overlaps {field}')
+        assert sep, f"rtl/qcore_top.sv no longer reports a {field} overlap"
+        assert qualifier in head[-400:], f"the {field} check is not qualified by {qualifier}"
+    # the rotation case the guard exists for: a vs_dst that would be a partial
+    # overlap for any opcode the rule binds is none for VROPE
+    rope = dataclasses.replace(isa.vrope(vs_src=64, n=64, addr_a=0x1000), vs_dst=65)
+    assert compiler.vector_overlap(rope) is None
+    quant = isa.vquant(vs_src=64, vs_dst=65, n=64, width=8, frac_in=16, sreg_dst=0)
+    assert compiler.vector_overlap(quant) is not None
+
+
+def test_quant_scale_exponent_rule() -> None:
+    """A VQUANT whose scale exponent leaves the i8 of the SREG word is named."""
+    good = isa.vquant(
+        vs_src=0,
+        vs_dst=64,
+        n=64,
+        width=8,
+        frac_in=16,
+        sreg_dst=0,
+        scale_mul=numerics.SFloat(47274, -18),  # log2(e)/8
+    )
+    assert compiler.quant_scale_exponent(good) is None
+    assert (
+        compiler.quant_scale_exponent(isa.vsubc(vs_src=0, vs_dst=64, n=64, addr_a=0x1000)) is None
+    )
+    for e in (127, -128):
+        bad = dataclasses.replace(good, imm32=isa.sfloat_imm(numerics.SFloat(1 << 15, e)))
+        msg = compiler.quant_scale_exponent(bad)
+        assert msg is not None and "exponent" in msg, (e, msg)
+
+
+def test_compile_rejects_a_scale_exponent_outside_the_i8(
+    syn: synthetic.SyntheticModel, out_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A program whose VQUANT scale would wrap the i8 exponent never reaches an image."""
+    real = compiler.build_programs
+
+    def widened(*args, **kwargs):
+        decode, prefill = real(*args, **kwargs)
+        for i, d in enumerate(decode.descs):
+            if d.opcode == Opcode.VQUANT:
+                decode.descs[i] = dataclasses.replace(
+                    d,
+                    flags=d.flags | int(VquantFlag.SCALE_MUL),
+                    imm32=isa.sfloat_imm(numerics.SFloat(1 << 15, -128)),
+                )
+                break
+        else:
+            raise AssertionError("the decode program has no VQUANT to widen")
+        return decode, prefill
+
+    monkeypatch.setattr(compiler, "build_programs", widened)
+    with pytest.raises(ValueError, match="exponent"):
+        compiler.compile(syn.quant, syn.spec, out_dir=out_root / "scale", max_ctx=SYN_CTX)
+
+
+def test_compile_rejects_a_partial_overlap(
+    syn: synthetic.SyntheticModel, out_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A program that reads a range it has begun to overwrite never reaches an image."""
+    real = compiler.build_programs
+
+    def shifted(*args, **kwargs):
+        decode, prefill = real(*args, **kwargs)
+        for i, d in enumerate(decode.descs):
+            if d.opcode == Opcode.VSILUMUL:
+                decode.descs[i] = dataclasses.replace(d, vs_dst=d.vs_aux + 8)
+                break
+        else:
+            raise AssertionError("the decode program has no VSILUMUL to shift")
+        return decode, prefill
+
+    monkeypatch.setattr(compiler, "build_programs", shifted)
+    out = out_root / "overlap"
+    with pytest.raises(ValueError, match="vs_aux"):
+        compiler.compile(syn.quant, syn.spec, out_dir=out, max_ctx=SYN_CTX)
+
+
+def test_compile_rejects_a_model_outside_the_rmsnorm_domain(
+    syn: synthetic.SyntheticModel, out_root: Path
+) -> None:
+    """The VRMSNORM intermediate domain is re-checked on the model the image is built from."""
+    frac = dict(syn.quant.frac)
+    frac["X"] = max(f for f in range(31) if quantize.xhat_bits(syn.quant.hidden, f) <= 32) + 1
+    bad = dataclasses.replace(syn.quant, frac=frac)
+    with pytest.raises(ValueError, match="VRMSNORM"):
+        compiler.compile(bad, syn.spec, out_dir=out_root / "domain", max_ctx=SYN_CTX)

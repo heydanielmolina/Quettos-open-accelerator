@@ -16,7 +16,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 
-from quettos.numerics import SFloat
+from quettos.numerics import E8_MAX, E8_MIN, SFloat, quant_scale_exponents
 
 ISA_VERSION = 1
 DESC_BITS = 256
@@ -503,6 +503,20 @@ def vrmsnorm(
     )
 
 
+def vquant_scales(d: Descriptor) -> int:
+    """Scale registers a VQUANT writes: ``SREG[sreg_dst .. sreg_dst + count - 1]``.
+
+    ``ceil(n / vs_aux)`` in the ``GROUP`` form -- a group length that does not
+    divide ``n`` leaves the last group short and still writes a scale for it --
+    and one otherwise.  Zero for any other opcode.
+    """
+    if d.opcode is not Opcode.VQUANT:
+        return 0
+    if (d.flags & VquantFlag.GROUP) and d.vs_aux:
+        return -(-d.n // d.vs_aux)
+    return 1
+
+
 def vquant(
     *,
     vs_src: int,
@@ -524,7 +538,11 @@ def vquant(
     ``width`` is 16 or 8 (flag ``W8``); ``use_tracked`` takes the absmax from
     ``SREG[sreg_src]``; ``group > 0`` quantizes every ``group`` elements on
     their own (``vs_aux = group``) into ``SREG[sreg_dst + g]``; ``scale_mul``
-    multiplies each scale by the sfloat carried in ``imm32``.
+    multiplies each scale by the sfloat carried in ``imm32``.  A group form
+    writes at most the :data:`SREG_COUNT` scales the register file holds
+    (:func:`vquant_scales`), and the scale exponent is an i8 in the SREG word
+    the descriptor writes, so the fields have to keep it there for every input
+    vector (:func:`numerics.quant_scale_exponents`).
     """
     _check_shift("frac_in", frac_in, 0, 30)
     if width not in (8, 16):
@@ -542,7 +560,17 @@ def vquant(
         flags |= VquantFlag.GROUP
         scales = n // group
     if sreg_dst + scales > SREG_COUNT:
-        raise ValueError(f"vquant: scales SREG[{sreg_dst}..{sreg_dst + scales - 1}] exceed SREG")
+        raise ValueError(
+            f"vquant: the group form writes {scales} scales into "
+            f"SREG[{sreg_dst}..{sreg_dst + scales - 1}], past the {SREG_COUNT} "
+            "registers the file holds"
+        )
+    lo, hi = quant_scale_exponents(width, frac_in, scale_mul)
+    if lo < E8_MIN or hi > E8_MAX:
+        raise ValueError(
+            f"vquant: the scale exponent reaches [{lo}, {hi}], outside the i8 "
+            f"[{E8_MIN}, {E8_MAX}] the descriptor and the SREG word carry"
+        )
     imm = 0
     if scale_mul is not None:
         flags |= VquantFlag.SCALE_MUL

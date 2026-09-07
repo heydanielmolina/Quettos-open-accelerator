@@ -1,6 +1,7 @@
 """Quality measurement: the metric definitions on synthetic logits, the SmolLM2 W8A16 gate on
-the calibration set, and agreement of the checked-in ``quality.json`` files with a fresh
-evaluation (``slow`` for the complete models from ``build/quant/``)."""
+the calibration set, the row naming and merging that keep the shipped and ``-nosmooth`` rows in
+one file, and agreement of the checked-in ``quality.json`` files with a fresh evaluation
+(``slow`` for the complete models from ``build/quant/``)."""
 
 from __future__ import annotations
 
@@ -135,6 +136,89 @@ def test_quality_json_text_is_canonical() -> None:
     assert quality.quality_json_text(back) == text
 
 
+# --------------------------------------------------------------------------- rows
+
+
+def _stub_model(*, smoothing: bool) -> quantize.QuantModel:
+    """A model carrying only what the row naming reads: the smoothing flag of its build."""
+    z = np.zeros(1)
+    lin = quantize.QuantLinear(z, z, z, z)
+    return quantize.QuantModel(
+        name="stub",
+        repo_id="test/stub",
+        arch="llama",
+        hidden=64,
+        heads=1,
+        kv_heads=1,
+        head_dim=64,
+        intermediate=64,
+        vocab=8,
+        has_qkv_bias=False,
+        rms_norm_eps=1e-5,
+        rope_theta=1e4,
+        frac={"LOGITS": 16},
+        eps_c={},
+        sqrt_d=numerics.SFLOAT_ONE,
+        log2e_over_8=numerics.SFLOAT_ONE,
+        calib_tokens_sha256="0" * 64,
+        layers=[],
+        norm_final=quantize.QuantNorm(z, 0),
+        embed=lin,
+        k_center=z,
+        extra={"qk_smoothing": {"enabled": smoothing}},
+    )
+
+
+def test_config_name_labels_the_build_the_row_came_from() -> None:
+    smoothed, plain = _stub_model(smoothing=True), _stub_model(smoothing=False)
+    assert [quality.config_name(smoothed, b) for b in (16, 8)] == ["W8A16", "W8A8"]
+    assert [quality.config_name(plain, b) for b in (16, 8)] == ["W8A16-nosmooth", "W8A8-nosmooth"]
+    assert set(quality.ROW_NAMES) == {"W8A16", "W8A8", "W8A16-nosmooth", "W8A8-nosmooth"}
+    assert len(set(quality.ROW_NAMES)) == len(quality.ROW_NAMES)
+    with pytest.raises(ValueError):
+        quality.config_name(smoothed, 4)
+
+
+def _stub_report(rows: dict) -> dict:
+    return {
+        "format": "quettos-quality",
+        "numerics": 1,
+        "model": {"repo_id": "test/stub", "name": "stub", "layers": 2},
+        "calib_tokens_sha256": "ab",
+        "protocol": {"ids_sha256": "ab", "tokens": 4, "logits_frac": 16},
+        "rows": rows,
+    }
+
+
+def test_merge_quality_keeps_the_rows_of_earlier_runs(tmp_path) -> None:
+    """A run of one build adds its rows and leaves every other row of the file as stored."""
+    path = tmp_path / "quality.json"
+    stored = _stub_report({"W8A16": {"kl_mean": 1.0}, "W8A16-nosmooth": {"kl_mean": 2.0}})
+    path.write_text(quality.quality_json_text(stored), encoding="utf-8")
+    fresh = _stub_report({"W8A16": {"kl_mean": 3.0}})
+    merged = quality.merge_quality(fresh, path)
+    assert merged["rows"] == {"W8A16": {"kl_mean": 3.0}, "W8A16-nosmooth": {"kl_mean": 2.0}}
+    assert {k: v for k, v in merged.items() if k != "rows"} == {
+        k: v for k, v in fresh.items() if k != "rows"
+    }
+    # the kept row is the stored one, so rewriting the file reproduces its text exactly
+    kept = quality.quality_json_text(
+        _stub_report({"W8A16-nosmooth": merged["rows"]["W8A16-nosmooth"]})
+    )
+    assert kept == quality.quality_json_text(
+        _stub_report({"W8A16-nosmooth": stored["rows"]["W8A16-nosmooth"]})
+    )
+    # a report of another model, numerics, calibration or protocol replaces the file
+    for key, value in (
+        ("numerics", 2),
+        ("calib_tokens_sha256", "cd"),
+        ("model", {"repo_id": "test/other", "name": "other", "layers": 2}),
+        ("protocol", {"ids_sha256": "cd", "tokens": 4, "logits_frac": 16}),
+    ):
+        assert quality.merge_quality({**fresh, key: value}, path)["rows"] == fresh["rows"], key
+    assert quality.merge_quality(fresh, tmp_path / "absent.json") is fresh
+
+
 # --------------------------------------------------------------------------- SmolLM2 gate
 
 
@@ -167,6 +251,35 @@ def test_smollm2_w8a16_gate(smollm2_quality) -> None:
     assert row["delta_nll"] == pytest.approx(row["nll_int"] - row["nll_fp32"])
 
 
+@pytest.fixture(scope="session")
+def smollm2_nosmooth(smollm2: ModelSpec, smollm2_quality) -> dict:
+    """W8A16 row of the same model built with every Q/K smoothing factor forced to 1."""
+    _, seqs, _ = smollm2_quality
+    plain = quantize.build_quant_model(smollm2, calibrate.calib_path(smollm2), smoothing=False)
+    assert not quantize.smoothing_enabled(plain)
+    return quality.evaluate(smollm2, plain, seqs, a_bits=16)
+
+
+def test_smollm2_nosmooth_row(smollm2_quality, smollm2_nosmooth) -> None:
+    """The ablation is the same protocol on the same tokens against the same fp32 reference."""
+    qmodel, seqs, shipped = smollm2_quality
+    row = smollm2_nosmooth
+    print(
+        f"{qmodel.name} {row['config']}: tokens {row['tokens']} top-1 {row['top1_percent']:.2f}% "
+        f"KL {row['kl_mean']:.5f} delta-NLL {row['delta_nll']:+.5f} +/- {row['delta_nll_se']:.5f} "
+        f"PPL {row['ppl_fp32']:.3f} -> {row['ppl_int']:.3f} {row['stats']}"
+    )
+    assert row["config"] == "W8A16" + quantize.NOSMOOTH_SUFFIX
+    assert row["a_bits"] == shipped["a_bits"] == 16
+    assert row["tokens"] == shipped["tokens"] == sum(len(s) - 1 for s in seqs)
+    assert row["nll_fp32"] == pytest.approx(shipped["nll_fp32"])  # one reference for both rows
+    assert row["stats"]["sat"] == 0 and row["stats"]["err_shift"] == 0
+    path = quality.quality_path(qmodel.name)
+    if not path.is_file():
+        pytest.skip(f"{path} not present (run: uv run quettos check smollm2 --no-qk-smoothing)")
+    _assert_row_close(quality.load_quality(path)["rows"][row["config"]], row)
+
+
 def test_smollm2_quality_json_matches_fresh_w8a16(smollm2_quality) -> None:
     qmodel, seqs, row = smollm2_quality
     path = quality.quality_path(qmodel.name)
@@ -183,7 +296,7 @@ def test_smollm2_quality_json_matches_fresh_w8a16(smollm2_quality) -> None:
     }
     fresh = quality.report(qmodel, seqs, [row])
     assert stored["protocol"] == fresh["protocol"]
-    assert set(stored["rows"]) == set(quality.CONFIGS.values())
+    assert set(stored["rows"]) == set(quality.ROW_NAMES)
     _assert_row_close(stored["rows"]["W8A16"], row)
     assert quality.quality_json_text(stored) == path.read_text(encoding="utf-8")
 
@@ -228,17 +341,36 @@ def qmodel_full(spec: ModelSpec) -> quantize.QuantModel:
     return model
 
 
+@pytest.fixture(scope="session")
+def qmodel_nosmooth(spec: ModelSpec) -> quantize.QuantModel:
+    """The K-centering-only build: ``build/quant/<name>-nosmooth.npz``, else built from calib."""
+    path = quantize.default_path(spec.name, smoothing=False)
+    if path.is_file():
+        model = quantize.load(path)
+        if model.n_layers == spec.layers:
+            return model
+    calib = calibrate.calib_path(spec)
+    if not calib.is_file():
+        pytest.skip(f"{calib} not present")
+    return quantize.build_quant_model(spec, calib, smoothing=False)
+
+
 @pytest.mark.slow
-def test_quality_json_matches_fresh_evaluation(spec: ModelSpec, qmodel_full) -> None:
-    """Both rows of the checked-in file agree with a fresh W8A16 and W8A8 evaluation."""
+def test_quality_json_matches_fresh_evaluation(spec: ModelSpec, qmodel_full, qmodel_nosmooth):
+    """Every row of the checked-in file agrees with a fresh evaluation of the build it names."""
     path = quality.quality_path(qmodel_full.name)
     if not path.is_file():
         pytest.skip(f"{path} not present (run: uv run quettos check)")
     stored = quality.load_quality(path)
     seqs = calibrate.calibration_sequences(spec)
     ref = quality.reference_logits(spec, seqs)
-    rows = [quality.evaluate(spec, qmodel_full, seqs, a_bits=b, ref=ref) for b in quality.CONFIGS]
+    rows = [
+        quality.evaluate(spec, model, seqs, a_bits=b, ref=ref)
+        for model in (qmodel_full, qmodel_nosmooth)
+        for b in quality.CONFIGS
+    ]
     fresh = quality.report(qmodel_full, seqs, rows)
+    assert set(fresh["rows"]) == set(quality.ROW_NAMES)
     for row in rows:
         print(
             f"{spec.name} {row['config']}: top-1 {row['top1_percent']:.2f}% "

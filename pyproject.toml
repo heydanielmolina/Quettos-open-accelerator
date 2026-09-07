@@ -29,7 +29,7 @@ dev = [
     "mpmath>=1.3",      # exact table generation (quettos.lutgen)
     "cocotb>=2.1",
     "yowasp-nextpnr-ecp5",
-    "ruff",
+    "ruff>=0.16",       # `make style`, the Python half of the lint
 ]
 
 [build-system]

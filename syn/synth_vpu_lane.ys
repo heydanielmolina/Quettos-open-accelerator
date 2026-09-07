@@ -1,0 +1,18 @@
+# Yosys synth_xilinx (xc7) of qcore_vpu_lane on its own. The lane has no
+# parameter: one lane is one lane in every RTL configuration, and qcore_vpu_top
+# instantiates VL of them, so one run covers the demo and the tiny build alike.
+# The multipliers are the block: a 32 x 32 product for L_MUL32 and two 32 x 17
+# products for L_MUL16 and the two rotation ops.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_vpu_lane.log -s syn/synth_vpu_lane.ys
+# syn/report.ys prints the cell table, the longest topological path and the
+# hard-block instances that scripts/synth_report.py turns into
+# syn/reports/qcore_vpu_lane.md.
+
+# ---- default: the lane takes no parameter
+log ==== qreport config default
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_vpu_lane.sv
+hierarchy -check -top qcore_vpu_lane
+synth_xilinx -family xc7 -top qcore_vpu_lane
+tee -q -o build/synth/qcore_vpu_lane_dsp.txt dump t:DSP48E1
+script syn/report.ys

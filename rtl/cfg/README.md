@@ -23,42 +23,66 @@ Parameter meaning:
   32,768 int32 elements; 2048 is enough for the truncated-model tests).
 - `FIFO_BEATS` -- depth of the weight FIFO between `qcore_stream_ctrl` and the
   lanes.
-- `ROM_FILE_EXP2`, `ROM_FILE_SIGMOID`, `ROM_FILE_RSQRT`, `ROM_FILE_RECIP`
-  (untyped parameters, empty default) -- absolute paths to the `rtl/gen/*.hex`
-  LUT images; set by the Makefile/.ys, never as literals in RTL.
+- `ROM_FILE_SIGMOID`, `ROM_FILE_RSQRT`, `ROM_FILE_RECIP` (untyped parameters,
+  empty default) -- absolute paths to the `rtl/gen/*.hex` lookup-table images.
+  These three are the ones `qcore_top` declares and forwards to
+  `qcore_vpu_top`; `qcore_lut_rom` takes its own image on `ROM_FILE`, which is
+  how a table is elaborated on its own, and `ROM_FILE_EXP2` joins the top with
+  the VSOFTMAX pass that reads that table. The build sets them, never a literal
+  in RTL.
 
 ## Passing a configuration
 
-Verilator (`-G` sets a top-level parameter; quote strings twice):
+The file list is the package first and then every other `rtl/*.sv` file exactly
+once: Yosys and Icarus resolve `qcore_pkg::` only after the package has been
+parsed, and a file named twice is a duplicate declaration. `scripts/lint.sh`
+builds the same list.
 
 ```sh
-verilator --cc --exe --build -j 0 -O3 --top-module qcore_top \
-  -GWB=64 -GB_MAX=1 -GVL=4 -GVSRAM_WORDS=4096 -GFIFO_BEATS=128 \
-  -GROM_FILE_EXP2='"'"$PWD"'/rtl/gen/exp2.hex"' \
-  rtl/*.sv sim/verilator/main.cpp
+SV="rtl/qcore_pkg.sv $(ls rtl/*.sv | grep -v qcore_pkg.sv | tr '\n' ' ')"
 ```
 
-Yosys (`read_verilog -defer` so that `$readmemh` runs after the parameters
-are set with `chparam`; `hierarchy -chparam` cannot take a string value):
+Verilator (`-G` sets a top-level parameter; a string value carries two layers of
+quotes, one for the shell and one for Verilator):
 
 ```sh
-yosys -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv; \
-  chparam -set WB 64 -set B_MAX 1 -set VL 4 \
-    -set VSRAM_WORDS 4096 -set FIFO_BEATS 128 \
-    -set ROM_FILE_EXP2 \"$PWD/rtl/gen/exp2.hex\" qcore_top; \
+verilator --lint-only -Wall -Wpedantic -Irtl --top-module qcore_top \
+  -GWB=64 -GB_MAX=1 -GVL=4 -GVSRAM_WORDS=4096 -GFIFO_BEATS=128 \
+  -GROM_FILE_SIGMOID='"'"$PWD"'/rtl/gen/sigmoid.hex"' \
+  -GROM_FILE_RSQRT='"'"$PWD"'/rtl/gen/rsqrt.hex"' \
+  -GROM_FILE_RECIP='"'"$PWD"'/rtl/gen/recip.hex"' \
+  $SV
+```
+
+`sim/verilator/Makefile` hands the same `-G` set to `--cc --exe --build`, with a
+matching `-D` for every width so the C++ side agrees with the RTL.
+
+Yosys (`read_verilog -defer` so that `$readmemh` runs after the parameters are
+set with `chparam`; `hierarchy -chparam` cannot take a string value):
+
+```sh
+yosys -p "read_verilog -sv -defer -Irtl $SV; \
+  chparam -set ROM_FILE_SIGMOID \"$PWD/rtl/gen/sigmoid.hex\" \
+    -set ROM_FILE_RSQRT \"$PWD/rtl/gen/rsqrt.hex\" \
+    -set ROM_FILE_RECIP \"$PWD/rtl/gen/recip.hex\" \
+    -set WB 64 -set B_MAX 1 -set VL 4 \
+    -set VSRAM_WORDS 4096 -set FIFO_BEATS 128 qcore_top; \
   hierarchy -check -top qcore_top; \
   synth_xilinx -family xc7 -flatten -top qcore_top; stat -tech xilinx; \
   ltp -noff t:FDRE t:FDSE t:BUFG t:IBUF t:OBUF t:DSP48E1 t:RAMB36E1 t:RAM32M %u %u %u %u %u %u %u %n"
 ```
 
-The `ltp` selection uses the flops, I/O buffers, DSPs and RAMs as cut points;
-`ltp -noff` alone reports paths through the `FDRE`/`FDSE` primitives.
+The image paths come first inside the `chparam`, because each `-set`
+re-elaborates the deferred module: setting a width first would run `$readmemh`
+on the empty default. The `ltp` selection uses the flops, I/O buffers, DSPs and
+RAMs as cut points; `ltp -noff` alone reports paths through the `FDRE`/`FDSE`
+primitives.
 
-Icarus (parse/lint only; `-P` sets a top parameter):
+Icarus (parse and elaborate only; `-P` sets a top parameter):
 
 ```sh
-iverilog -g2012 -s qcore_top -Pqcore_top.WB=16 -Pqcore_top.B_MAX=2 -Pqcore_top.VL=2 \
-  -Pqcore_top.VSRAM_WORDS=2048 -o /dev/null rtl/*.sv
+iverilog -g2012 -Irtl -s qcore_top -Pqcore_top.WB=16 -Pqcore_top.B_MAX=2 \
+  -Pqcore_top.VL=2 -Pqcore_top.VSRAM_WORDS=2048 -o /dev/null $SV
 ```
 
 ## Who passes what
@@ -72,8 +96,9 @@ they agree on.
   `sw/quettos/compare.py`, which calls the same makefile once per configuration
   it compares. `sim/verilator/Makefile` turns each variable into a Verilator
   `-G` parameter and a matching `-D` define for the C++ side, and names the
-  object directory after a hash of the RTL, the C++ and the configuration, so
-  two configurations never share a build.
+  object directory after a hash of the RTL, the `rtl/gen/*.hex` images, the C++
+  and the configuration, so two configurations never share a build and a
+  regenerated table rebuilds.
 - **The synthesis scripts** set them with `chparam -set` after a deferred
   `read_verilog` and before `hierarchy`, one block per configuration in each
   `syn/synth_*.ys`. `scripts/synth_report.py` reads the `Parameter \X = Y` lines

@@ -1,0 +1,47 @@
+# Yosys synth_xilinx (xc7) of qcore_lut_rom, once per lookup table. ENTRIES is
+# the table length and ROM_FILE the image the build hands $readmemh, so each
+# configuration below is the block as one of the four tables makes it: the
+# contents decide how much logic the address decode collapses into, which is
+# why the four differ. Yosys 0.65 resolves $readmemh while it reads a module,
+# so the image path has to arrive before elaboration: `read_verilog -defer`
+# holds the module unelaborated and `chparam` supplies both parameters at once.
+# The path is relative to the repo root, which is where the script runs:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_lut.log -s syn/synth_lut.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_lut_rom.md.
+
+# ---- exp2: 256 entries, 2^x on [0, 1)
+log ==== qreport config exp2
+read_verilog -sv -defer -Irtl rtl/qcore_lut_rom.sv
+chparam -set ENTRIES 256 -set ROM_FILE "rtl/gen/exp2.hex" qcore_lut_rom
+hierarchy -check -top qcore_lut_rom
+synth_xilinx -family xc7 -top qcore_lut_rom
+script syn/report.ys
+
+# ---- sigmoid: 512 entries, sigmoid(x) on [0, 16)
+design -reset
+log ==== qreport config sigmoid
+read_verilog -sv -defer -Irtl rtl/qcore_lut_rom.sv
+chparam -set ENTRIES 512 -set ROM_FILE "rtl/gen/sigmoid.hex" qcore_lut_rom
+hierarchy -check -top qcore_lut_rom
+synth_xilinx -family xc7 -top qcore_lut_rom
+script syn/report.ys
+
+# ---- rsqrt: 512 entries, two 256-entry segments over [1, 2) and [2, 4)
+design -reset
+log ==== qreport config rsqrt
+read_verilog -sv -defer -Irtl rtl/qcore_lut_rom.sv
+chparam -set ENTRIES 512 -set ROM_FILE "rtl/gen/rsqrt.hex" qcore_lut_rom
+hierarchy -check -top qcore_lut_rom
+synth_xilinx -family xc7 -top qcore_lut_rom
+script syn/report.ys
+
+# ---- recip: 256 entries, 1/x on [1, 2)
+design -reset
+log ==== qreport config recip
+read_verilog -sv -defer -Irtl rtl/qcore_lut_rom.sv
+chparam -set ENTRIES 256 -set ROM_FILE "rtl/gen/recip.hex" qcore_lut_rom
+hierarchy -check -top qcore_lut_rom
+synth_xilinx -family xc7 -top qcore_lut_rom
+script syn/report.ys

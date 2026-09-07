@@ -176,7 +176,7 @@ Program end:
 | `FAULT` | Name | Raised when | `FAULT_OP` |
 |---|---|---|---|
 | 0 | `NONE` | no fault; the value while a program runs | 0 |
-| 1 | `OPCODE` | the opcode byte is none of the twelve (`isa.opcode_of` / `isa.is_opcode` probe it before decoding), or it names a unit the build does not carry -- a `qcore_top` built without `qcore_vpu_top` refuses the six vector opcodes this way | that byte |
+| 1 | `OPCODE` | the opcode byte is none of the twelve (`isa.opcode_of` / `isa.is_opcode` probe it before decoding), or it names a pass the build does not carry -- `qcore_top` refuses VROPE and VSOFTMAX this way, the two `qcore_vpu_top` has no pass for | that byte |
 | 2 | `ROW` | a participating row's `src_row + r` or `dst_row + r` is at or above `B_MAX` | the opcode |
 | 3 | `PC_ALIGN` | `START` or `STEP` with a `PC` that is not a multiple of 32 | 0 |
 
@@ -184,8 +184,16 @@ Program end:
   fields back; `quettos.isa_sim` reports the `OPCODE` fault the same way.
 
 Compiler assertions: GEMV / EMBED `vs_dst` is 8-aligned, `K < 2^16`,
-`n < 2^24`, every VSRAM range fits the map, every SREG index is below 32, and
-the requant shift `S` is in `[0, 63]` for all reachable exponents.
+`n < 2^24`, every VSRAM range fits the map, every SREG index is below 32, the
+whole run of a group VQUANT included (`compiler.sreg_range`), the
+requant shift `S` is in `[0, 63]` for all reachable exponents, every V op in
+both programs obeys the destination rule of the opcode table
+(`compiler.vector_overlap`), every VQUANT writes a scale whose exponent fits
+the i8 the descriptor and the SREG word carry, for any input vector
+(`compiler.quant_scale_exponent` over `numerics.quant_scale_exponents`), and
+the model stays inside the VRMSNORM domain -- the `xhat` intermediate fits the
+int32 the lane carries it in, and every `eps_c` keeps `S1` non-negative
+(`quantize.check_rmsnorm_domain`, `docs/NUMERICS.md`, RMSNorm).
 
 ## Opcode table
 
@@ -195,13 +203,25 @@ the requant shift `S` is in `[0, 63]` for all reachable exponents.
 | `0x10` | GEMV | for tile, for k: `beat = addr_a + (tile*k_field + k)*WB`; broadcast `A[k]` = low 16 bits of `vsram[vs_src+k]`; tile end swaps accumulators; requant with `meta[addr_m + (tile*WB+j)*8]` (or unit) and `SREG[sreg_src]`; out to `vsram[vs_dst + tile*WB + j]` (RMW if `accumulate`; absmax if `track_absmax`), the ARGMAX CSR, or DUMP at `addr_c`. Partial last tile: requant drains `min(WB, n - tile*WB)`. Used for QKV, o, gate\|up, down, LM head, scores (K^T, `n_from_pos`, `k=64`) and PV (V, `unit_meta`, `n=64`, `k = MAX_CTX`, `k_from_pos`) |
 | `0x11` | EMBED | gather `k` bytes of row `TOK` from tiled table `addr_a` (byte `(TOK/WB)*k*WB + i*WB + TOK%WB` for `i < k`); the row scale from `meta[addr_m + TOK*8]` is `Sw`, `Sx = 1.0 = {2^15, -15}`, `acc = q << 24`, `sbias = -(FRAC_X + s1) + 24` with `8 <= s1 <= 24`; `n` is written equal to `k` |
 | `0x20` | VRMSNORM | `vs_src -> vs_dst`, `n` elements; gamma int16 streamed from `addr_a`; `imm32 = eps_c`; `sh0 = FRAC_X`, `sh1 = G` (shift); `addr_m` low 24 bits = sqrt(d) sfloat constant; absmax -> `SREG[sreg_dst]` |
-| `0x21` | VQUANT | `vs_src -> vs_dst`, `n` elements; flags `W8` (int8, else int16), `USE_TRACKED` (absmax from `SREG[sreg_src]`), `GROUP` (`vs_aux` = group length -> consecutive `SREG[sreg_dst..]`), `SCALE_MUL` (`SREG *= sfloat imm32`); `sh0 = FRAC_in` |
+| `0x21` | VQUANT | `vs_src -> vs_dst`, `n` elements; flags `W8` (int8, else int16), `USE_TRACKED` (absmax from `SREG[sreg_src]`), `GROUP` (`vs_aux` = group length -> consecutive `SREG[sreg_dst..]`, at most the 32 the file holds), `SCALE_MUL` (`SREG *= sfloat imm32`); `sh0 = FRAC_in` |
 | `0x22` | VROPE | in place at `vs_src` of row `src_row + r` (`dst_row` ignored), `n = heads*64` (the compiler covers the contiguous q and k heads with one VROPE), table row `addr_a + POS*128`, pairs `(i, i+32)`, shift 14 |
 | `0x23` | VSILUMUL | `dst = silu(src) * aux`; `sh0 = FRAC_GU` (sigmoid index), `sh1 = 2 FRAC_GU - FRAC_H` (shift); absmax -> SREG |
 | `0x24` | VSOFTMAX | scores at `vs_src`, `len = POS+1` or `imm`, clamped into `[1, n]`; V-scale meta at `addr_a`; `w` int16 to `vs_dst` (zeros from `len` to `n`); `SREG[sreg_dst] = sfloat(2^(1+e_max))`; `sh0 = FRAC_S` |
 | `0x25` | VSUBC | `dst = sat32(src - const row streamed from addr_a)`, `n` elements |
 | `0x30` | KVWRITE | the 64 int8 values at `vs_src` (low byte of each element), `k` = token capacity; flag `TRANSPOSED`: 64 single-byte-strobe writes into `addr_a + (POS/WB)*64*WB + d*WB + POS%WB`; else `ceil(64/WB)` `WB`-byte beats, tile `t` at `addr_a + (t*k + POS)*WB` holding dims `t*WB ..` zero-padded; meta `{0, SREG[sreg_src]}` -> `addr_m + POS*8`; `POS >= k` writes nothing and counts in `ERR_BOUNDS` |
 | `0x31` | FENCE | wait for write-ack count == issued (the auto-fence ahead of every memory-reading descriptor is implicit; an explicit FENCE parks a program at a point where every issued write is acknowledged) |
+
+Destination and source of a V op: for each source range the opcode reads --
+`vs_src`, and `vs_aux` as well on VSILUMUL -- `vs_dst` starts either at exactly
+that source or at least `n` elements away from it. The vector unit reads its
+operands ahead of its writes, so an in-place descriptor is exact -- which is how
+the compiler quantizes q, K, V and `silu(gate) * up`, and it is equally exact
+over `vs_aux`, so a VSILUMUL may write over its `u` operand while `vs_src` lies
+elsewhere -- while a destination that starts inside a source range is written
+before the rest of that source is read (`docs/RTL.md` 3.12). The rule binds
+within one bank: a descriptor with `dst_row != src_row` writes a different row's
+VSRAM and cannot alias its source at all. VROPE is in place by definition: it
+names no destination and rewrites `vs_src`.
 
 Removed from v1 (v1.1): VCOPY, VADD/VSUB/VMOV, PERFMARK, last_row_only,
 LOOP/JUMP.
@@ -243,59 +263,66 @@ All multi-byte quantities are **little-endian**.
 
 ## Bring-up programs
 
-Two short programs over a compiled image bring a machine up: one for a machine
-with the vector unit, one for the GEMV and EMBED units alone.
-Both are small enough to read end to end in a waveform and both are
-self-checking on a tied-embedding model: v1 ties the embedding and the LM head,
-so the largest logit of the embedding row of token `t` against the embedding
-matrix is row `t` itself. `ARGMAX_TOK == TOK` for every token of the model, and
-`SAT_REQ`, `SAT_VPU`, `ERR_SHIFT` and `ERR_BOUNDS` all read 0.
+Two short programs over a compiled image bring a machine up: the bring-up
+program, which is the whole decode path in four descriptors, and a directed
+vector program that runs the vector unit's opcodes back to back. Both are small
+enough to read end to end in a waveform. `quettos.compare` assembles both,
+runs each on `qcore_top` through the Verilator harness and on
+`quettos.isa_sim` at the same time, and compares every VSRAM element, SREG
+word, dumped logit, CSR and PERF counter after each descriptor (`make bringup`,
+`make bringup-sweep`, `sw/tests/test_bringup.py`).
 
 ### Four descriptors: the whole decode path
 
-`bringup_program` in `sw/tests/test_isa.py` assembles it from the model's own
-`decode.prog` and runs it on `quettos.isa_sim` over every token of a random
-tiny model from `quettos.synthetic`, so `ARGMAX_TOK`, `ARGMAX_VAL`,
-`DESCRIPTORS`, `MACS` and `WT_BYTES` have a reference.
+The bring-up program. It is self-checking on a tied-embedding model: v1 ties the
+embedding and the LM head, so the largest logit of the embedding row of token
+`t` against the embedding matrix is row `t` itself. `ARGMAX_TOK == TOK` for
+every token of the model, and `SAT_REQ`, `SAT_VPU`, `ERR_SHIFT` and
+`ERR_BOUNDS` all read 0. `bringup_program` in `sw/tests/test_isa.py` runs the
+same four descriptors on `quettos.isa_sim` over every token of a random tiny
+model from `quettos.synthetic`, so `ARGMAX_TOK`, `ARGMAX_VAL`, `DESCRIPTORS`,
+`MACS` and `WT_BYTES` have a reference.
 
 | # | Descriptor | Exercises |
 |---|---|---|
 | 0 | `EMBED` -- descriptor 0 of `decode.prog` | fetch, dispatch, the TOK-gathered table read, the meta record, the requant, a VSRAM write |
 | 1 | `VQUANT` of the EMBED output into the activation slot | the vector unit, an SREG scale write |
-| 2 | `GEMV` with `out_mode = ARGMAX` -- the LM-head descriptor of `decode.prog` with its `out_mode` replaced | the weight stream, the tiles, the MAC rows, the requant, the ARGMAX CSRs |
+| 2 | `GEMV` with `out_mode = ARGMAX` -- the LM-head descriptor of `decode.prog` with its `out_mode` replaced; `quettos.compare` uses `ARGMAX_DUMP`, which puts every logit in memory so the comparison covers the whole output vector and not only its argmax | the weight stream, the tiles, the MAC rows, the requant, the ARGMAX CSRs |
 | 3 | `HALT` | the auto-fence, the PERF snapshot, `STATUS.DONE` |
 
 The VQUANT earns its place: a GEMV takes its `Sx` from
 `SREG[src_row + r][sreg_src]`, the SREG banks have no reset, and a VQUANT is
 what writes a scale there, so a program that reaches a GEMV without one has no
-defined activation scale.
+defined activation scale. The host therefore loads no register: the program
+writes the scale it reads, and every other input is the compiled image.
 
-### Three descriptors: the GEMV and EMBED units
+### Eight descriptors: the vector unit
 
-`quettos.compiler.build_bringup` assembles it and `sw/quettos/compare.py` runs
-it on `qcore_top` through the Verilator harness and on `quettos.isa_sim` at the
-same time, comparing every VSRAM element, SREG word, dumped logit, CSR and PERF
-counter after each descriptor (`make bringup`, `make bringup-sweep`,
-`sw/tests/test_bringup.py`).
+The directed program. Each vector descriptor is lifted from the model's own
+`decode.prog`, so the gamma row, `eps_c`, `sqrt(d)`, the centering row and the
+shifts are the compiler's own; the four scratch ranges sit past the compiler's
+VSRAM map and are compared with the rest of the bank.
 
 | # | Descriptor | Exercises |
 |---|---|---|
-| 0 | `EMBED` -- descriptor 0 of `decode.prog`, writing the LM head's activation slot, with `sh1` raised by `q` | fetch, dispatch, the TOK-gathered table read, the meta record, the requant, a VSRAM write |
-| 1 | `GEMV` in `ARGMAX_DUMP` mode -- the LM-head descriptor of `decode.prog` | the weight stream, the tiles, the MAC rows, the requant, the ARGMAX CSRs and a dump of all `N` int32 logits |
-| 2 | `HALT` | the auto-fence, the PERF snapshot, `STATUS.DONE` |
+| 0 | `EMBED` | the row of `TOK` into the `X` slot, so the vector descriptors have real data |
+| 1 | `VRMSNORM` with `track_absmax` | the absmax and sum-of-squares passes, `RMS_SCALE`, the streamed gamma row, an SREG absmax write |
+| 2 | `VQUANT` with `USE_TRACKED` | the absmax written one descriptor earlier, read back through the bank at issue; `QUANT_SCALE` and the int16 clip |
+| 3 | `VSUBC` | the streamed int32 centering row and the saturating subtract |
+| 4 | `VSILUMUL` with `track_absmax` | the sigmoid table, its odd symmetry and clamp, and the two products per element |
+| 5 | `VQUANT` with `GROUP` and `W8` | one scale per 64 elements into `SREG[sreg_dst + g]`, and the int8 clip |
+| 6 | `VSILUMUL` with `sh_h = 0` | the saturating path: part of the output leaves int32, so `SAT_VPU` carries a number both models have to agree on |
+| 7 | `HALT` | the auto-fence, the PERF snapshot, `STATUS.DONE` |
 
-The activation scale is the host's here: `SREG[0][sreg_src] = 2^-(FRAC_X + q)`,
-written before `START`, paired with the EMBED output shift raised by the same
-`q = max(0, bitlen(absmax) - 15)`. That is the scale a `VQUANT` would have
-written, and it keeps the gathered row inside the int16 window a GEMV
-activation is read through. Both models are given the same scale; every other
-input is the compiled image. `ARGMAX_DUMP` puts every logit in memory, so the
-comparison covers the whole output vector and not only its argmax.
+Descriptor 2 is the reason the program is worth running as a whole: the SREG
+bank is a channel between two vector descriptors, and only a run that executes
+both ends of it checks that channel. Descriptor 6 is there so `SAT_VPU` is
+compared with a value in it rather than as a zero on both sides.
 
 Format, both programs: the same 32-byte descriptors as any program, assembled
 with `isa.assemble` and placed in the 1 MB program window of `image.bin` after
 `prefill.prog`, at `programs.prefill.addr + programs.prefill.size` rounded up
-to 64 from `layout.json`; nothing else in the image moves. The three-descriptor
+to 64 from `layout.json`; nothing else in the image moves. The bring-up
 program's dump region follows the descriptors at the next 64-byte boundary,
 inside the same window. The host writes the program address to `PC`, the token
 under test to `TOK`, `POS = 0` and `ROW_EN = 1`, then pulses `START` and waits
@@ -327,7 +354,7 @@ written to a bit acts once; reads return 0), `w1c` read plus write-one-to-clear
 | 6 | `ARGMAX_TOK` | ro | index of the largest output of the most recent ARGMAX-mode GEMV (strict `>`, so ties resolve to the lowest id) |
 | 7 | `ARGMAX_VAL` | ro | that output, int32 |
 | 8 | `SAT_REQ` | ro | requant `sat40` / `sat32` events since `START` |
-| 9 | `SAT_VPU` | ro | vector-unit `sat32` events since `START` (clips are not saturations) |
+| 9 | `SAT_VPU` | ro | vector-unit `sat32` events since `START`, one per saturating element of a writing pass. The two passes that carry an intermediate through the lane report its saturation too -- VRMSNORM's `xhat`, VSILUMUL's `silu` -- as one event for the element whether one of its two products saturated or both. VQUANT raises none: its clip is the defined result, not a saturation |
 | 10 | `ERR_SHIFT` | ro | shift amounts clamped into `[0, 63]` since `START`, one per output element: requant stage-2 `S`, VRMSNORM `S1`, and the descriptor shift fields `s1`, `G`, `sh_h` |
 | 11 | `ERR_BOUNDS` | ro | since `START`: POS-derived values above their capacity field, VSOFTMAX `len` outside `[1, n]`, KVWRITE at `POS >= k`, VSRAM operand ranges past the end, SREG indices at or above 32 |
 | 12 | `ISA_VERSION` | ro | the constant `ISA_VERSION` |

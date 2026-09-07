@@ -12,7 +12,8 @@ import subprocess
 import numpy as np
 import pytest
 from quettos import cli, csrgen, isa, isa_sim, synthetic
-from quettos.isa import Descriptor, Opcode, OutMode
+from quettos import numerics as N
+from quettos.isa import Descriptor, Opcode, OutMode, VquantFlag
 from quettos.numerics import SFloat
 
 # docs/ISA.md, descriptor bit layout: field -> (lsb, width)
@@ -459,6 +460,54 @@ def test_helpers_place_the_documented_fields() -> None:
 
     assert isa.fence().opcode is Opcode.FENCE and isa.halt().opcode is Opcode.HALT
     assert isa.nop() == Descriptor()
+
+
+def test_vquant_group_writes_at_most_the_registers_the_file_holds() -> None:
+    """A group form writes ``ceil(n / vs_aux)`` scales, and the run has to fit in the file.
+
+    ``sreg_dst`` is a byte and the group count comes from two other fields, so
+    each field can be in range while the run is not; the helper refuses that
+    where the descriptor is built, and the hardware's group index saturates
+    rather than wrapping onto a register the same descriptor already wrote.
+    """
+    d = isa.vquant(vs_src=0, vs_dst=0, n=256, width=8, frac_in=16, sreg_dst=4, group=64)
+    assert isa.vquant_scales(d) == 4 and d.vs_aux == 64
+    assert isa.vquant_scales(isa.vquant(vs_src=0, vs_dst=64, n=64, width=8, frac_in=16, sreg_dst=0))
+    assert isa.vquant_scales(isa.vsubc(vs_src=0, vs_dst=64, n=64, addr_a=0x1000)) == 0
+    # a group length that does not divide n leaves the last group short and
+    # still writes a scale for it
+    short = Descriptor(
+        opcode=Opcode.VQUANT, row_mask=1, flags=int(VquantFlag.GROUP), n=20, vs_aux=8, sh0=16
+    )
+    assert isa.vquant_scales(short) == 3
+    isa.vquant(vs_src=0, vs_dst=0, n=32 * 8, width=8, frac_in=16, sreg_dst=0, group=8)
+    for sreg_dst, n, group in ((1, 32 * 8, 8), (0, 33 * 8, 8), (0, 257, 1)):
+        with pytest.raises(ValueError, match="registers the file holds"):
+            isa.vquant(vs_src=0, vs_dst=0, n=n, width=8, frac_in=16, sreg_dst=sreg_dst, group=group)
+
+
+def test_vquant_rejects_a_scale_exponent_outside_the_i8() -> None:
+    """The scale a VQUANT writes carries an i8 exponent, and the fields have to keep it there.
+
+    ``Sx = {a_hi, e_a - (w-1) - FRAC_in}`` times the ``SCALE_MUL`` constant, over
+    the ``e_a`` any input can produce (``numerics.quant_scale_exponents``): the
+    hardware wraps the exponent at eight bits where the reference keeps it exact,
+    so a descriptor that could reach the wrap is refused where it is built.
+    """
+    kw = dict(vs_src=0, vs_dst=64, n=64, sreg_dst=0)
+    ok = isa.vquant(**kw, width=8, frac_in=16, scale_mul=SFloat(47274, -18))  # log2(e)/8
+    assert isa.sfloat_from_imm(ok.imm32) == SFloat(47274, -18)
+    for width, frac_in, e in ((8, 16, -128), (16, 30, -128), (8, 0, 127), (16, 10, 127)):
+        lo, hi = N.quant_scale_exponents(width, frac_in, SFloat(1 << 15, e))
+        assert lo < N.E8_MIN or hi > N.E8_MAX, (width, frac_in, e, lo, hi)
+        with pytest.raises(ValueError, match="scale exponent"):
+            isa.vquant(**kw, width=width, frac_in=frac_in, scale_mul=SFloat(1 << 15, e))
+    # without the constant the fields cannot leave the range: FRAC_in is capped at 30
+    for width in (8, 16):
+        for frac_in in (0, 30):
+            lo, hi = N.quant_scale_exponents(width, frac_in)
+            assert N.E8_MIN <= lo and hi <= N.E8_MAX
+            isa.vquant(**kw, width=width, frac_in=frac_in)
 
 
 def test_sfloat_immediate_encoding() -> None:

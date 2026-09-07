@@ -59,8 +59,10 @@ design.
 
 ## What is covered
 
-Thirteen configurations of ten blocks -- ten of the twelve modules under
-`rtl/`. `uv run python sim/gatesim/gatesim.py --list` prints them.
+Nineteen configurations of fifteen blocks. `rtl/` holds eighteen files: the
+package `qcore_pkg.sv` and seventeen modules, fifteen of which are in the table
+below. `uv run python sim/gatesim/gatesim.py --list` prints the cases with the
+parameters each is elaborated with.
 
 | Case | Block | Configuration | Cells |
 |---|---|---|---|
@@ -77,22 +79,39 @@ Thirteen configurations of ten blocks -- ten of the twelve modules under
 | `kv_writer_tiny` | `qcore_kv_writer` | `WB=16, B_MAX=2, VSRAM_WORDS=2048` | 4493 |
 | `row_tiny` | `qcore_row` | `WB=16, ACC_W=40, VSRAM_WORDS=2048` | 3887 |
 | `stream_ctrl_tiny` | `qcore_stream_ctrl` | `WB=16, FIFO_BEATS=32, META_FIFO_BEATS=8, MAX_BURST=8` | 2877 |
+| `lut_rom_exp2` | `qcore_lut_rom` | `ENTRIES=256`, `rtl/gen/exp2.hex` | 421 |
+| `lut_rom_rsqrt` | `qcore_lut_rom` | `ENTRIES=512`, `rtl/gen/rsqrt.hex` | 730 |
+| `lut_interp` | `qcore_lut_interp` | defaults | 99 |
+| `vpu_lane` | `qcore_vpu_lane` | defaults | 1734 |
+| `vpu_scalar` | `qcore_vpu_scalar` | `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 2765 |
+| `vpu_top_tiny` | `qcore_vpu_top` | `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048, VPU_FIFO_BEATS=16, MAX_BURST=64` | 18405 |
+
+A lookup table reaches the netlist as constants, so the image is part of the
+configuration and each of the four is compared: `exp2` through `lut_rom_exp2`,
+`rsqrt` through `lut_rom_rsqrt`, and `recip` and `sigmoid` through the units
+that instantiate them, `vpu_scalar` and `vpu_top_tiny`. Yosys reads the image
+through `chparam -set ROM_FILE`, Icarus through the same path on the source
+instance, so a table the two front ends load differently is a mismatch.
 
 ## What is not covered, and why
 
-- **`qcore_vsram`.** Its 256-bit memory is inferred as `RAMB36E1`. Yosys 0.65's
-  `xilinx/cells_sim.v` declares `RAMB18E1` and `RAMB36E1` with their ports and
-  no body, so a netlist holding one has undriven read ports and there is nothing
-  to compare. The block is covered by its cocotb bench instead
-  (`sim/cocotb/tb_vsram.py`).
-- **`qcore_stream_ctrl` at the demo width.** `WB=64, FIFO_BEATS=128` maps its
-  FIFOs to 15 `RAMB18E1`, the same wall. The tiny configuration keeps both
-  FIFOs in distributed RAM (`RAM32M`), which does have a model, so that is the
-  configuration in the table.
-- **`qcore_top`.** The assembled core carries the block RAMs of `qcore_vsram`
-  and the stream FIFOs, so it hits the same wall; its blocks are covered
-  individually and the whole core is covered against the ISA simulator by
-  `make bringup` and `make bringup-sweep`.
+Two of the seventeen modules are absent, both for the same reason. Yosys's
+`xilinx/cells_sim.v` declares the hard block-RAM primitives with their ports and
+no body, so a netlist holding one has undriven read ports and there is nothing
+to compare against.
+
+- **`qcore_vsram`.** Its 256-bit memory is inferred as `RAMB36E1` -- 32 of them
+  at 4096 words and 16 at 2048, as `syn/reports/qcore_vsram.md` records. The
+  block is covered by its cocotb bench instead (`sim/cocotb/tb_vsram.py`).
+- **`qcore_top`.** The assembled core carries the vector SRAM of every row and
+  the stream FIFOs at their demo depth, so it hits the same wall. Its blocks are
+  covered individually above, and the whole core is compared against the ISA
+  simulator by `make bringup` and `make bringup-sweep`.
+
+One configuration is absent for the same reason: `qcore_stream_ctrl` at the demo
+width. `WB=64, FIFO_BEATS=128` maps its FIFOs to 15 `RAMB18E1`. The tiny
+configuration keeps both FIFOs in distributed RAM (`RAM32M`), which does have a
+model, so that is the configuration in the table.
 
 A configuration that starts inferring a block RAM does not fall through
 silently: the case fails and names the cell.
@@ -106,15 +125,31 @@ uv run python sim/gatesim/gatesim.py --list
 uv run python sim/gatesim/gatesim.py --rtl-dir /path/to/other/rtl
 ```
 
-The full set takes about a minute, eight cases at a time (`--jobs`, capped by
-the core count). Almost all of it is `qcore_perf`: Icarus spends the time on
-its 1024-bit snapshot output.
+The full set runs eight cases at a time (`--jobs`, capped by the core count) and
+takes 66.76 s, the median of five runs from an emptied `build/gatesim`
+(65.94 - 67.92, n=5, on the machine `docs/PERFORMANCE.md` names). Almost all of
+that is one case: `qcore_perf` has the widest output of the set, 1024 bits of
+snapshot to compare every cycle, and the run prints the seconds each case took
+beside its cell and cycle counts, so the eighteen others finish inside it.
 
 `--rtl-dir` points the run at another copy of `rtl/`, which is how the check is
-verified to have teeth: reintroduce `~25'(WB - 1)` in a scratch copy and the
-`seq_fetch` and `seq_dispatch` cases fail on the first compared cycles with
-`f_req_addr src=00000000 gate=0000003f` and `ev_macs src=0000001080
-gate=000000081f`.
+verified to have teeth. Two lines carry the parenthesised form,
+`rtl/qcore_seq_dispatch.sv:231` and `:284`; write them back as
+`& ~25'(WB - 1)` in a scratch copy and `seq_dispatch_wb64` fails from the first
+compared cycle with
+
+```
+gatesim: [seq_dispatch_wb64] FAILED: 6980 mismatching cycle(s)
+gatesim: MISMATCH cycle 17
+gatesim:   cmd_sx_m src=0000 gate=0030
+gatesim:   cmd_sreg_u32 src=00000000 gate=00000030
+gatesim:   ev_macs src=0000001080 gate=000000081f
+gatesim:   ev_wt_bytes src=0000001480 gate=0000000a17
+```
+
+while `seq_fetch_wb64`, which has no size cast under a unary operator, still
+passes. `scripts/lint.sh` greps for the same shape, so the two checks have to
+be defeated together.
 
 Everything lands under `build/gatesim/<case>/`: the Yosys script and log, the
 netlist, the port list, the generated bench and the simulation log with the

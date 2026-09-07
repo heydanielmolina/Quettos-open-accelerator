@@ -1,0 +1,19 @@
+# Yosys synth_xilinx (xc7) of qcore_vpu_scalar with the two lookup tables it
+# owns. ROM_FILE_RSQRT and ROM_FILE_RECIP are the images $readmemh loads into
+# the two qcore_lut_rom instances; Yosys 0.65 resolves $readmemh while it reads
+# a module, so `read_verilog -defer` holds the modules unelaborated and
+# `chparam` supplies both paths before `hierarchy` propagates them. The paths
+# are relative to the repo root, which is where the script runs. The unit takes
+# no width parameter, so one configuration covers every RTL build.
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_vpu_scalar.log -s syn/synth_vpu_scalar.ys
+# syn/report.ys prints the cell table, the longest topological path and the
+# hard-block instances that scripts/synth_report.py turns into
+# syn/reports/qcore_vpu_scalar.md.
+
+# ---- default: the rsqrt table (512 entries) and the recip table (256)
+log ==== qreport config default
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_lut_rom.sv rtl/qcore_lut_interp.sv rtl/qcore_vpu_scalar.sv
+chparam -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" qcore_vpu_scalar
+hierarchy -check -top qcore_vpu_scalar
+synth_xilinx -family xc7 -flatten -top qcore_vpu_scalar
+script syn/report.ys

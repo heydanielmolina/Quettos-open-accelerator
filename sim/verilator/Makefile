@@ -14,6 +14,7 @@ WB              ?= 64
 B_MAX           ?= 1
 VL              ?= 4
 VSRAM_WORDS     ?= 4096
+VPU_FIFO_BEATS  ?= 16
 FIFO_BEATS      ?= 128
 META_FIFO_BEATS ?= 16
 ACC_W           ?= 40
@@ -32,16 +33,26 @@ RTL   := $(REPO)/rtl
 # is hashed but never named.
 SV   := $(sort $(wildcard $(RTL)/*.sv))
 SVH  := $(sort $(wildcard $(RTL)/*.svh))
+HEX  := $(sort $(wildcard $(RTL)/gen/*.hex))
 HDRS := $(sort $(wildcard $(HERE)/*.hpp))
 SRCS := $(HERE)/main.cpp $(HDRS)
 
-PARAMS := -GWB=$(WB) -GB_MAX=$(B_MAX) -GVSRAM_WORDS=$(VSRAM_WORDS) \
+# The lookup-table images qcore_vpu_top's ROMs load. Absolute, because Verilator
+# runs $readmemh from the object directory rather than from the repository root;
+# a string parameter is set quoted on the Verilator command line, so the quotes
+# are escaped through the shell that runs the build.
+ROMS := -GROM_FILE_SIGMOID=\"$(RTL)/gen/sigmoid.hex\" \
+        -GROM_FILE_RSQRT=\"$(RTL)/gen/rsqrt.hex\" \
+        -GROM_FILE_RECIP=\"$(RTL)/gen/recip.hex\"
+
+PARAMS := -GWB=$(WB) -GB_MAX=$(B_MAX) -GVL=$(VL) -GVSRAM_WORDS=$(VSRAM_WORDS) \
           -GFIFO_BEATS=$(FIFO_BEATS) -GMETA_FIFO_BEATS=$(META_FIFO_BEATS) \
-          -GACC_W=$(ACC_W) -GMAX_BURST=$(MAX_BURST) -GDQ_DEPTH=$(DQ_DEPTH)
+          -GACC_W=$(ACC_W) -GMAX_BURST=$(MAX_BURST) -GDQ_DEPTH=$(DQ_DEPTH) \
+          -GVPU_FIFO_BEATS=$(VPU_FIFO_BEATS) $(ROMS)
 DEFS := -DQCORE_WB=$(WB) -DQCORE_B_MAX=$(B_MAX) -DQCORE_VL=$(VL) \
         -DQCORE_VSRAM_WORDS=$(VSRAM_WORDS) -DQCORE_FIFO_BEATS=$(FIFO_BEATS) \
         -DQCORE_ACC_W=$(ACC_W) -DQCORE_MAX_BURST=$(MAX_BURST) \
-        -DQCORE_DQ_DEPTH=$(DQ_DEPTH) \
+        -DQCORE_DQ_DEPTH=$(DQ_DEPTH) -DQCORE_VPU_FIFO_BEATS=$(VPU_FIFO_BEATS) \
         -DQCORE_THREADS=$(THREADS) -DQCORE_TOP_NAME=$(TOP)
 ifeq ($(TRACE),1)
 DEFS      += -DQCORE_TRACE
@@ -56,9 +67,9 @@ VFLAGS := --cc --exe --build -j 0 -O3 --x-assign fast --x-initial fast --no-asse
           --no-timing -Wall --output-split 20000 $(TRACEFLAGS) $(THREADFLAGS) \
           -CFLAGS "-O2 -I$(HERE) $(DEFS)" -I$(RTL) $(PARAMS) --top-module $(TOP)
 
-CONFIG := $(TOP) $(WB) $(B_MAX) $(VL) $(VSRAM_WORDS) $(FIFO_BEATS) $(META_FIFO_BEATS) \
-          $(ACC_W) $(MAX_BURST) $(DQ_DEPTH) $(THREADS) $(TRACE)
-HASH := $(shell { echo "$(CONFIG)"; cat $(SV) $(SVH) $(SRCS); } | shasum -a 256 | cut -c1-12)
+CONFIG := $(TOP) $(WB) $(B_MAX) $(VL) $(VSRAM_WORDS) $(VPU_FIFO_BEATS) $(FIFO_BEATS) \
+          $(META_FIFO_BEATS) $(ACC_W) $(MAX_BURST) $(DQ_DEPTH) $(THREADS) $(TRACE)
+HASH := $(shell { echo "$(CONFIG)"; cat $(SV) $(SVH) $(HEX) $(SRCS); } | shasum -a 256 | cut -c1-12)
 OBJ  := $(REPO)/build/verilator/$(TOP)-$(HASH)
 BIN  := $(OBJ)/qcore_sim
 

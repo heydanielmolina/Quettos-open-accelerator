@@ -287,6 +287,50 @@ def test_sfloat_mul_random_200k_pairs() -> None:
         assert SFloat(int(got_m[i]), int(got_e[i])) == ref_sfloat(exact)
 
 
+def test_sfloat_mul_exponent_gain_is_15_or_16() -> None:
+    """The gain ``sfloat_mul`` adds to ``e_a + e_b`` is exhaustively 15 or 16, never 17.
+
+    17 would need the ``p >= 2**31`` branch to round up to ``2**16``, so
+    ``p >= 2**32 - 2**15``; the largest product of two canonical mantissas is
+    ``(2**16 - 1)**2 = 2**32 - 2**17 + 1``, below that.  The gain is
+    non-decreasing in ``m_b`` (``p`` grows, the branch and the rounding only
+    move up), so ``m_b = 2**16 - 1`` is the maximum over all ``m_b`` and the
+    scan below is a complete proof over both mantissas.
+    """
+    m_max = (1 << 16) - 1
+    assert N.round_shift(m_max * m_max, 16) < 1 << 16
+    gains = {N.sfloat_mul(SFloat(ma, 0), SFloat(m_max, 0)).e for ma in range(1 << 15, 1 << 16)}
+    assert max(gains) == N.SFLOAT_MUL_E_MAX == 16
+    assert min(N.sfloat_mul(SFloat(ma, 0), SFloat(1 << 15, 0)).e for ma in (1 << 15, m_max)) == (
+        N.SFLOAT_MUL_E_MIN
+    )
+    assert N.SFLOAT_MUL_E_MIN == 15
+    # both ways of reaching the top gain: the 2**31 branch, and the rounding
+    # overflow of the branch below it
+    assert N.sfloat_mul(SFloat(m_max, 0), SFloat(m_max, 0)).e == N.SFLOAT_MUL_E_MAX
+    assert 32769 * 65534 < 1 << 31
+    assert N.sfloat_mul(SFloat(32769, 0), SFloat(65534, 0)) == SFloat(1 << 15, N.SFLOAT_MUL_E_MAX)
+
+
+def test_quant_scale_exponents_upper_bound_uses_the_reachable_gain() -> None:
+    """``SCALE_MUL`` widens the bound by the gain ``sfloat_mul`` can actually reach.
+
+    ``quant_scale_exponents`` composes the ``Sx`` window with one
+    :func:`sfloat_mul`, so its widening is exactly ``[SFLOAT_MUL_E_MIN,
+    SFLOAT_MUL_E_MAX]`` and not a branch the rounding rule makes unreachable.
+    """
+    m_max = (1 << 16) - 1
+    gain_hi = max(N.sfloat_mul(SFloat(ma, 0), SFloat(m_max, 0)).e for ma in range(1 << 15, 1 << 16))
+    gain_lo = N.sfloat_mul(SFloat(1 << 15, 0), SFloat(1 << 15, 0)).e
+    for width in (8, 16):
+        for frac_in in (0, 8, 16, 30):
+            base_lo, base_hi = N.quant_scale_exponents(width, frac_in)
+            for e in (-40, -1, 0, 7, 40):
+                mul = SFloat(50000, e)
+                lo, hi = N.quant_scale_exponents(width, frac_in, mul)
+                assert (lo, hi) == (base_lo + e + gain_lo, base_hi + e + gain_hi)
+
+
 def test_sfloat_mul_zero_and_one() -> None:
     s = SFloat(51234, -7)
     assert N.sfloat_mul(SFLOAT_ZERO, s) == SFLOAT_ZERO
@@ -756,6 +800,35 @@ def test_quant_scale_and_dequantization_error(width: int, tables: N.Tables) -> N
             assert st.clip == 0
 
 
+@pytest.mark.parametrize("width", [8, 16])
+def test_quant_scale_exponents_bound_every_reachable_scale(width: int, tables: N.Tables) -> None:
+    """The static bound holds for every magnitude the hardware can present, and is attained.
+
+    ``a`` is a u32 -- an int32 absmax, or a tracked absmax an SREG word holds --
+    so ``e_a = bitlen(a_eff) - 16`` runs over ``[-14, 17]`` and nothing else,
+    with and without the ``SCALE_MUL`` constant.
+    """
+    rng = np.random.default_rng(90 + width)
+    x = np.array([7, -3, 0, 1], dtype=np.int64)
+    amaxes = (1, 2, 3, 12345, (1 << 30) - 1, 1 << 31, (1 << 32) - 1)
+    for frac_in in (0, 8, 16, 30):
+        lo, hi = N.quant_scale_exponents(width, frac_in)
+        seen = [N.quant(x, width, frac_in, tables, amax=a)[1].e for a in amaxes]
+        assert min(seen) == lo and max(seen) == hi
+        assert (lo, hi) == (
+            N.QUANT_E_A_MIN - (width - 1) - frac_in,
+            N.QUANT_E_A_MAX - (width - 1) - frac_in,
+        )
+        for _ in range(50):
+            mul = N.sfloat_from_float(float(rng.uniform(1e-6, 1e6)))
+            mlo, mhi = N.quant_scale_exponents(width, frac_in, mul)
+            got = [N.quant(x, width, frac_in, tables, amax=a, scale_mul=mul)[1].e for a in amaxes]
+            assert mlo <= min(got) and max(got) <= mhi, (frac_in, mul, got, mlo, mhi)
+    assert N.quant_scale_exponents(8, 0, SFLOAT_ZERO) == N.quant_scale_exponents(8, 0)
+    with pytest.raises(ValueError):
+        N.quant_scale_exponents(12, 0)
+
+
 def test_quant_power_of_two_absmax_is_exact_rounding(tables: N.Tables) -> None:
     # absmax = 2**k: the scale basis a_eff = 2**k + 2**(k-w+1) keeps the absmax element on
     # +-(2**(w-1) - 1) and q equals round_half_up(x * 2**(w-1) / a_used) within the table error.
@@ -891,6 +964,30 @@ def test_rmsnorm_eps_dominated_tiny_input_is_finite_and_accurate(tables: N.Table
     assert not N.rmsnorm(
         np.zeros(d, dtype=np.int64), gq, ge, 0, N.sfloat_from_float(math.sqrt(d)), frac_x, tables
     ).any()
+
+
+@pytest.mark.parametrize(
+    ("sqrt_e", "s1", "clamped"),
+    [(10, -8, True), (0, 2, False), (-61, 63, False), (-62, 64, True), (-90, 92, True)],
+)
+def test_rmsnorm_shift_clamps_at_both_ends(
+    tables: N.Tables, sqrt_e: int, s1: int, clamped: bool
+) -> None:
+    """``S1`` is a 6-bit shift: outside ``[0, 63]`` it clamps and counts, at either end.
+
+    ``x`` has absmax 1 and ``ss' = n``, so ``sh = 0``, ``e = 2`` and
+    ``Rc = {2**15, sqrt_e}``: the constant alone places ``S1 = 2 - sqrt_e``.
+    63 is the last shift the field carries and 64 the first one past it, and
+    both the requant and ``qcore_vpu_scalar`` clamp and count the same way.
+    """
+    n = 16
+    x = np.array([1, -1] * (n // 2), dtype=np.int64)
+    gq = np.ones(n, dtype=np.int64)
+    st = Stats()
+    y = N.rmsnorm(x, gq, 0, 0, SFloat(1 << 15, sqrt_e), 0, tables, st)
+    assert st.err_shift == (n if clamped else 0)
+    assert y.tolist() == N.round_shift(x * (1 << 15), min(max(s1, 0), N.SHIFT_MAX)).tolist()
+    assert st.sat == 0
 
 
 def test_rmsnorm_rejects_positive_gamma_exponent(tables: N.Tables) -> None:

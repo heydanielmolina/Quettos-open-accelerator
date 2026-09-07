@@ -17,6 +17,11 @@ Usage:
 a failing command rather than a misleading page. The `## Notes (hand-written)`
 section at the end of a report is the one part written by a person; it is
 carried forward unchanged.
+
+Yosys's own output is passed through, minus the lines `is_noise` names: the
+`check` pass that `synth_xilinx` runs between `proc` and its first `opt_clean`
+reports the scaffolding elaboration has just built, and the next pass deletes
+it. The full log under `build/synth/` keeps every line.
 """
 
 from __future__ import annotations
@@ -77,16 +82,55 @@ class Config:
 # --------------------------------------------------------------------------- run
 
 
+# A wire the AST front end leaves behind: the per-bit `$mem2bits$` expansion of
+# an array `$readmemh` fills, and the argument and result wires of an inlined
+# `qcore_pkg::` function. `synth_xilinx` runs `check` once between `proc` and
+# its first `opt_clean`, and that is the pass that prints these; its two later
+# `check` passes print none, because `opt_clean` has deleted the wires by then.
+# `scripts/lint.sh` runs `proc; opt; check -assert` over every module, so an
+# undriven wire that outlives `opt` is still an error -- what these lines
+# describe is the state between two passes, not the design.
+_ELABORATION_WIRE = re.compile(
+    r"^Warning: Wire \S*\$(?:mem2bits|func)\$\S+ \[\d+\] is used but has no driver\.$"
+)
+
+
+def is_noise(line: str) -> bool:
+    """Whether a Yosys stderr line describes a pass in progress rather than the design."""
+    return "Resizing cell port" in line or _ELABORATION_WIRE.match(line) is not None
+
+
+def check_noise_is_scaffolding(script: Path, sections: list[tuple[str, list[str]]]) -> None:
+    """The dropped warnings have to be the ones the next pass deletes.
+
+    `is_noise` judges a stderr line by its wire name, and stderr carries no pass
+    boundary. The log carries one: within a configuration, the first `opt_clean`
+    is the pass that removes the elaboration scaffolding. A warning that matches
+    after it names a wire that survived, so it fails the run rather than the
+    console, and the filter cannot quietly grow into a real finding.
+    """
+    for label, lines in sections:
+        start = next(
+            (i for i, ln in enumerate(lines) if "Executing OPT_CLEAN pass" in ln), len(lines)
+        )
+        late = [ln for ln in lines[start:] if _ELABORATION_WIRE.match(ln)]
+        if late:
+            raise ReportError(
+                f"{label}: {len(late)} undriven wire(s) outlive `opt_clean` in "
+                f"{script.name}, starting with {late[0]}"
+            )
+
+
 def run_script(script: Path, log: Path) -> None:
     """Run one Yosys script, leaving its log at `log`."""
     log.parent.mkdir(parents=True, exist_ok=True)
     argv = yosys_argv(script, log)
     proc = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
-    noise = [ln for ln in proc.stderr.splitlines() if "Resizing cell port" not in ln]
+    kept = [ln for ln in proc.stderr.splitlines() if not is_noise(ln)]
     if proc.returncode != 0:
-        sys.stderr.write("\n".join(noise) + "\n")
+        sys.stderr.write("\n".join(kept) + "\n")
         raise ReportError(f"{' '.join(argv)} failed with exit {proc.returncode}")
-    for line in noise:
+    for line in kept:
         print(line)
 
 
@@ -454,12 +498,16 @@ def build(script: Path) -> tuple[str, str]:
     run_script(script, log)
     text = log.read_text()
     version = yosys_version(text)
-    cfgs = [parse_config(label, lines) for label, lines in split_configs(text)]
+    sections = split_configs(text)
+    check_noise_is_scaffolding(script, sections)
+    cfgs = [parse_config(label, lines) for label, lines in sections]
     modules = {c.module for c in cfgs}
     if len(modules) != 1:
         raise ReportError(f"{script.name}: configurations synthesize {sorted(modules)}")
     name = f"{cfgs[0].module}.md"
-    return name, render(script, log, version, cfgs, keep_notes(REPORT_DIR / name))
+    page = render(script, log, version, cfgs, keep_notes(REPORT_DIR / name))
+    check_facts_cover_params(name, cfgs, page)
+    return name, page
 
 
 # Cell types whose count is an inference outcome, not an optimization detail: a
@@ -489,14 +537,48 @@ def recorded_tool(text: str) -> str:
 
 
 def design_facts(text: str) -> list[str]:
-    """The lines a report must reproduce on any Yosys build."""
-    facts = []
-    for line in text.splitlines():
-        if line.startswith("# ") or line.startswith("## ") or line.startswith("Parameters: "):
+    """The lines a report must reproduce on any Yosys build.
+
+    `render` wraps the parameter list to the page width, so a configuration with
+    more parameters than one line holds carries the rest on continuation lines.
+    The whole paragraph is joined back into a single fact before it is compared:
+    every parameter is then held to the recorded value, and a build that happens
+    to break the paragraph elsewhere still compares equal.
+    """
+    facts: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("Parameters: "):
+            paragraph = []
+            while i < len(lines) and lines[i].strip():
+                paragraph.append(lines[i].strip())
+                i += 1
+            facts.append(" ".join(paragraph))
+            continue
+        if line.startswith("# ") or line.startswith("## "):
             facts.append(line)
         elif line.startswith("| `") and any(f"`{b}`" in line for b in HARD_BLOCKS):
             facts.append(line)
+        i += 1
     return facts
+
+
+def check_facts_cover_params(name: str, cfgs: list[Config], text: str) -> None:
+    """Every parameter the run elaborated has to reach the cross-build comparison.
+
+    `design_facts` reads the rendered page, so a change to how `render` lays the
+    parameters out could drop one from the comparison without changing any
+    report. This fails the run instead: each `NAME = VALUE` the log carried is
+    required back in the facts extracted from the page that was written from it.
+    """
+    facts = "\n".join(design_facts(text))
+    missing = [f"{k} = {v}" for cfg in cfgs for k, v in cfg.params if f"`{k} = {v}`" not in facts]
+    if missing:
+        raise ReportError(
+            f"{name}: the cross-build comparison does not cover " + ", ".join(missing)
+        )
 
 
 def main() -> int:

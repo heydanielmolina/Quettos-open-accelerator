@@ -23,11 +23,15 @@ command in this repository (`uv run quettos calibrate <alias>`,
   (`Stats.sat` in software, the `SAT_*` CSRs in hardware) so the golden model
   and the RTL counters can be compared.
 - `Stats` holds three counters: `sat` (sat40/sat32 events), `err_shift`
-  (a requant stage-2 shift outside `[0, 63]`; must stay 0 on a correct
-  program) and `clip` (VQUANT clips at `+-(2^(w-1) - 1)` and the softmax weight
+  (a requant stage-2 shift or an RMSNorm `S1` outside `[0, 63]`; must stay 0 on
+  a correct program) and `clip` (VQUANT clips at `+-(2^(w-1) - 1)` and the softmax weight
   clip at 32767; expected, not a fault).
 - Vectors are `int64` arrays, scalars are Python ints; every intermediate
   product fits in 63 bits by construction (see the width notes below).
+- A width in bits is a **signed** width throughout this repository -- the bits a
+  two's-complement value needs, sign included -- unless it says magnitude bits.
+  `sat_32` therefore bounds a value to 32 signed bits: 31 magnitude bits and a
+  sign.
 - All RTL intermediates are `logic signed`; every operand is wrapped in
   `$signed()`; u16 mantissas are handled as 17-bit signed.
 
@@ -48,7 +52,10 @@ range. Weight meta stores `e` as an `i8`.
 - `sfloat_mul(a, b)`: `p = m_a * m_b` lies in `[2^30, 2^32)`. If `p >= 2^31`:
   `m = round_shift(p, 16)`, `e = e_a + e_b + 16`; otherwise
   `m = round_shift(p, 15)`, `e = e_a + e_b + 15`. A rounding overflow to `2^16`
-  becomes `{2^15, e + 1}`. Zero times anything is the canonical zero. There is
+  becomes `{2^15, e + 1}`, and only the `p < 2^31` branch can reach it:
+  `p <= (2^16 - 1)^2 = 2^32 - 2^17 + 1` is below the `2^32 - 2^15` that
+  `round_shift(p, 16)` would need, so the exponent gain is 15 or 16 and never
+  17. Zero times anything is the canonical zero. There is
   one rounding, so the result is the correctly rounded (half-up) product;
   property-tested against exact rationals on every edge-mantissa/exponent
   combination and on 200k random pairs.
@@ -115,6 +122,14 @@ the zero scale. A descriptor sfloat constant (`log2(e)/8` for q) multiplies
 the scale through `sfloat_mul`. `quant_groups` applies the same per group of
 64 elements (per head) for q, K and V. Widths: `x` int32, `inv` 16 bits,
 product 47 bits.
+
+`Sx`'s exponent travels as an i8, in the descriptor and in the SREG word the
+descriptor writes, so it has to stay in `[-128, 127]`; this module keeps it
+exact and the hardware wraps. The bound is a property of the width, `FRAC_in`
+and the `SCALE_MUL` constant rather than of the data, so it is settled where a
+descriptor is built: `quant_scale_exponents(w, FRAC_in, scale_mul)` returns the
+smallest and largest exponent the op can produce for any input vector, and
+`isa.vquant` and the compiler refuse a descriptor whose range leaves the i8.
 
 ## Accumulator
 
@@ -217,8 +232,8 @@ writes back into the residual class; `FRAC_S` is sized from the centered scores
 is recorded for reference, and on Qwen it is almost entirely the constant
 `q . c` term), must come out at 16 (the softmax consumes a 16-bit fraction) and
 calibration fails otherwise; `FRAC_QKV` also covers the centered K vectors;
-logits are fixed at 16. The quantizer also requires `FRAC_GU >= 13` (sigmoid table index) and
-`FRAC_H <= 2 FRAC_GU` (SiLU shift).
+logits are fixed at 16. The quantizer also requires `FRAC_GU >= 13` (sigmoid
+table index) and `FRAC_H <= 2 FRAC_GU` (SiLU shift).
 
 The calibration set is the three prompt files under `prompts/` plus three
 passages of plain prose rendered through the model's chat template, so ChatML
@@ -248,7 +263,10 @@ dequantized into `FRAC_X` by EMBED.
 
 Runtime counters `SAT_REQ`, `SAT_VPU`, `ERR_SHIFT`, `ERR_BOUNDS` are printed
 per run; `make demo` fails on any non-zero counter unless `--allow-sat`.
-`SAT_VPU` counts saturations; the VQUANT and softmax clips are counted separately as clips.
+`SAT_VPU` counts saturations; the VQUANT and softmax clips are counted
+separately as clips. A pass with two products per element -- RMSNorm, SiLU --
+reports one `SAT_VPU` event for that element whether its intermediate saturated,
+its result did, or both.
 
 ## RMSNorm (VRMSNORM)
 
@@ -258,7 +276,7 @@ are descriptor constants.
 
 ```
 amax = absmax(x);  sh = max(0, bitlen(amax) - 15)
-ss   = sum((x >> sh)^2)                               # <= 48 bits
+ss   = sum((x >> sh)^2)              # each square <= 2^30: 30 + ceil(log2 n) bits, 54 at n = 2^24
 ss'  = ss + (eps_c >> 2 sh)                           # (mean(x^2) + eps) * d * 2^(2 FRAC_X - 2 sh)
 ss'  = m * 2^(2e), m in [1, 4):  L = bitlen(ss'); 2e = L-1 if L odd else L-2
 R    = rsqrt_q15(m)                                   # m as Q2.16 in [2^16, 2^18); 1/sqrt(m) in Q1.15
@@ -270,12 +288,31 @@ y    = sat32(round_shift(xhat * gamma_q, G)),  G = -gamma_e
 because `rsqrt(mean(x^2) + eps) = sqrt(d) * 2^(FRAC_X - sh - e) * R * 2^-15`.
 `ss' = 0` gives an all-zero output. `S1` is non-negative whenever
 `eps_c >= 2^(2 (FRAC_X + e_d))` with `e_d = floor(log2 sqrt(d)) - 15` (`2^10`
-for `FRAC_X = 16` and `512 <= d < 1024`; both models use `eps_c > 1.5e6`); a
-program that still produces `S1 < 0` gets the shift clamped to 0 and counted
-in `ERR_SHIFT`. `|xhat| <= sqrt(d) * 2^FRAC_X * (1 + 2^-13)`, 21 bits at
-`d = 896`. The output absmax is tracked for the VQUANT that follows. Measured against a float64 reference over 240 random
-vectors (d = 896 and 576, `FRAC_X` 14 and 16, scales from 0.01 to 8000, single
-outlier channels): worst relative error `0.23 * 2^-12` (test bound `2^-12`).
+for `FRAC_X = 16` and `512 <= d < 1024`; both models use `eps_c > 1.5e6`); `S1` is
+the shift a 6-bit field carries, so a program that produces one outside
+`[0, 63]` gets it clamped into that range and counted in `ERR_SHIFT` at either
+end, the same rule the requant shift already follows. The output absmax is tracked for the VQUANT that follows.
+
+`xhat` is bounded by `sqrt(d) * 2^FRAC_X * (1 + 2^-13)`: with `S1` unclamped
+`xhat = x * sqrt(d) * 2^(FRAC_X - sh) / sqrt(ss')` and `|x| <= sqrt(sum(x^2))`,
+and the `2^-13` covers the rsqrt table, the `x >> sh` truncation and the
+rounding. `numerics.rmsnorm` holds `xhat` exactly and saturates only `y`; the
+hardware forms it in `qcore_vpu_lane`, where it is an int32 result and a
+saturation of it counts in `SAT_VPU` like any other. The two are the same
+function of the input while that bound fits a signed 32-bit value.
+
+That condition and the `eps_c` floor above are properties of `d`, `FRAC_X` and
+the descriptor constants alone, so both are settled where a model is built:
+`quantize.check_rmsnorm_domain` refuses a model that breaks either, and
+`quantize.xhat_bits` is the bound in signed bits -- 22 at `d = 896` with
+`FRAC_X = 16` and 20 at `d = 576` with `FRAC_X = 14`, against the 32 the lane
+holds. It
+leaves `FRAC_X` free up to 26 at `d = 896` and 24 at `d = 8192`, above the 16
+the calibration rule produces.
+
+Measured against a float64 reference over 240 random vectors (d = 896 and 576,
+`FRAC_X` 14 and 16, scales from 0.01 to 8000, single outlier channels): worst
+relative error `0.23 * 2^-12` (test bound `2^-12`).
 
 ## RoPE (VROPE)
 
@@ -361,9 +398,11 @@ section gives the end-to-end effect.
 
 K int8 per (token, kv head) + sfloat scale, transposed in `WB`-token tiles; V
 int8 (`v_raw`, without its bias) per (token, kv head) + scale, tiled with the
-64 dimensions as channels (one row per token at `WB = 64`); 8 B meta each. The compiler writes zero K/V meta for the whole `MAX_CTX` range into
-`image.bin`; the harness zero-fills the KV region at sequence start and before
-prefix restore; the comparison (`isa_sim.compare_sequence`) masks score elements `>= len`.
+64 dimensions as channels (one row per token at `WB = 64`); 8 B meta each. The
+compiler writes zero K/V meta for the whole `MAX_CTX` range into `image.bin`;
+the harness zero-fills the KV region at sequence start and before prefix
+restore; the comparison (`isa_sim.compare_sequence`) masks score elements
+`>= len`.
 
 ## Scores
 
@@ -513,17 +552,30 @@ written to `models/<name>/quality.json`; the token ids are the ones hashed in
 | Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.39% (1130) | 0.110 | +0.0111 +/- 0.0208 | 34.97 -> 35.36 |
 | SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00485 | -0.0023 +/- 0.0030 | 35.91 -> 35.82 |
 | SmolLM2-135M-Instruct | W8A8 | 1175 | 89.19% (1048) | 0.0454 | +0.0302 +/- 0.0113 | 35.91 -> 37.01 |
+| Qwen2.5-0.5B-Instruct | W8A16-nosmooth | 1308 | 93.65% (1225) | 0.0556 | +0.0492 +/- 0.0132 | 34.97 -> 36.73 |
+| Qwen2.5-0.5B-Instruct | W8A8-nosmooth | 1308 | 86.01% (1125) | 0.109 | +0.0302 +/- 0.0242 | 34.97 -> 36.04 |
+| SmolLM2-135M-Instruct | W8A16-nosmooth | 1175 | 95.66% (1124) | 0.00464 | +0.0052 +/- 0.0028 | 35.91 -> 36.09 |
+| SmolLM2-135M-Instruct | W8A8-nosmooth | 1175 | 87.15% (1024) | 0.0468 | -0.0185 +/- 0.0101 | 35.91 -> 35.25 |
 
 W8A16 is the default (int16 activations into every weight GEMV, int8 K/V
 cache, table-driven nonlinearities, K-centering and the Q/K smoothing fold);
 W8A8 feeds int8 activations to the weight GEMVs with everything else
 unchanged. `sat` and `err_shift` are 0 on every row; the VQUANT and softmax
 clip counts are 243621 / 194390 on Qwen (W8A16 / W8A8) and 171687 / 140157 on
-SmolLM2. With K-centering alone (every smoothing factor 1, everything else
-equal) the Qwen W8A16 row measures 93.65% top-1, KL 0.0556 and delta-NLL
-+0.0492 +/- 0.0132 (PPL 36.73), so the fold recovers 1.9 points of top-1 and
-4.5x in KL on the model with large `k_proj` biases and leaves SmolLM2 within
-noise (95.66%, KL 0.00464 with centering alone). On Qwen the KL is largest on
+SmolLM2, and 246540 / 196472 and 169416 / 138576 on the two ablation rows.
+
+The `-nosmooth` rows are the ablation of the fold, built and scored the same
+way as the rest of the table: `uv run quettos quantize <alias>
+--no-qk-smoothing` rebuilds the model with every smoothing factor forced to 1
+and everything else identical (the same `calib.json`, formats, K-centering
+rows, class maxima and program constants), and `uv run quettos check <alias>
+--no-qk-smoothing` scores it over the same token ids against the same fp32
+reference. At W8A16 the fold is worth 1.91 points of top-1 and 4.5x in KL on
+Qwen, whose `k_proj` biases are large, and leaves SmolLM2 inside its own noise
+(95.66% either way, KL 0.00485 against 0.00464). At W8A8 the picture changes:
+the fold is worth 0.38 points on Qwen with the KL unmoved (0.110 against
+0.109) and 2.04 points on SmolLM2, because the int8 activation error dominates
+the K-cache error the fold conditions. On Qwen the KL is largest on
 the two short prompts (0.038 per position at T = 36 and 0.034 at T = 180,
 W8A16) while the four longer sequences lie between 0.0054 and 0.0117; on
 SmolLM2 every sequence lies between 0.0040 and 0.0080. The W8A8 rows lose 9.2

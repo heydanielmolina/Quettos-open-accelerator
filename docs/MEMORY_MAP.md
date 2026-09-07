@@ -63,12 +63,17 @@ writes to `build/images/<name>/` (`<name>-l<N>` when truncated to `N` layers):
 
 Two compiles of the same model and parameters produce byte-identical files.
 The compiler rejects a requant shift window outside `[0, 63]`, a VSRAM or SREG
-allocation that overflows, programs that reach the RoPE base, and a `MAX_CTX`
-that is not a multiple of `WB` or exceeds 2048 (the RoPE table). The requant
-constants of both programs are `program.build` at `MAX_CTX = 2048` for every
-`--max-ctx`; a smaller `--max-ctx` sizes the KV region, the RoPE rows and the
-capacity fields only, so the golden model's defaults reproduce the compiled
-program at every image size.
+allocation that overflows, programs that reach the RoPE base, a `MAX_CTX` that
+is not a multiple of `WB` or exceeds 2048 (the RoPE table), a model outside the
+VRMSNORM domain, a descriptor of either program that breaks the V-op
+destination rule, and a VQUANT whose scale exponent could leave the i8 the
+SREG word carries -- the last three are `quantize.check_rmsnorm_domain`,
+`compiler.vector_overlap` and `compiler.quant_scale_exponent` in the
+compiler-assertion list of `docs/ISA.md`.
+The requant constants of both programs are `program.build` at
+`MAX_CTX = 2048` for every `--max-ctx`; a smaller one sizes the KV region, the
+RoPE rows and the capacity fields only, so the golden model's defaults
+reproduce the compiled program at every image size.
 
 ## Weight tile layout
 
@@ -131,9 +136,17 @@ one per query head for the q scales, one per KV head for the K scales and one
 per KV head for the V scales: 23 registers on Qwen, 20 on SmolLM2, at most
 `5 + heads + 2 kv_heads`.
 
-Other on-chip state (**estimates** of what synthesis will report): accumulators
-64 x 40 b x 2; `SREG` 32 x 32 b; weight FIFO 128 x 64 B; meta side-FIFO
-64 x 64 B; descriptor queue 8 x 32 B; ROMs ~6 RAMB36; total BRAM ~44 RAMB36.
+The rest of the on-chip state, as `make synth` maps it in the demo
+configuration (`syn/reports/qcore_top.md`, Demo configuration, is the run these
+counts are read from): block RAM is the VSRAM and the weight FIFO and nothing
+else -- 32 `RAMB36E1` for the row's `qcore_vsram` and 15 `RAMB18E1` for the
+stream controller's 128-beat weight FIFO, 47 block RAMs in all. The rest is
+distributed RAM: 359 `RAM32M` over the requant's dump-beat queue (102), the
+vector unit's QMEM operand FIFO (86), the descriptor queue (85), the meta
+side-FIFO (80) and the `SREG` banks (6). The four lookup tables are write-free
+memories, which `memory_libmap` maps into the LUT fabric rather than block RAM
+(`syn/reports/qcore_lut_rom.md`), and the accumulators, 64 x 40 b x 2 per row,
+are flops.
 
 ## KV layout
 
@@ -162,6 +175,6 @@ variant issues `ceil(64/WB)` `WB`-byte writes, one per V tile, and both carry
 `MAX_CTX` in the `k` field. The compiler writes zero data and zero meta for the
 whole `MAX_CTX` range so that unwritten positions read as `m = 0`.
 
-Canonical (WB-independent) format used by the harness for prefix save/restore:
-`[layer][kvh][token][64]` int8 plus scales, re-laid-out to the tiled format on
-restore.
+Prefix save and restore (`--kv-save FILE`, `--kv-load FILE`) copy this region
+byte for byte at the layout above, so a saved file is valid for the model and
+the port width that wrote it.

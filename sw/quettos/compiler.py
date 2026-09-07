@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from quettos import golden, isa, isa_sim, numerics, program
+from quettos import golden, isa, isa_sim, numerics, program, quantize
 from quettos.isa import Descriptor, Opcode, OutMode, VquantFlag
 from quettos.model import BUILD_DIR, REPO_ROOT, ModelSpec
 from quettos.quantize import QuantLinear, QuantModel, QuantNorm
@@ -464,7 +464,7 @@ def descriptor_effects(d: Descriptor) -> Effects:
     if op in (Opcode.VRMSNORM, Opcode.VSILUMUL):
         return Effects((d.vs_dst, d.n), tracked, False)
     if op == Opcode.VQUANT:
-        scales = d.n // d.vs_aux if d.flags & VquantFlag.GROUP else 1
+        scales = isa.vquant_scales(d)
         return Effects((d.vs_dst, d.n), tuple(range(d.sreg_dst, d.sreg_dst + scales)), False)
     if op == Opcode.VROPE:
         return Effects((d.vs_src, d.n), (), False)
@@ -475,6 +475,94 @@ def descriptor_effects(d: Descriptor) -> Effects:
     if op == Opcode.KVWRITE:
         return Effects(None, (), True)
     return Effects(None, (), False)
+
+
+VECTOR_SOURCES: dict[Opcode, tuple[str, ...]] = {
+    Opcode.VRMSNORM: ("vs_src",),
+    Opcode.VQUANT: ("vs_src",),
+    Opcode.VSILUMUL: ("vs_src", "vs_aux"),
+    Opcode.VSOFTMAX: ("vs_src",),
+    Opcode.VSUBC: ("vs_src",),
+}
+
+
+def vector_overlap(d: Descriptor) -> str | None:
+    """The source range of ``d`` that partially overlaps its destination, or ``None``.
+
+    The vector unit reads a chunk of operands several stages before it writes
+    the results of the chunk ahead of it, while ``sw/quettos/isa_sim.py`` reads
+    the whole source before writing anything.  The two describe the same values
+    only when a destination range is the source range or is disjoint from it,
+    which is the rule in ``docs/ISA.md``; VROPE writes its source and needs no
+    check.  The rule is about one bank: row ``r`` reads bank ``src_row + r``
+    and writes bank ``dst_row + r``, so with different row bases the source and
+    the destination are different memories and no pair of element indices can
+    alias.
+    """
+    if d.src_row != d.dst_row:
+        return None
+    for name in VECTOR_SOURCES.get(d.opcode, ()):
+        start = getattr(d, name)
+        gap = abs(start - d.vs_dst)
+        if 0 < gap < d.n:
+            return (
+                f"{d.opcode.name} {name} at element {start} and vs_dst at {d.vs_dst} "
+                f"overlap over {d.n} elements without being the same range"
+            )
+    return None
+
+
+def sreg_range(d: Descriptor) -> str | None:
+    """The SREG access of ``d`` that leaves the register file, or ``None``.
+
+    A group VQUANT writes ``SREG[sreg_dst .. sreg_dst + ceil(n / vs_aux) - 1]``
+    and every other access is a single register, so every index has to lie
+    below :data:`isa.SREG_COUNT`.  ``isa.vquant`` holds the group form to that
+    where the descriptor is built; this is the same rule on a descriptor from
+    anywhere.  The hardware checks nothing: an index above the file is dropped
+    and counted in ``ERR_BOUNDS``, so a descriptor that breaks the rule loses
+    scales instead of writing them.
+    """
+    top = isa.SREG_COUNT
+    read = -1
+    if d.opcode in (Opcode.GEMV, Opcode.KVWRITE) or (
+        d.opcode == Opcode.VQUANT and d.flags & VquantFlag.USE_TRACKED
+    ):
+        read = d.sreg_src
+    if read >= top:
+        return f"{d.opcode.name} reads SREG[{read}], at or above the {top} the file holds"
+    scales = isa.vquant_scales(d)
+    if d.opcode != Opcode.VQUANT:
+        scales = 1 if (d.track_absmax or d.opcode == Opcode.VSOFTMAX) else 0
+    if scales and d.sreg_dst + scales > top:
+        last = d.sreg_dst + scales - 1
+        span = f"SREG[{d.sreg_dst}..{last}]" if scales > 1 else f"SREG[{d.sreg_dst}]"
+        return f"{d.opcode.name} writes {span}, past the {top} registers the file holds"
+    return None
+
+
+def quant_scale_exponent(d: Descriptor) -> str | None:
+    """The VQUANT scale exponent of ``d`` that leaves the i8 the hardware carries, or ``None``.
+
+    ``numerics.quant`` keeps the exponent of ``Sx`` exact; the SREG word and
+    every descriptor immediate carry it as an i8, and the vector unit's
+    exponent arithmetic wraps there.  The bound depends only on the width, the
+    input class and the ``SCALE_MUL`` constant, so it is settled here rather
+    than left to the data (:func:`numerics.quant_scale_exponents`).
+    """
+    if d.opcode != Opcode.VQUANT:
+        return None
+    flags = VquantFlag(d.flags)
+    width = 8 if flags & VquantFlag.W8 else 16
+    mul = isa.sfloat_from_imm(d.imm32) if flags & VquantFlag.SCALE_MUL else None
+    lo, hi = numerics.quant_scale_exponents(width, d.sh0, mul)
+    if lo < numerics.E8_MIN or hi > numerics.E8_MAX:
+        return (
+            f"VQUANT at vs_src {d.vs_src} writes a scale whose exponent reaches "
+            f"[{lo}, {hi}], outside the i8 [{numerics.E8_MIN}, {numerics.E8_MAX}] "
+            "the SREG word carries"
+        )
+    return None
 
 
 class _Emitter:
@@ -870,6 +958,11 @@ def truncate_layers(model: QuantModel, layers: int) -> QuantModel:
 
 
 def _check_params(model: QuantModel, max_ctx: int, wb: int, vsram_words: int, a_bits: int) -> None:
+    for key, eps_c in sorted(model.eps_c.items()):
+        try:
+            quantize.check_rmsnorm_domain(model.hidden, model.frac["X"], eps_c, model.sqrt_d)
+        except ValueError as exc:
+            raise ValueError(f"compile: eps_c[{key}]: {exc}") from exc
     if model.head_dim != HEAD_DIM:
         raise ValueError(f"compile: head_dim {model.head_dim} is not {HEAD_DIM}")
     if wb <= 0 or wb % 8:
@@ -977,7 +1070,11 @@ def compile(
     ``program.MAX_CTX`` for every ``max_ctx`` (``max_ctx`` sizes the KV region,
     the RoPE rows and the capacity fields), so the golden model's defaults
     reproduce the program.  Raises on any static check: requant windows,
-    VSRAM and SREG fit, region bases, field ranges.
+    VSRAM and SREG fit, region bases, field ranges, the V-op rule that a
+    destination range is the source range or is disjoint from it within one
+    bank (:func:`vector_overlap`), the SREG indices every descriptor reads and
+    writes (:func:`sreg_range`), and the i8 range of every VQUANT scale
+    exponent (:func:`quant_scale_exponent`).
     """
     _check_params(model, max_ctx, wb, vsram_words, a_bits)
     if prompt is not None and spec is None:
@@ -991,9 +1088,18 @@ def compile(
     regions = plan_regions(model, max_ctx, wb)
     by_name = {r.name: r for r in regions}
     decode, prefill = build_programs(model, consts, by_name, vs, sr, max_ctx, a_bits)
-    for d in decode.descs:
+    for d in list(decode.descs) + list(prefill.descs):
         if d.opcode in (Opcode.GEMV, Opcode.EMBED) and d.vs_dst % isa.VSRAM_WORD_ELEMS:
             raise ValueError(f"GEMV output at element {d.vs_dst} is not 8-aligned")
+        overlap = vector_overlap(d)
+        if overlap is not None:
+            raise ValueError(f"compile: {overlap}")
+        scale = quant_scale_exponent(d)
+        if scale is not None:
+            raise ValueError(f"compile: {scale}")
+        sregs = sreg_range(d)
+        if sregs is not None:
+            raise ValueError(f"compile: {sregs}")
     progs = {"prog.decode": isa.assemble(decode.descs), "prog.prefill": isa.assemble(prefill.descs)}
     prog_regions = [
         Region(

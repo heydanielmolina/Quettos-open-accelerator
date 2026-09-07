@@ -45,7 +45,11 @@ class Case:
     name: str
     top: str
     sources: tuple[str, ...]
-    params: dict[str, int] = field(default_factory=dict)
+    # Parameter values as Yosys, Icarus and the generated bench all read them:
+    # an int, or the already-quoted absolute path `rom_image` builds for a ROM
+    # image parameter (`ROM_FILE`, `ROM_FILE_<TABLE>`), which the RTL declares
+    # untyped because Yosys 0.65 rejects `parameter string`.
+    params: dict[str, int | str] = field(default_factory=dict)
     cycles: int = 4000
     reset: str | None = "rst"
     # Verilog driven verbatim on the cycles right after reset, one entry per
@@ -103,6 +107,12 @@ DESC_SHAPE = """
       rv = $random(seed); done_vpu    = (rv % 6) == 0;
       rv = $random(seed); done_kv     = (rv % 6) == 0;
 """
+
+
+def rom_image(table: str) -> str:
+    """The `chparam` / instance value of one ROM_FILE parameter: a quoted image path."""
+    return f'"{REPO / "rtl" / "gen" / f"{table}.hex"}"'
+
 
 CASES: tuple[Case, ...] = (
     Case(
@@ -304,6 +314,173 @@ CASES: tuple[Case, ...] = (
         params={"WB": 16, "FIFO_BEATS": 32, "META_FIFO_BEATS": 8, "MAX_BURST": 8},
         cycles=6000,
     ),
+    # The lookup ROMs carry their contents in the netlist, so the two front ends
+    # have to read the same image out of the same $readmemh: Yosys through
+    # `chparam -set ROM_FILE`, Icarus through the parameter on the instance.
+    # ROM_FILE is listed first because each `chparam` re-elaborates the deferred
+    # module, and the elaboration that loads the image has to have the path.
+    Case(
+        name="lut_rom_exp2",
+        top="qcore_lut_rom",
+        sources=("rtl/qcore_lut_rom.sv",),
+        params={"ROM_FILE": rom_image("exp2"), "ENTRIES": 256},
+        cycles=4000,
+        reset=None,
+        directed=(
+            "en_a = 1'b1; en_b = 1'b1; idx_a = 0; idx_b = 0;",
+            "idx_a = ENTRIES - 1; idx_b = ENTRIES - 1;",
+            "idx_a = 1; idx_b = ENTRIES - 2;",
+            "en_a = 1'b0;",
+            "en_a = 1'b1; idx_a = ENTRIES / 2; idx_b = ENTRIES / 2 - 1;",
+        ),
+    ),
+    Case(
+        name="lut_rom_rsqrt",
+        top="qcore_lut_rom",
+        sources=("rtl/qcore_lut_rom.sv",),
+        params={"ROM_FILE": rom_image("rsqrt"), "ENTRIES": 512},
+        cycles=4000,
+        reset=None,
+        directed=(
+            "en_a = 1'b1; en_b = 1'b1; idx_a = 0; idx_b = 0;",
+            "idx_a = ENTRIES - 1; idx_b = ENTRIES - 1;",
+            # the two sides of the segment boundary in one cycle
+            "idx_a = 255; idx_b = 256;",
+            "en_b = 1'b0;",
+            "en_b = 1'b1; idx_a = ENTRIES / 2; idx_b = ENTRIES / 2 - 1;",
+        ),
+    ),
+    Case(
+        name="lut_interp",
+        top="qcore_lut_interp",
+        sources=("rtl/qcore_lut_interp.sv",),
+        cycles=4000,
+        directed=(
+            "in_valid = 1'b1; v = 16'd32768; dv = 16'd128; frac8 = 8'd0;",
+            "frac8 = 8'd255;",
+            "dv = 16'hffff; frac8 = 8'd129;",
+            "v = 16'hffff; dv = 16'h8000; frac8 = 8'd255;",
+            "v = 16'd0; dv = 16'h7fff; frac8 = 8'd255;",
+            "in_valid = 1'b0;",
+        ),
+    ),
+    # The vector lane takes no parameter, so one case is every configuration of
+    # it. The directed cycles walk the six ops through the operand extremes so
+    # the products, the round-shift and both saturation signs are reached before
+    # the random phases start.
+    Case(
+        name="vpu_lane",
+        top="qcore_vpu_lane",
+        sources=("rtl/qcore_pkg.sv", "rtl/qcore_vpu_lane.sv"),
+        cycles=6000,
+        directed=(
+            "in_valid = 1'b1; op = 3'd0; a = 32'h7fff_ffff; b = 32'h7fff_ffff; sh = 6'd0;",
+            "a = 32'h8000_0000; b = 32'h8000_0000; sh = 6'd63;",
+            "sh = 6'd31;",
+            "op = 3'd1; c = 16'hffff; sh = 6'd15;",
+            "op = 3'd2; c = 16'h8000; c2 = 16'h7fff; sh = 6'd14;",
+            "op = 3'd3;",
+            "op = 3'd4; a = 32'h8000_0000; b = 32'h0000_0001;",
+            "op = 3'd5; a = 32'hffff_ffff;",
+            "op = 3'd6; in_valid = 1'b0;",
+        ),
+        shape=(
+            "rv = $random(seed); in_valid = (rv % 4) != 0;\n"
+            "rv = $random(seed); if (rv % 4) op = rv % 6;\n"
+        ),
+    ),
+    # The scalar unit with the two tables it owns. ROM_FILE_* is listed first for
+    # the same reason as the ROM cases above, and the directed cycles issue one
+    # request of each op so both ports of both ROMs have been read before the
+    # comparison window opens.
+    Case(
+        name="vpu_scalar",
+        top="qcore_vpu_scalar",
+        sources=(
+            "rtl/qcore_pkg.sv",
+            "rtl/qcore_lut_rom.sv",
+            "rtl/qcore_lut_interp.sv",
+            "rtl/qcore_vpu_scalar.sv",
+        ),
+        params={
+            "ROM_FILE_RSQRT": rom_image("rsqrt"),
+            "ROM_FILE_RECIP": rom_image("recip"),
+        },
+        cycles=6000,
+        directed=(
+            "req_valid = 1'b1; req_op = 2'd0; req_x = 64'h0000_0000_0002_0001;"
+            " req_sh0 = 8'd16; req_sh = 6'd3; req_aux_m = 16'h8000; req_aux_e = 8'hf1;",
+            "req_op = 2'd1; req_x = 64'h0000_0000_0000_ffff; req_w8 = 1'b1;",
+            "req_op = 2'd2; req_x = 64'h0000_0010_0000_0000; req_w8 = 1'b0;",
+            "req_op = 2'd1; req_mul_en = 1'b1; req_aux_m = 16'hffff; req_aux_e = 8'd7;",
+            "req_x = 64'd0;",
+            "req_op = 2'd0; req_x = 64'h0001_ffff_ffff_ffff; req_sh0 = 8'd255; req_sh = 6'd0;",
+            "req_op = 2'd0; req_x = 64'h0000_0000_0003_ffff; req_sh0 = 8'd0; req_sh = 6'd63;",
+            "req_valid = 1'b0;",
+        ),
+        shape=(
+            "rv = $random(seed); req_valid = (rv % 4) != 0;\n"
+            "rv = $random(seed); if (rv % 8) req_op = rv % 3;\n"
+            "rv = $random(seed); if (rv % 2) req_x = {rv, $random(seed)} >> (rv % 40);\n"
+        ),
+    ),
+    # The whole vector unit on the tiny configuration, with the lanes, the
+    # scalar unit and the sigmoid tables it contains. ROM_FILE_* comes first for
+    # the reason the ROM cases give, and the shape keeps the descriptors short
+    # and mostly executable so a case reaches its passes, its SREG write and its
+    # event strobes inside the window. v_req_tag is TAG_VPU by construction.
+    Case(
+        name="vpu_top_tiny",
+        top="qcore_vpu_top",
+        sources=(
+            "rtl/qcore_pkg.sv",
+            "rtl/qcore_lut_rom.sv",
+            "rtl/qcore_lut_interp.sv",
+            "rtl/qcore_vpu_lane.sv",
+            "rtl/qcore_vpu_scalar.sv",
+            "rtl/qcore_vpu_top.sv",
+        ),
+        params={
+            "ROM_FILE_SIGMOID": rom_image("sigmoid"),
+            "ROM_FILE_RSQRT": rom_image("rsqrt"),
+            "ROM_FILE_RECIP": rom_image("recip"),
+            "WB": 16,
+            "B_MAX": 2,
+            "VL": 2,
+            "VSRAM_WORDS": 2048,
+            "VPU_FIFO_BEATS": 16,
+            "MAX_BURST": 64,
+        },
+        cycles=8000,
+        constants=("v_req_tag",),
+        directed=(
+            "cmd_op = 8'h21; cmd_n = 24'd12; cmd_vs_src = 16'd8; cmd_vs_dst = 16'd1024;"
+            " cmd_vs_aux = 16'd2048; cmd_rows = 2'b11; cmd_sh0 = 8'd16; cmd_sh1 = 8'd16;"
+            " cmd_sreg_dst = 8'd3; v_req_ready = 1'b1; cmd_valid_vpu = 1'b1;",
+            "cmd_valid_vpu = 1'b0; vsa_rdata = {8{32'h0001_3579}}; vsb_rdata = {8{32'hfffe_0021}};",
+        ),
+        shape=(
+            "rv = $random(seed);\n"
+            "case (rv % 8)\n"
+            "  0, 1: cmd_op = 8'h20;   // VRMSNORM\n"
+            "  2, 3: cmd_op = 8'h21;   // VQUANT\n"
+            "  4, 5: cmd_op = 8'h23;   // VSILUMUL\n"
+            "  6:    cmd_op = 8'h25;   // VSUBC\n"
+            "  default: cmd_op = rv[7:0];\n"
+            "endcase\n"
+            "rv = $random(seed); cmd_valid_vpu = (rv % 24) == 0;\n"
+            "rv = $random(seed); cmd_n    = (rv % 4) ? (rv % 20) : 24'd0;\n"
+            "rv = $random(seed); cmd_vs_src = (rv % 8) ? (rv % 64) : rv[15:0];\n"
+            "rv = $random(seed); cmd_vs_dst = (rv % 8) ? (16'd1024 + rv % 64) : rv[15:0];\n"
+            "rv = $random(seed); cmd_vs_aux = (rv % 8) ? (16'd2048 + rv % 64) : rv[15:0];\n"
+            "rv = $random(seed); cmd_rows = rv % 4;\n"
+            "rv = $random(seed); cmd_sh0  = 8'd13 + (rv % 18);\n"
+            "rv = $random(seed); cmd_sh1  = rv % 96;\n"
+            "rv = $random(seed); cmd_sreg_dst = rv % 40;\n"
+            "rv = $random(seed); v_req_ready = (rv % 4) != 0;\n"
+            "rv = $random(seed); rdv_valid   = (rv % 3) == 0;\n"
+        ),
+    ),
 )
 
 # The four stimulus phases the random body cycles through: (hold %, one %).
@@ -420,7 +597,9 @@ def gen_bench(case: Case, ports: list[tuple[str, str, int]]) -> str:
     n_dir = len(case.directed)
     warmup = RESET_CYCLES + n_dir + SETTLE_CYCLES
 
-    lp = [f"  localparam int {k} = {v};\n" for k, v in case.params.items()]
+    # The integer parameters only: a directed or shape line names them
+    # (`ENTRIES - 1`, `{WB{1'b1}}`), and a ROM image path is not an int.
+    lp = [f"  localparam int {k} = {v};\n" for k, v in case.params.items() if isinstance(v, int)]
     if case.top == "qcore_requant":
         lp.append("  localparam int NVALID_MAX = WB;\n")
 

@@ -6,15 +6,25 @@ Numbers marked **estimate** are analytical projections; `make perf` and
 
 ## Thesis
 
-Agent inference is decode. Published traces of agent workloads put decode at
-91-98.6% of LLM time, prefix-cache hit rates at 85-99%, and typical outputs at
-~200 tokens per step (arXiv 2605.26297, 2606.30560, 2608.15127). The unit of
+Agent inference is decode. Three published trace studies measure the same shape.
+Decode takes 91.0-98.6% of LLM time across their benchmarks and models, prefill
+1.4-9.0% (arXiv 2605.26297, Figure 9). Prefix caching serves about 96% of prompt
+tokens over 4,300 coding-agent sessions (arXiv 2606.30560, Table 11), so what is
+left to compute is the newly appended text and the output -- and the output is
+short, a median of 252 tokens per step for one agent and 184 for the other
+(arXiv 2606.30560, Table 8). Reuse that high belongs to an append-only history:
+an application that reorders or refetches its context at each turn sees prefix
+reuse fall to 1% or below (arXiv 2608.15127, Section 4.2). The unit of
 work is therefore one token for one sequence: a GEMV over ~498 MB of int8
 weights (Qwen2.5-0.5B) with an arithmetic intensity of one MAC per weight byte.
 
-A weight-stationary systolic array is a poor match for that: at batch 1 it is
-roughly 3% utilized because it wants to reuse each weight against many
-activations that do not exist. Quettos Core inverts the roles:
+A weight-stationary systolic array is a poor match for that. It amortizes a
+`K x K` tile of weights over the activation columns that follow it, and shifting
+the next tile in through the array's `K` ports takes `K` cycles; at batch 1
+there is one column per tile, so the array computes in one cycle out of `K + 1`
+-- 3% for a 32 x 32 array, and less as the array grows. It wants to reuse each
+weight against many activations that do not exist. Quettos Core inverts the
+roles:
 
 - every weight byte streams through a `WB`-byte-per-cycle port **exactly once
   per token** and is consumed the cycle it arrives;
@@ -33,13 +43,19 @@ as channels and streams against int16 softmax weights. The row dimension
 keeps it as an RTL parameter proven by a block-level B=2 test; end-to-end
 batched decode is the first roadmap item.
 
+The three studies, in the order they are cited: arXiv 2605.26297, *Agentic AI
+Workload Characteristics*; arXiv 2606.30560, *TraceLab: Characterizing Coding
+Agent Workloads for LLM Serving*; arXiv 2608.15127, *From LLM Inference to
+Agentic Workloads: Characterization and Implications for Serving Systems*.
+
 ## v1 configuration
 
 - `WB=64` lanes, `B_MAX=1` active row (generate-for over rows retained),
   `VL=4` vector lanes, heads processed sequentially, one descriptor in flight
   (fully serialized; cross-op weight prefetch is v1.1).
 - Tiny CI config: `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048`.
-- Simulation fallback: `WB=128`, same RTL, identical tokens (partial last tiles are zero-padded and drained per `docs/ISA.md`).
+- Simulation fallback: `WB=128`, same RTL, identical tokens (partial last tiles
+  are zero-padded and drained per `docs/ISA.md`).
 
 See `rtl/cfg/README.md` for how parameters are passed.
 
@@ -82,20 +98,22 @@ external memory model is also C++ and sits outside the design boundary.
 
 Block labels inside the box are the `qcore_*` modules with the prefix dropped
 for width (`vpu_top` = `qcore_vpu_top`, `mem_arb` = `qcore_mem_arb`, `requant`
-= `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on). The six V
-opcodes run on `qcore_vpu_top`; `qcore_top` wires the GEMV, EMBED and KVWRITE
-units, and a V descriptor stops the program with `STATUS.ERR`,
-`FAULT = OPCODE`, `FAULT_OP` = the opcode byte and `PC` on the descriptor.
+= `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on).
+`qcore_top` wires the GEMV, EMBED, KVWRITE and vector units; `qcore_vpu_top`
+executes VRMSNORM, VQUANT, VSILUMUL and VSUBC, and a VROPE or VSOFTMAX
+descriptor stops the program with `STATUS.ERR`, `FAULT = OPCODE`,
+`FAULT_OP` = the opcode byte and `PC` on the descriptor. The tables follow their
+passes: the unit holds sigmoid, rsqrt and recip, and exp2 arrives with
+VSOFTMAX, the one pass that reads it.
 
-Module list and responsibilities. Thirteen of them are files under `rtl/`,
-each linted as its own top by `make lint`; the vector unit and its lookup-table
-pair land with `qcore_vpu_top`, to the interface `docs/RTL.md` 3.12-3.16
-specifies:
+Module list and responsibilities. The package and its seventeen modules are the
+eighteen files under `rtl/`, each linted as its own top by `make lint`, to the
+interface `docs/RTL.md` section 3 specifies:
 
 | Module | Purpose |
 |---|---|
 | `qcore_pkg` | descriptor field extractors, SREG / sfloat / meta packing, the QMEM read tags, `round_shift` / `sat` / clip functions mirroring `numerics.py` (explicit `qcore_pkg::` scoping only; each module restates the `rtl/qcore_csr_defs.svh` macros it uses) |
-| `qcore_top` | flat QMEM/CSR ports, parameter root, generate-for rows with their VSRAMs, the VSRAM port-B crossbar and the SREG muxes, the beat fan-out and the event adders |
+| `qcore_top` | flat QMEM/CSR ports, parameter root, generate-for rows with their VSRAMs, the VSRAM port-A and port-B crossbars and the SREG muxes, the beat fan-out and the event adders |
 | `qcore_csr` | CTRL/STATUS/PC/ROW_EN/TOK/POS/ARGMAX/PERF halves/SAT+ERR counters |
 | `qcore_seq_fetch` | descriptor fetch, 8-deep queue, step-mode gating, the write fence on new requests |
 | `qcore_seq_dispatch` | decode, POS-derived N/K/len/addresses, in-order issue, auto-fence, busy/retire, stall classification, the program end (HALT, fault, ABORT) |
@@ -105,8 +123,8 @@ specifies:
 | `qcore_mac_lane_group` | 8 lanes of 8w x 16a -> 24-bit product into one 40-bit accumulator per lane (`acc <= prod + (tile_start ? load : acc)`, a DSP48E1 with the P feedback and the C override for the EMBED load) plus a hold set for the finished tile |
 | `qcore_requant` | two-stage sfloat requant, S clamp + ERR, m==0 rule, bias, RMW, sat counters, absmax, argmax, dump, partial-tile drain |
 | `qcore_vsram` | true-dual-port 256-bit RAM wrapper, `verilator public_flat_rd` for zero-cycle dumps |
-| `qcore_vpu_top` / `_lane` / `_scalar` | the six V ops, VL lanes, LOD/sfloat/LUT scalar path — lands with the vector unit |
-| `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation — lands with the vector unit |
+| `qcore_vpu_top` / `_lane` / `_scalar` | VRMSNORM, VQUANT, VSILUMUL and VSUBC over `VL` lanes, with the LOD / sfloat / LUT scalar path and the two-trip lane schedule the two-product passes use |
+| `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation |
 | `qcore_kv_writer` | K^T byte scatter / V tile row / meta writes, issued-write tracking |
 | `qcore_perf` | 16 x 64-bit counters with exclusive stall buckets |
 
@@ -155,10 +173,10 @@ prefill program omits the final norm and LM head, which saves 27.6% of the
 bytes per prompt token on Qwen (LM head share of linear MACs; see
 `MEMORY_MAP.md`).
 
-Prefix reuse (v1, `make demo-toolcall`): the **harness** saves and restores the
-KV region plus `POS` in a WB-independent canonical format
-(`[layer][kvh][token][64]` int8 + scales), re-laid-out on save/restore. This is
-a harness save/restore of the RTL's KV state, not a prefix-caching system in
+Prefix reuse (v1, `make demo-toolcall`): the **harness** copies the KV region
+byte for byte at its image layout, so a saved file belongs to the model and the
+port width that produced it, and the host restores `POS` alongside it. This is a
+harness save and restore of the RTL's KV state, not a prefix-caching system in
 hardware.
 
 ## Host / RTL boundary

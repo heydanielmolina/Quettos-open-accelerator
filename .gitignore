@@ -29,13 +29,10 @@ __pycache__/
 # Yosys / synthesis scratch (reports under syn/reports/ stay tracked)
 *.il.gz
 
-# NOTE: models/ is intentionally tracked (calib.json, layout.json, program.lst,
-# expected_tokens.json, sha256s). Only the downloaded weights and image.bin,
-# which live under build/, are ignored.
+# NOTE: models/ is intentionally tracked (calib.json, quality.json,
+# expected_tokens.json). The downloaded weights, the compiled images and
+# layout.json live under build/ and are ignored.
 
-# editor settings
+# local editor state
 .vscode/
 .idea/
-
-# Claude Code project settings (local tooling)
-.claude/

@@ -6,9 +6,10 @@ weights with sfloat scales grouped as the programs stream them, QKV biases in
 ``FRAC_QKV``, the V bias folded into the ``o_proj`` bias, int16 gammas,
 K-centering rows and the descriptor constants.  The pairwise Q/K smoothing
 factors of ``calib.json`` are folded into ``W_q``/``b_q``, ``W_k``/``b_k`` and
-the K-centering rows before quantization (:func:`smooth_qk`).  :func:`save` and
-:func:`load` round-trip the model through one ``.npz``.  Formats and the fold:
-``docs/NUMERICS.md``.
+the K-centering rows before quantization (:func:`smooth_qk`); ``smoothing=False``
+forces every factor to 1 and builds the K-centering-only ablation from the same
+``calib.json``.  :func:`save` and :func:`load` round-trip the model through one
+``.npz``.  Formats and the fold: ``docs/NUMERICS.md``.
 """
 
 from __future__ import annotations
@@ -29,8 +30,10 @@ from quettos.numerics import SFloat
 from quettos.reference_np import LayerWeights, load_embedding, load_final_norm, load_layer
 
 QUANT_DIR = BUILD_DIR / "quant"
+NOSMOOTH_SUFFIX = "-nosmooth"  # file and quality-row label of the smoothing-free build
 ROW_CHUNK = 4096  # rows quantized per numerics call (bounds the float64 temporaries)
 SIGMOID_MIN_FRAC = 13  # numerics.sigmoid_q15 requirement on FRAC_GU
+XHAT_BITS = 32  # qcore_vpu_lane carries the VRMSNORM intermediate as an int32
 
 
 # --------------------------------------------------------------------------- containers
@@ -206,6 +209,43 @@ def quantize_layer(spec: ModelSpec, w: LayerWeights, frac: dict[str, int]) -> Qu
     )
 
 
+def xhat_bits(hidden: int, frac_x: int) -> int:
+    """Signed bits the VRMSNORM intermediate needs for ``sqrt(d) * 2**FRAC_X * (1 + 2**-13)``.
+
+    ``xhat = round_shift(x * Rc_m, S1)`` is bounded by ``sqrt(d)`` times the
+    scale of its class because ``|x| <= sqrt(sum(x**2))``; the ``2**-13`` covers
+    the rsqrt table, the ``x >> sh`` truncation and the rounding.
+    """
+    bound = math.sqrt(hidden) * 2.0**frac_x * (1.0 + 2.0**-13) + 1.0
+    return int(math.ceil(bound)).bit_length() + 1
+
+
+def check_rmsnorm_domain(hidden: int, frac_x: int, eps_c: int, sqrt_d: SFloat) -> None:
+    """The VRMSNORM intermediate has to fit the int32 the hardware carries it in.
+
+    ``numerics.rmsnorm`` holds ``xhat`` exactly and saturates only ``y``;
+    ``qcore_vpu_lane`` produces it as a lane result, so it is an int32 there and
+    a saturation of it is a ``SAT_VPU`` event.  Two conditions make the two
+    models identical for every vector a program can present: ``xhat`` fits
+    ``XHAT_BITS`` bits, and ``S1`` is non-negative, which holds when
+    ``eps_c >= 2**(2 * (FRAC_X + e_d))`` with ``e_d`` the ``sqrt(d)`` exponent
+    (``docs/NUMERICS.md``, RMSNorm).
+    """
+    bits = xhat_bits(hidden, frac_x)
+    if bits > XHAT_BITS:
+        raise ValueError(
+            f"VRMSNORM xhat needs {bits} signed bits at hidden {hidden} with "
+            f"FRAC_X = {frac_x}; the hardware carries it in {XHAT_BITS}"
+        )
+    floor_bits = 2 * (frac_x + sqrt_d.e)
+    need = 1 << floor_bits if floor_bits > 0 else 1
+    if eps_c < need:
+        raise ValueError(
+            f"VRMSNORM eps_c = {eps_c} is below {need} at FRAC_X = {frac_x} with a "
+            f"sqrt(d) exponent of {sqrt_d.e}; S1 would clamp and ERR_SHIFT would count"
+        )
+
+
 def check_fracs(frac: dict[str, int]) -> None:
     """Constraints the integer operators place on the per-class formats."""
     for cls in ("X", "QKV", "S", "GU", "H", "CTX", "LOGITS"):
@@ -229,17 +269,21 @@ def build_quant_model(
     calib: dict[str, Any] | Path | str,
     *,
     layers: int | None = None,
+    smoothing: bool = True,
 ) -> QuantModel:
     """Quantize ``spec`` with the formats, K-centering rows and smoothing factors of ``calib``.
 
     Every layer's ``W_q``/``b_q`` and ``W_k``/``b_k`` are folded with
     :func:`smooth_qk` and its K-centering row divided by the same per-channel
-    factors before quantization.  ``layers`` keeps only the first ``layers``
+    factors before quantization.  ``smoothing=False`` replaces the validated
+    factors by 1 and changes nothing else -- same ``calib.json``, formats,
+    K-centering rows, class maxima and program constants -- which is the
+    K-centering-only ablation.  ``layers`` keeps only the first ``layers``
     decoder layers (for fast tests); the norm, embedding and constants are
     always produced.  The calibration maxima per class travel with the model in
     ``extra["absmax"]`` so the program constants (:mod:`quettos.program`)
-    derive from the ``.npz`` alone; ``extra["qk_smoothing"]`` records the
-    smoothing rule's ``alpha``, ``cap`` and the factor range.
+    derive from the ``.npz`` alone; ``extra["qk_smoothing"]`` records whether
+    the fold was applied, the rule's ``alpha`` and ``cap`` and the factor range.
     """
     if not isinstance(calib, dict):
         calib = load_calib(calib)
@@ -251,8 +295,13 @@ def build_quant_model(
         raise ValueError(f"calib.json is for {calib['model']['repo_id']}, not {spec.repo_id}")
     frac = {k: int(v) for k, v in calib["frac"].items()}
     check_fracs(frac)
+    eps_c = numerics.eps_const(spec.rms_norm_eps, spec.hidden, frac["X"])
+    sqrt_d = numerics.sfloat_from_float(math.sqrt(spec.hidden))
+    check_rmsnorm_domain(spec.hidden, frac["X"], eps_c, sqrt_d)
     n_layers = spec.layers if layers is None else min(layers, spec.layers)
     factors = smoothing_factors(calib, spec)
+    if not smoothing:
+        factors = np.ones_like(factors)
     h, kv, d = spec.heads, spec.kv_heads, spec.head_dim
 
     q_layers = [
@@ -263,7 +312,6 @@ def build_quant_model(
     if k_center.shape != (n_layers, kv, d):
         raise ValueError(f"calib.json k_center shape {k_center.shape} does not match the model")
     k_center = k_center / pair_to_channels(factors[:n_layers])
-    eps_c = numerics.eps_const(spec.rms_norm_eps, spec.hidden, frac["X"])
     absmax = {k: float(v) for k, v in calib["absmax"].items()}
     return QuantModel(
         name=spec.name,
@@ -280,7 +328,7 @@ def build_quant_model(
         rope_theta=spec.rope_theta,
         frac=frac,
         eps_c={"input": eps_c, "post": eps_c, "final": eps_c},
-        sqrt_d=numerics.sfloat_from_float(math.sqrt(spec.hidden)),
+        sqrt_d=sqrt_d,
         log2e_over_8=numerics.sfloat_from_float(math.log2(math.e) / 8),
         calib_tokens_sha256=str(calib["tokens"]["sha256"]),
         layers=q_layers,
@@ -290,6 +338,7 @@ def build_quant_model(
         extra={
             "absmax": absmax,
             "qk_smoothing": {
+                "enabled": bool(smoothing),
                 "alpha": float(calib["qk_smoothing"]["alpha"]),
                 "cap": float(calib["qk_smoothing"]["cap"]),
                 "factor_min": float(factors.min()),
@@ -365,13 +414,22 @@ def arrays(model: QuantModel) -> dict[str, np.ndarray]:
     return out
 
 
-def default_path(name: str) -> Path:
-    return QUANT_DIR / f"{name}.npz"
+def smoothing_enabled(model: QuantModel) -> bool:
+    """Whether the Q/K smoothing fold was applied when ``model`` was built."""
+    return bool(model.extra.get("qk_smoothing", {}).get("enabled", True))
+
+
+def default_path(name: str, *, smoothing: bool = True) -> Path:
+    """``build/quant/<name>.npz``, or ``<name>-nosmooth.npz`` for the ablation build."""
+    return QUANT_DIR / f"{name}{'' if smoothing else NOSMOOTH_SUFFIX}.npz"
 
 
 def save(model: QuantModel, path: Path | str | None = None) -> Path:
     """Write the model as an uncompressed ``.npz``; returns the path."""
-    path = default_path(model.name) if path is None else Path(path)
+    if path is None:
+        path = default_path(model.name, smoothing=smoothing_enabled(model))
+    else:
+        path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = arrays(model)
     payload["manifest"] = np.array(json.dumps(manifest(model), sort_keys=True))

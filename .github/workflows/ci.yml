@@ -1,8 +1,8 @@
-# Quettos Core CI: three-parser lint and the software tests, the cocotb block
-# tests on the tiny configuration, the bring-up comparison of qcore_top against
-# the ISA simulator, and the per-block synthesis (docs/VERIFICATION.md layer 8).
-# Every job runs on ubuntu-latest with its own timeout; lint-and-pytest gates
-# the other four.
+# Quettos Core CI: three-parser lint, the Python lint and the software tests,
+# the cocotb block tests on the tiny configuration, the bring-up comparison of
+# qcore_top against the ISA simulator, and the per-block synthesis
+# (docs/VERIFICATION.md layer 8). Every job runs on ubuntu-latest with its own
+# timeout; lint-and-pytest gates the other four.
 #
 # Action versions were checked against the upstream repos on 2026-09-02:
 #   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10.0.1 (exact tag; it publishes no floating v10),
@@ -53,19 +53,25 @@ jobs:
           uv --version
 
       # Every rtl/*.sv module and every sim/cocotb/wrappers/*.sv assembly as its
-      # own top: 14 tops, zero warnings, no waivers.
+      # own top: 19 tops, zero warnings, no waivers.
       - name: Lint (three parsers + forbidden-construct greps)
         run: make lint
 
       - name: Sync Python environment (core + dev groups, no torch)
         run: uv sync --frozen --group dev
 
+      # ruff, at the version uv.lock pins, over every .py in the repository:
+      # the rules of [tool.ruff.lint] and the formatting of `ruff format`.
+      - name: Lint and format-check the Python (ruff)
+        run: make style
+
       - name: pytest
         run: uv run pytest -q sw/tests
 
   # cocotb block tests on the tiny configuration (WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048):
   # every rtl/*.sv block and the assembled GEMV path, built with Verilator through
-  # cocotb's runner (make cocotb). A clean build and run takes under a minute locally.
+  # cocotb's runner (make cocotb). sim/cocotb/README.md holds the local wall
+  # clock of a clean build and run.
   # Build products are keyed by top, sources and parameters, so the two seq_fetch
   # width settings do not share object files.
   cocotb-units:
@@ -113,7 +119,8 @@ jobs:
 
   # Gate-level equivalence (docs/VERIFICATION.md layer 1): every block's Yosys
   # netlist against the SystemVerilog it came from, driven by one bench and
-  # compared every cycle. 13 configurations of 10 blocks, about a minute locally.
+  # compared every cycle. 19 configurations of 15 blocks; sim/gatesim/README.md
+  # holds the local wall clock.
   gatesim:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -137,10 +144,12 @@ jobs:
         run: make gatesim
 
   # qcore_top against sw/quettos/isa_sim.py on the tiny configuration (WB=16,
-  # B_MAX=2, VSRAM_WORDS=2048): the three-descriptor bring-up program of
-  # docs/ISA.md over random tiny models, every VSRAM element, SREG word, dumped
-  # logit, CSR and PERF counter compared, at LAT 1 / 32 / 200 and --bw-div 2.
-  # Locally the whole target is 3.2 s from a cold Verilator build.
+  # B_MAX=2, VL=2, VSRAM_WORDS=2048): the four-descriptor bring-up program of
+  # docs/ISA.md and its directed vector program over random tiny models, every
+  # VSRAM element, SREG word, dumped logit, CSR and PERF counter compared, at
+  # LAT 1 / 32 / 200 and --bw-div 2.
+  # docs/PERFORMANCE.md holds the local wall clock of this target from a cold
+  # Verilator build.
   bringup-tiny:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -160,11 +169,12 @@ jobs:
           version: ${{ env.OSS_CAD_SUITE_VERSION }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       # The object directory is named after a hash of rtl/*.sv, rtl/*.svh, the
-      # C++ and the configuration, so a stale entry is simply not used.
+      # lookup-table images, the C++ and the configuration, so a stale entry is
+      # simply not used.
       - uses: actions/cache@v6
         with:
           path: build/verilator
-          key: verilator-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}-${{ hashFiles('rtl/**/*.sv', 'rtl/**/*.svh', 'sim/verilator/**') }}
+          key: verilator-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}-${{ hashFiles('rtl/**/*.sv', 'rtl/**/*.svh', 'rtl/gen/*.hex', 'sim/verilator/**') }}
       - run: uv sync --frozen
       - name: CSR driver against rtl/qcore_csr.sv
         run: make harness-csr

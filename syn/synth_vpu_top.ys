@@ -1,0 +1,33 @@
+# Yosys synth_xilinx (xc7) of qcore_vpu_top with the lanes, the scalar unit and
+# the lookup tables it contains, in both RTL configurations. VL is the number of
+# qcore_vpu_lane instances and of sigmoid interpolators, WB the beat width of the
+# QMEM operand FIFO, B_MAX the rows a descriptor may name, VSRAM_WORDS the width
+# of the VSRAM word addresses, VPU_FIFO_BEATS the depth of that FIFO and
+# MAX_BURST the cap on a burst. ROM_FILE_SIGMOID, ROM_FILE_RSQRT and
+# ROM_FILE_RECIP are the images $readmemh loads into the qcore_lut_rom
+# instances; Yosys 0.65 resolves $readmemh while it reads a module, so
+# `read_verilog -defer` holds the modules unelaborated and `chparam` supplies
+# every parameter, the three paths first, before `hierarchy` propagates them.
+# The paths are relative to the repo root, which is where the script runs.
+# Run from the repo root:
+#   mkdir -p build/synth && yosys -q -l build/synth/synth_vpu_top.log -s syn/synth_vpu_top.ys
+# syn/report.ys prints, for each configuration, the cell table, the longest
+# topological path and the hard-block instances that scripts/synth_report.py
+# turns into syn/reports/qcore_vpu_top.md.
+
+# ---- demo: WB = 64, B_MAX = 1, VL = 4, VSRAM_WORDS = 4096
+log ==== qreport config demo
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_lut_rom.sv rtl/qcore_lut_interp.sv rtl/qcore_vpu_lane.sv rtl/qcore_vpu_scalar.sv rtl/qcore_vpu_top.sv
+chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 64 -set B_MAX 1 -set VL 4 -set VSRAM_WORDS 4096 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
+hierarchy -check -top qcore_vpu_top
+synth_xilinx -family xc7 -flatten -top qcore_vpu_top
+script syn/report.ys
+
+# ---- tiny: WB = 16, B_MAX = 2, VL = 2, VSRAM_WORDS = 2048
+design -reset
+log ==== qreport config tiny
+read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_lut_rom.sv rtl/qcore_lut_interp.sv rtl/qcore_vpu_lane.sv rtl/qcore_vpu_scalar.sv rtl/qcore_vpu_top.sv
+chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 16 -set B_MAX 2 -set VL 2 -set VSRAM_WORDS 2048 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
+hierarchy -check -top qcore_vpu_top
+synth_xilinx -family xc7 -flatten -top qcore_vpu_top
+script syn/report.ys

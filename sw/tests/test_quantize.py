@@ -1,5 +1,6 @@
 """Quantizer and calibration file: exactness of every integer against the numerics primitives,
-and the pairwise Q/K smoothing (factor rule, fold exactness, K-centering consistency)."""
+the pairwise Q/K smoothing (factor rule, fold exactness, K-centering consistency) and the
+K-centering-only build the fold is measured against."""
 
 from __future__ import annotations
 
@@ -321,11 +322,68 @@ def test_k_center(
     want = numerics.to_fixed(rows[:TEST_LAYERS] / per_channel, qmodel.frac["QKV"])
     assert np.array_equal(qmodel.k_center, want)
     assert qmodel.extra["qk_smoothing"] == {
+        "enabled": True,
         "alpha": calib["qk_smoothing"]["alpha"],
         "cap": calib["qk_smoothing"]["cap"],
         "factor_min": float(factors.min()),
         "factor_max": float(factors.max()),
     }
+
+
+def test_nosmooth_build_is_the_same_model_with_every_factor_one(
+    spec: ModelSpec,
+    calib: dict,
+    qmodel: quantize.QuantModel,
+    layer0: LayerWeights,
+    tmp_path: Path,
+) -> None:
+    """``smoothing=False``: raw Q/K rows and centering rows, everything else the shipped build."""
+    plain = quantize.build_quant_model(spec, calib, layers=TEST_LAYERS, smoothing=False)
+    assert quantize.smoothing_enabled(qmodel) and not quantize.smoothing_enabled(plain)
+    assert plain.extra["qk_smoothing"] == {
+        "enabled": False,
+        "alpha": calib["qk_smoothing"]["alpha"],
+        "cap": calib["qk_smoothing"]["cap"],
+        "factor_min": 1.0,
+        "factor_max": 1.0,
+    }
+    # Q, K and the centering rows are the unsmoothed ones; V, o, the MLP and the
+    # embedding are what they are in the shipped build, which the fold never touches.
+    _check_int8_rows(
+        plain.layers[0].wqkv, np.concatenate([layer0.wq, layer0.wk, layer0.wv], axis=0)
+    )
+    rows = np.asarray(calib["k_center"], dtype=np.float64)[:TEST_LAYERS]
+    assert np.array_equal(plain.k_center, numerics.to_fixed(rows, plain.frac["QKV"]))
+    for name in ("wo", "wgu", "wdown"):
+        a, b = getattr(plain.layers[0], name), getattr(qmodel.layers[0], name)
+        assert np.array_equal(a.q, b.q) and np.array_equal(a.bias_q, b.bias_q), name
+    assert np.array_equal(plain.embed.q, qmodel.embed.q)
+    if spec.has_qkv_bias:
+        h, kv, d = spec.heads, spec.kv_heads, spec.head_dim
+        bias = np.concatenate([layer0.bq, layer0.bk])
+        assert np.array_equal(
+            plain.layers[0].wqkv.bias_q[: (h + kv) * d],
+            numerics.to_fixed(bias, plain.frac["QKV"]),
+        )
+    # same calibration, formats, constants and program inputs: only the fold differs
+    assert (plain.frac, plain.eps_c, plain.sqrt_d, plain.log2e_over_8) == (
+        qmodel.frac,
+        qmodel.eps_c,
+        qmodel.sqrt_d,
+        qmodel.log2e_over_8,
+    )
+    assert plain.extra["absmax"] == qmodel.extra["absmax"]
+    assert plain.calib_tokens_sha256 == qmodel.calib_tokens_sha256
+    assert not quantize.models_equal(plain, qmodel)
+    again = quantize.build_quant_model(spec, calib, layers=TEST_LAYERS, smoothing=False)
+    assert quantize.models_equal(plain, again)
+    # the build travels through the .npz, and each build has its own default file
+    back = quantize.load(quantize.save(plain, tmp_path / "nosmooth.npz"))
+    assert quantize.models_equal(plain, back) and not quantize.smoothing_enabled(back)
+    assert quantize.default_path(spec.name, smoothing=False) == (
+        quantize.QUANT_DIR / f"{spec.name}{quantize.NOSMOOTH_SUFFIX}.npz"
+    )
+    assert quantize.default_path(spec.name) == quantize.QUANT_DIR / f"{spec.name}.npz"
 
 
 # --------------------------------------------------------------------------- the rest
@@ -508,3 +566,97 @@ def test_recalibration_matches_checked_in_file(spec: ModelSpec) -> None:
     assert fresh["tokens"] == stored["tokens"]
     assert fresh["v_scale_spread"] == stored["v_scale_spread"]
     assert _close(fresh, stored), "calibration drifted from the checked-in file"
+
+
+# ------------------------------------------------------------------ the VRMSNORM domain
+
+
+def _xhat(x: np.ndarray, frac_x: int, sqrt_d: numerics.SFloat, eps_c: int, tables) -> np.ndarray:
+    """``xhat = round_shift(x * Rc_m, S1)`` of :func:`numerics.rmsnorm`, before gamma."""
+    amax = numerics.absmax(x)
+    sh = max(0, numerics.bitlen(amax) - 15)
+    xs = x >> sh
+    ss2 = int(np.sum(xs * xs)) + (eps_c >> (2 * sh))
+    if ss2 <= 0:
+        return np.zeros_like(x)
+    length = numerics.bitlen(ss2)
+    e2 = length - 1 if (length - 1) % 2 == 0 else length - 2
+    m_q16 = ss2 >> (e2 - 16) if e2 >= 16 else ss2 << (16 - e2)
+    rc = numerics.sfloat_mul(
+        numerics.sfloat_from_int(numerics.rsqrt_q15(m_q16, tables), -15), sqrt_d
+    )
+    s1 = -(rc.e + frac_x - sh - e2 // 2)
+    assert s1 >= 0, f"S1 = {s1} clamped: the checked epsilon floor does not hold"
+    return numerics.round_shift(x * rc.m, s1)
+
+
+@pytest.mark.parametrize("hidden", [64, 192, 576, 896, 4096, 8192])
+@pytest.mark.parametrize("frac_x", [10, 14, 16])
+def test_rmsnorm_xhat_stays_inside_the_checked_domain(hidden: int, frac_x: int) -> None:
+    """The bound :func:`quantize.xhat_bits` checks is a bound on the values themselves.
+
+    The hardware carries ``xhat`` as an int32 lane result, so the check has to
+    cover every vector, not the typical one: a single non-zero element makes
+    ``|x| / sqrt(sum(x**2))`` exactly 1 and drives ``xhat`` to the bound.
+    """
+    tables = numerics.load_tables()
+    sqrt_d = numerics.sfloat_from_float(math.sqrt(hidden))
+    eps_c = numerics.eps_const(1e-6, hidden, frac_x)
+    quantize.check_rmsnorm_domain(hidden, frac_x, eps_c, sqrt_d)
+    bound = 1 << (quantize.xhat_bits(hidden, frac_x) - 1)
+    assert bound <= 1 << (quantize.XHAT_BITS - 1)
+
+    rng = np.random.default_rng(hidden * 131 + frac_x)
+    lim = (1 << 31) - 1
+    vectors = [
+        np.array([lim] + [0] * (hidden - 1), dtype=np.int64),
+        np.array([-(1 << 31)] + [0] * (hidden - 1), dtype=np.int64),
+        np.array([1] + [0] * (hidden - 1), dtype=np.int64),
+        np.array([lim, -(1 << 31)] + [0] * (hidden - 2), dtype=np.int64),
+        np.full(hidden, lim, dtype=np.int64),
+        np.full(hidden, 1, dtype=np.int64),
+    ]
+    for bits in (4, 12, 20, 31):
+        v = rng.integers(-(1 << bits), 1 << bits, size=hidden, dtype=np.int64)
+        v[0] = lim  # one outlier channel over a small background, the residual's shape
+        vectors.append(v)
+    for x in vectors:
+        big = int(np.max(np.abs(_xhat(x, frac_x, sqrt_d, eps_c, tables))))
+        assert big <= bound, (hidden, frac_x, big, bound)
+        stats = numerics.Stats()
+        numerics.rmsnorm(
+            x, np.ones(hidden, dtype=np.int64), 0, eps_c, sqrt_d, frac_x, tables, stats
+        )
+        assert stats.err_shift == 0, (hidden, frac_x)
+
+
+def test_rmsnorm_domain_rejects_a_format_that_leaves_int32() -> None:
+    """A FRAC_X one step past the domain is refused where the model is built."""
+    hidden = 896
+    sqrt_d = numerics.sfloat_from_float(math.sqrt(hidden))
+    ok = max(f for f in range(31) if quantize.xhat_bits(hidden, f) <= quantize.XHAT_BITS)
+    quantize.check_rmsnorm_domain(hidden, ok, numerics.eps_const(1e-6, hidden, ok), sqrt_d)
+    with pytest.raises(ValueError, match="xhat"):
+        quantize.check_rmsnorm_domain(
+            hidden, ok + 1, numerics.eps_const(1e-6, hidden, ok + 1), sqrt_d
+        )
+
+
+def test_rmsnorm_domain_rejects_an_epsilon_that_clamps_s1() -> None:
+    """``eps_c`` below ``2**(2 (FRAC_X + e_d))`` lets S1 clamp, which unbounds ``xhat``."""
+    hidden, frac_x = 896, 16
+    sqrt_d = numerics.sfloat_from_float(math.sqrt(hidden))
+    need = 1 << (2 * (frac_x + sqrt_d.e))
+    quantize.check_rmsnorm_domain(hidden, frac_x, need, sqrt_d)
+    with pytest.raises(ValueError, match="eps_c"):
+        quantize.check_rmsnorm_domain(hidden, frac_x, need - 1, sqrt_d)
+    with pytest.raises(ValueError, match="eps_c"):
+        quantize.check_rmsnorm_domain(hidden, frac_x, 0, sqrt_d)
+
+
+def test_build_rejects_a_calibration_outside_the_domain(spec: ModelSpec, calib: dict) -> None:
+    """The quantizer refuses a ``calib.json`` whose FRAC_X puts xhat past int32."""
+    bad = json.loads(json.dumps(calib))
+    bad["frac"]["X"] = max(f for f in range(31) if quantize.xhat_bits(spec.hidden, f) <= 32) + 1
+    with pytest.raises(ValueError, match="xhat"):
+        quantize.build_quant_model(spec, bad, layers=1)

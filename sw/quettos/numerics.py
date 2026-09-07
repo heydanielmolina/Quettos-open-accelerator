@@ -28,6 +28,8 @@ LUTS_JSON = TABLES_DIR / "luts.json"
 I16_MAX = (1 << 15) - 1
 I32_MAX = (1 << 31) - 1
 Q15_ONE = 1 << 15  # 1.0 in Q1.15
+SHIFT_MAX = 63  # the widest shift a descriptor field carries and the datapath performs
+E8_MIN, E8_MAX = -128, 127  # an sfloat exponent is an i8 in a descriptor and in an SREG word
 
 # --------------------------------------------------------------------------- primitives
 
@@ -79,7 +81,7 @@ class Stats:
     """Event counters mirrored by the hardware ``SAT_*`` / ``ERR_*`` CSRs."""
 
     sat: int = 0  # saturations at sat40/sat32 points
-    err_shift: int = 0  # requant shift outside [0, 63] (must stay 0 on correct programs)
+    err_shift: int = 0  # a shift clamped into [0, SHIFT_MAX] (0 on a correct program)
     clip: int = 0  # VQUANT clips at +-(2**(w-1)-1): expected, not a fault
 
     def __add__(self, other: Stats) -> Stats:
@@ -160,14 +162,25 @@ def sfloat_from_float(x: float) -> SFloat:
     return SFloat(m, e)
 
 
+# What sfloat_mul adds to the sum of the exponents.  15, or 16 when the mantissa
+# product reaches 2**31 or its rounding overflows to 2**16 -- never both, so
+# never 17: p <= (2**16 - 1)**2 = 2**32 - 2**17 + 1 is below the 2**32 - 2**15
+# that round_shift(p, 16) needs to overflow, so the 2**31 branch always rounds
+# to 65534 or less.
+SFLOAT_MUL_E_MIN = 15
+SFLOAT_MUL_E_MAX = 16
+
+
 def sfloat_mul(a: SFloat, b: SFloat) -> SFloat:
     """Product of two sfloats, rounded once to a 16-bit mantissa.
 
     ``p = m_a * m_b`` lies in ``[2**30, 2**32)``.  If ``p >= 2**31`` the
     mantissa is ``round_shift(p, 16)`` with exponent ``e_a + e_b + 16``,
     otherwise ``round_shift(p, 15)`` with exponent ``e_a + e_b + 15``.  A
-    rounding overflow to ``2**16`` becomes ``{2**15, e + 1}``.  Zero times
-    anything is the canonical zero.  The result mantissa is always in range.
+    rounding overflow to ``2**16`` becomes ``{2**15, e + 1}``, which only the
+    second branch reaches, so the exponent gain is ``SFLOAT_MUL_E_MIN`` or
+    ``SFLOAT_MUL_E_MAX``.  Zero times anything is the canonical zero.  The
+    result mantissa is always in range.
     """
     if a.is_zero or b.is_zero:
         return SFLOAT_ZERO
@@ -349,10 +362,10 @@ def requant(
     else:
         t = sat(round_shift(acc * sw.m, s1), 40, stats)
         shift = sbias - (sw.e + sx.e)
-        if shift < 0 or shift > 63:
+        if shift < 0 or shift > SHIFT_MAX:
             if stats is not None:
                 stats.err_shift += int(np.size(acc))
-            shift = min(max(shift, 0), 63)
+            shift = min(max(shift, 0), SHIFT_MAX)
         y = sat(round_shift(t * sx.m, shift), 32, stats)
     if bias_q:
         y = sat(y + bias_q, 32, stats)
@@ -441,8 +454,12 @@ def quant(
     spans the two-level margin, so roughly one vector in four clips its absmax
     element by one level (harmless, counted in ``stats.clip``).  A zero vector
     gives ``q = 0`` and the canonical zero scale.  ``scale_mul`` (a descriptor
-    sfloat constant, e.g. ``log2(e)/8`` for q) multiplies the scale.  Widths:
-    ``x`` is int32, ``inv`` 16-bit, product 47 bits.
+    sfloat constant, e.g. ``log2(e)/8`` for q) multiplies the scale; the
+    exponent that comes out has to fit the i8 the hardware carries, which
+    :func:`quant_scale_exponents` bounds from the descriptor fields alone.
+    Widths: ``x`` is int32, ``inv`` 16-bit, product 47 bits, and the shift
+    ``31 + e_a - w`` lies in ``[1, 40]``, inside the ``[0, 63]`` the hardware
+    clamps to.
     """
     if width not in (8, 16):
         raise ValueError("quant: width must be 8 or 16")
@@ -463,6 +480,38 @@ def quant(
     if scale_mul is not None:
         sx = sfloat_mul(sx, scale_mul)
     return q, sx
+
+
+# The exponents a VQUANT scale can reach.  ``a`` is a u32 magnitude -- an int32
+# absmax, or the tracked absmax an SREG word holds -- so
+# ``a_eff = a + (a >> (w-1)) + 1`` lies in ``[2, 2**33)`` and
+# ``e_a = bitlen(a_eff) - 16`` in ``[-14, 17]`` for every input and both widths.
+QUANT_E_A_MIN = -14
+QUANT_E_A_MAX = 17
+
+
+def quant_scale_exponents(
+    width: int, frac_in: int, scale_mul: SFloat | None = None
+) -> tuple[int, int]:
+    """Smallest and largest exponent :func:`quant` can produce for these descriptor fields.
+
+    ``Sx = {a_hi, e_a - (w-1) - frac_in}`` over every reachable ``e_a``, then
+    :func:`sfloat_mul` with ``scale_mul``, which adds between
+    ``SFLOAT_MUL_E_MIN`` and ``SFLOAT_MUL_E_MAX`` to the exponent.  The bounds
+    hold for any input vector, so a descriptor can be held to them before it
+    runs: the hardware carries the exponent as an i8 in the descriptor and in
+    the SREG word it writes, and a scale outside ``[E8_MIN, E8_MAX]`` wraps
+    there while this module keeps it exact.  ``isa.vquant`` and the compiler
+    refuse such a descriptor.
+    """
+    if width not in (8, 16):
+        raise ValueError("quant_scale_exponents: width must be 8 or 16")
+    lo = QUANT_E_A_MIN - (width - 1) - frac_in
+    hi = QUANT_E_A_MAX - (width - 1) - frac_in
+    if scale_mul is not None and not scale_mul.is_zero:
+        lo += scale_mul.e + SFLOAT_MUL_E_MIN
+        hi += scale_mul.e + SFLOAT_MUL_E_MAX
+    return lo, hi
 
 
 def quant_groups(
@@ -531,7 +580,7 @@ def rmsnorm(
     ::
 
         amax = absmax(x);  sh = max(0, bitlen(amax) - 15)
-        ss   = sum((x >> sh)**2)                      # <= 48 bits
+        ss   = sum((x >> sh)**2)   # each square <= 2**30: 30 + ceil(log2 n) bits, 54 at n = 2**24
         ss'  = ss + (eps_c >> 2*sh)         # (mean(x^2) + eps) * d * 2**(2*FRAC_X - 2*sh)
         ss'  = m * 2**(2e) with m in [1, 4):  L = bitlen(ss'), 2e = L-1 if L odd else L-2
         R    = rsqrt_q15(m)                            # 1/sqrt(m) in Q1.15
@@ -545,9 +594,10 @@ def rmsnorm(
     ``S1`` is computed from data; it is non-negative whenever
     ``eps_c >= 2**(2 * (FRAC_X + e_d))`` with ``e_d = floor(log2(sqrt(d))) - 15``
     (``2**10`` for ``FRAC_X = 16`` and ``512 <= d < 1024``; both supported
-    models use ``eps_c > 1.5e6``).  If a
-    program still produces ``S1 < 0`` the shift is clamped to 0 and counted in
-    ``err_shift``, mirroring the requant clamp.  ``|xhat|`` is bounded by
+    models use ``eps_c > 1.5e6``).  ``S1`` is the shift a 6-bit field carries,
+    so a program that produces one outside ``[0, 63]`` gets it clamped into
+    that range with one ``err_shift`` per element, at either end and exactly as
+    the requant clamp and ``qcore_vpu_scalar`` do.  ``|xhat|`` is bounded by
     ``sqrt(d) * 2**FRAC_X * (1 + 2**-13)`` (21 bits at ``d = 896``,
     ``FRAC_X = 16``); ``xhat * gamma_q`` fits 37 bits.
     """
@@ -565,10 +615,10 @@ def rmsnorm(
     r = rsqrt_q15(m_q16, tables)
     rc = sfloat_mul(sfloat_from_int(r, -15), sqrt_d)
     s1 = -(rc.e + frac_x - sh - e)
-    if s1 < 0:
+    if s1 < 0 or s1 > SHIFT_MAX:
         if stats is not None:
             stats.err_shift += int(x.size)
-        s1 = 0
+        s1 = min(max(s1, 0), SHIFT_MAX)
     xhat = round_shift(x * rc.m, s1)
     g_shift = -gamma_e
     if g_shift < 0:
@@ -675,7 +725,9 @@ def softmax(
     part in ``e_max``.  Widths: ``m - s_t`` needs a 33-bit signed subtraction
     before the clamp, ``n <= 25``, ``e_t * inv`` fits 39 bits, ``p_t * Sv_m``
     fits 39 bits, and the per-token ``w`` shift lies in ``[24, 54]`` for real V
-    scales.
+    scales.  The largest score always contributes ``2**23`` to ``total`` and
+    ``length < 2**24``, so ``7 + e_s`` lies in ``[15, 38]``, inside the
+    ``[0, 63]`` the hardware clamps a shift to.
     """
     if length < 1 or length > scores.size or len(v_scales) < length:
         raise ValueError("softmax: bad length")
@@ -845,8 +897,8 @@ def requant_rows(
 
     shift = np.broadcast_to(sbias - (swe + sxe), acc.shape)
     if stats is not None:
-        stats.err_shift += int(np.count_nonzero(((shift < 0) | (shift > 63)) & nz))
-    shift = np.clip(shift, 0, 63)
+        stats.err_shift += int(np.count_nonzero(((shift < 0) | (shift > SHIFT_MAX)) & nz))
+    shift = np.clip(shift, 0, SHIFT_MAX)
     half = np.where(shift > 0, np.left_shift(np.int64(1), np.maximum(shift - 1, 0)), 0)
     y = (t * sxm + half) >> shift
 

@@ -35,17 +35,19 @@ std::vector<int64_t> read_prompt(const std::string& path) {
   return ids;
 }
 
-// A vector opcode has no unit in this build, so qcore_top stops the program on
-// one. --traffic rewrites them to NOP first: the GEMV, EMBED and KVWRITE
-// descriptors then run over the real addresses, strides, meta and partial
-// tiles, which is what a traffic and cycle measurement needs. The values the
-// program computes are not meaningful and are not checked.
+// VROPE and VSOFTMAX name passes qcore_vpu_top does not carry, so qcore_top
+// stops the program on one. --traffic rewrites those two to NOP first; every
+// other descriptor, the four vector opcodes included, then runs over the real
+// addresses, strides, meta and partial tiles, which is what a traffic and cycle
+// measurement needs. The values the program computes are not meaningful once
+// two of its passes are missing, and they are not checked.
+bool has_no_unit(uint32_t op) { return op == OP_VROPE || op == OP_VSOFTMAX; }
+
 uint64_t nop_out_vector_ops(MemBytes* bytes, const Program& p) {
   static_assert(DESC_OPCODE_LSB == 0 && DESC_OPCODE_W == 8, "the opcode is byte 0");
   uint64_t count = 0;
   for (uint32_t off = 0; off + DESC_BYTES <= p.size; off += DESC_BYTES) {
-    uint32_t op = bytes->read_byte(p.addr + off);
-    if (op >= OP_VRMSNORM && op <= OP_VSUBC) {
+    if (has_no_unit(bytes->read_byte(p.addr + off))) {
       bytes->write_byte(p.addr + off, static_cast<uint8_t>(OP_NOP));
       count++;
     }
@@ -438,8 +440,9 @@ int main_impl(int argc, char** argv) {
     marks.rewritten =
         nop_out_vector_ops(&bytes, layout.decode) + nop_out_vector_ops(&bytes, layout.prefill);
     o.allow_sat = true;
-    printf("traffic measurement: %llu vector descriptors rewritten to NOP; the addresses, "
-           "strides, tiles and counters are the program's, the values are not checked\n",
+    printf("traffic measurement: %llu VROPE / VSOFTMAX descriptors rewritten to NOP; every "
+           "other descriptor runs, and the addresses, strides, tiles and counters are the "
+           "program's, the values are not checked\n",
            (unsigned long long)marks.rewritten);
   }
 
@@ -562,8 +565,9 @@ int main_impl(int argc, char** argv) {
   } else if (!run.ok) {
     Status s = m.status();
     marks.set_stop("a descriptor faulted", s, m.read(CSR_PC));
-    printf("stopped: descriptor at PC=0x%08x faulted; %s carries no vector unit, so a vector "
-           "opcode ends the program (--traffic runs the rest as a traffic measurement)\n",
+    printf("stopped: descriptor at PC=0x%08x faulted; %s has no VROPE or VSOFTMAX pass, so "
+           "either opcode ends the program (--traffic runs the rest as a traffic "
+           "measurement)\n",
            marks.pc, Build::top);
     printf("%s PC=0x%08x\n", s.text().c_str(), marks.pc);
     rc = 2;

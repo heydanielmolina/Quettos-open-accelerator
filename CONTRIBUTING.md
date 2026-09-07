@@ -12,8 +12,8 @@ README can be traced to a command that produced it.
   the change (the commands, verbatim).
 - Commit messages: a short imperative subject line (under 72 characters), a
   blank line, then the why. One logical change per commit.
-- CI must be green (`make lint`, `uv run pytest -q sw/tests`, and the RTL jobs)
-  before a PR is reviewed.
+- CI must be green (`make lint`, `make style`, `uv run pytest -q sw/tests`, and
+  the RTL jobs) before a PR is reviewed.
 - Never commit anything under `build/`. Model weights are downloaded at build
   time and are not redistributed (see `NOTICE`).
 
@@ -50,11 +50,13 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 - Memories as **1-D unpacked arrays of packed words** (`logic [255:0] mem
   [0:VSRAM_WORDS-1]`) with **registered reads** (read address or read data
   goes through a flop) and separate `always_ff` read and write processes.
-- ROM initialization only through an untyped `parameter ROM_FILE = ""`
-  (Yosys 0.65 rejects `parameter string`), set to an **absolute path** by the
-  Makefile / `.ys` script: `$readmemh(ROM_FILE, mem);`. Yosys resolves
-  `$readmemh` while reading, so the script uses `read_verilog -sv -defer`
-  followed by `chparam -set ROM_FILE "<abs path>" <module>` before `hierarchy`.
+- ROM initialization only through an untyped `parameter ROM_FILE = ""` (or
+  `ROM_FILE_<TABLE>` where a module holds several; Yosys 0.65 rejects
+  `parameter string`), set to an **absolute path** by the Makefile / `.ys`
+  script: `$readmemh(ROM_FILE, mem);`. Yosys resolves `$readmemh` while
+  reading, so the script uses `read_verilog -sv -defer` followed by `chparam
+  -set ROM_FILE "<abs path>" <module>` before `hierarchy`, with the image paths
+  ahead of any other `-set` in that `chparam`.
 - ISA constants (opcodes, flag masks, descriptor field positions, CSR offsets,
   PERF indices) come from the generated include `rtl/qcore_csr_defs.svh`
   (`uv run quettos csr-defs`), which defines one `` `define QCORE_<NAME> ``
@@ -98,23 +100,34 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   localparams, one module per file, file name equals module name.
 - Every module header comment states the module's contract in a few lines:
   inputs, outputs, latency, and what it does not do.
-- Keep modules small enough to lint individually. No file over ~1,000 lines.
+- Keep modules small enough to lint individually. A file over 1,000 lines needs
+  a header comment giving the reason the module does not split, and one file
+  carries such a note: `rtl/qcore_vpu_top.sv`, whose passes are stages of one
+  shift register, so a boundary drawn through them would carry the stage indices
+  across it and put the issue decision on a combinational round trip through an
+  interface -- the shape the handshake rules of `docs/RTL.md` section 1 exist to
+  keep out. Without a reason of that kind, split the module.
 
 ## 4. Three-parser lint recipe
 
 `make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` module and
-every `sim/cocotb/wrappers/*.sv` block assembly as its own top (`qcore_pkg.sv`
-always first on the command line, since Yosys and Icarus resolve `qcore_pkg::`
-references only after parsing the package):
+every `sim/cocotb/wrappers/*.sv` block assembly as its own top. The file list is
+`qcore_pkg.sv` first and then every other file once: Yosys and Icarus resolve
+`qcore_pkg::` references only after parsing the package, and a file named twice
+is a duplicate declaration (Verilator `MODDUP`, an Icarus syntax error).
 
 ```sh
-verilator --lint-only -Wall -Wpedantic -Irtl --top-module <mod> rtl/qcore_pkg.sv rtl/*.sv [sim/cocotb/wrappers/*.sv]
-yosys -q -p "read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/*.sv [...]; hierarchy -check -top <mod>; proc; opt; check -assert"
-iverilog -g2012 -Irtl -s <mod> -o /dev/null rtl/qcore_pkg.sv rtl/*.sv [...]
+SV="rtl/qcore_pkg.sv $(ls rtl/*.sv | grep -v qcore_pkg.sv | tr '\n' ' ')"
+verilator --lint-only -Wall -Wpedantic -Irtl --top-module <mod> $SV [sim/cocotb/wrappers/*.sv]
+yosys -q -p "read_verilog -sv -defer -Irtl $SV [...]; hierarchy -check -top <mod>; proc; opt; check -assert"
+iverilog -g2012 -Irtl -s <mod> -o /dev/null $SV [...]
 ```
 
 A wrapper top is elaborated with the `rtl/*.sv` files plus the wrappers on the
-command line; a module top is elaborated with the `rtl/*.sv` files alone. The
+command line; a module top is elaborated with the `rtl/*.sv` files alone. A top
+that declares a `ROM_FILE*` parameter also takes its image path -- `-G` for
+Verilator, a `chparam -set ... <mod>;` ahead of `hierarchy` for Yosys,
+`-P<mod>.<param>` for Icarus (`rtl/cfg/README.md`). The
 forbidden-construct greps cover both directories. Two of them are heuristics
 with a comment in `scripts/lint.sh` explaining the shape they match: the
 unpacked-port check (a port declaration whose identifier is followed by a `[..]`
@@ -127,6 +140,11 @@ bench drives the source and that netlist from the same stimulus, comparing every
 output every cycle (`sim/gatesim/README.md`).
 
 `make lint TOPS="qcore_row qcore_requant"` restricts the run to named tops.
+
+`make style` is the Python half of the lint: `uv run ruff check .` and `uv run
+ruff format --check .` over every `.py` in the repository, at the ruff version
+`uv.lock` pins, with the rules and the line length in the `[tool.ruff]` tables
+of `pyproject.toml`. Both commands only report; `uv run ruff format .` rewrites.
 
 The glob is `rtl/*.sv` plus `sim/cocotb/wrappers/*.sv`: the generated include
 `rtl/qcore_csr_defs.svh` is linted through the modules that include it, checked
@@ -142,9 +160,10 @@ Run it as you write a module. It is fast.
 scripts/install-hooks.sh
 ```
 
-installs `.git/hooks/pre-commit`, which runs `make lint` and
+installs `.git/hooks/pre-commit`, which runs `make lint`, `make style` and
 `uv run pytest -q sw/tests -x`. The hook only checks; it never rewrites files.
-If `uv` is not on PATH the pytest step is skipped with a message.
+If `uv` is not on PATH the style check and the test step are skipped with a
+message.
 
 ## 6. Measured numbers (README rule)
 
@@ -154,7 +173,10 @@ If `uv` is not on PATH the pytest step is skipped with a message.
 - Synthesis numbers are never typed by hand: `scripts/synth_report.py` writes
   each `syn/reports/*.md` from the Yosys log of the run that produced it, and
   `make synth` regenerates them and fails on any difference. A wall-clock figure
-  is a median with its range and the number of runs.
+  is a median with its range and the number of runs, and it is quoted once, on
+  the page that owns it: `docs/PERFORMANCE.md` for a harness run, that tool's
+  own `sim/<tool>/README.md` for a `make` target of its own. Everywhere else
+  names the command and points at that page.
 - Analytical projections live in `docs/`, labeled **estimate**.
 - FPGA tokens/s figures state the clock and memory bandwidth they are derived
   from (100 MHz and 6.4 GB/s for WB=64).

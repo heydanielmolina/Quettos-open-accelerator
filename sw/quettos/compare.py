@@ -1,27 +1,35 @@
-"""RTL against the ISA simulator: one bring-up program run on both, compared element by element.
+"""RTL against the ISA simulator: two short programs run on both, compared element by element.
 
-The program is :func:`quettos.compiler.build_bringup`: ``EMBED``, the tied LM
-head as a ``GEMV`` in ``ARGMAX_DUMP`` mode, and ``HALT`` -- three descriptors
-lifted from the model's own ``decode.prog``.  It runs on :mod:`quettos.isa_sim`
-and on ``qcore_top`` through the Verilator harness in ``sim/verilator``, and
-every VSRAM element, SREG word, dumped logit, CSR and PERF counter the two
-produce is compared; the first difference is reported with the descriptor, the
-field and the element it is in.
+The bring-up program is the four descriptors of ``docs/ISA.md``: the ``EMBED``
+of the model's own ``decode.prog``, a ``VQUANT`` of its output into the
+activation slot, the tied LM head as a ``GEMV`` in ``ARGMAX_DUMP`` mode, and
+``HALT``.  Nothing is loaded from the host: the ``VQUANT`` writes the
+activation scale the ``GEMV`` reads out of the SREG bank, which is the whole
+decode path in four descriptors.  A v1 model ties the embedding and the LM
+head, so the program is self-checking: ``ARGMAX_TOK == TOK``.
 
-``qcore_vpu_top`` owns the ``VQUANT`` that pairs an activation with its scale,
-so the host loads that one scale register and the ``EMBED`` output shift is
-raised to match it, which keeps the gathered row inside the int16 window a GEMV
-activation is read through.  Both models are given the same scale; every other
-input is the compiled image.  A v1 model ties the embedding and the LM head, so
-the program is self-checking: ``ARGMAX_TOK == TOK``.
+The vector program takes the same ``EMBED`` and then runs ``VRMSNORM``,
+``VQUANT`` with ``USE_TRACKED``, ``VSUBC``, ``VSILUMUL`` and ``VQUANT`` with
+``GROUP`` back to back, lifting each descriptor's constants -- the gamma row,
+``eps_c``, ``sqrt(d)``, the centering row and the shifts -- from ``decode.prog``
+so they are the compiler's own.  Its ``USE_TRACKED`` quantize reads the absmax
+the ``VRMSNORM`` before it wrote, so the SREG bank is checked as a channel
+between two vector descriptors and not only as an output.
+
+Both run on :mod:`quettos.isa_sim` and on ``qcore_top`` through the Verilator
+harness in ``sim/verilator``, and every VSRAM element, SREG word, dumped logit,
+CSR and PERF counter the two produce is compared; the first difference is
+reported with the descriptor, the field and the element it is in.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +38,7 @@ import numpy as np
 
 from quettos import compiler, isa, isa_sim, numerics, synthetic
 from quettos.compiler import Bringup
-from quettos.isa import OutMode
+from quettos.isa import Descriptor, Opcode, OutMode
 
 REPO = Path(__file__).resolve().parents[2]
 HARNESS = REPO / "sim" / "verilator"
@@ -109,6 +117,162 @@ class Mismatch:
         return f"{where}: isa_sim {self.expected}, RTL {self.got}"
 
 
+# --------------------------------------------------------------------------- the programs
+
+
+def _decode_prog(image_dir: Path, cfg: Config) -> tuple[dict[str, Any], list[Descriptor]]:
+    """A compiled model's ``layout.json`` and the descriptors of its ``decode.prog``."""
+    layout = compiler.load_layout(image_dir)
+    if layout["wb"] != cfg.wb:
+        raise ValueError(f"{image_dir} was compiled for WB={layout['wb']}, not {cfg.wb}")
+    return layout, isa.parse((image_dir / compiler.FILES["decode"]).read_bytes())
+
+
+def _lift(descs: list[Descriptor], opcode: Opcode, **match: Any) -> Descriptor:
+    """The first ``decode.prog`` descriptor with this opcode; its constants are the compiler's."""
+    for d in descs:
+        if d.opcode is opcode and all(getattr(d, k) == v for k, v in match.items()):
+            return d
+    raise ValueError(f"decode.prog carries no {opcode.name} descriptor{match or ''}")
+
+
+def bringup(image_dir: Path | str, cfg: Config, tok: int) -> Bringup:
+    """The four-descriptor bring-up program of ``docs/ISA.md`` over one token of a compiled model.
+
+    ``EMBED`` gathers the row of ``tok`` into the ``X`` slot, ``VQUANT`` turns it
+    into the int16 activation the LM head reads and writes the pairing scale into
+    ``SREG[sreg_src]``, the tied head runs as a ``GEMV`` in ``ARGMAX_DUMP`` mode
+    so every logit is compared, and ``HALT`` fences the writes.  The program
+    loads behind ``prefill.prog`` and dumps behind itself, both inside the
+    image's program window; nothing else in the image moves and the host loads
+    no register.
+    """
+    image_dir = Path(image_dir)
+    layout, descs = _decode_prog(image_dir, cfg)
+    embed = _lift(descs, Opcode.EMBED)
+    lm = _lift(descs, Opcode.GEMV, out_mode=OutMode.ARGMAX)
+    quant = isa.vquant(
+        vs_src=embed.vs_dst,
+        vs_dst=lm.vs_src,
+        n=embed.k,
+        width=16,
+        frac_in=layout["frac"]["X"],
+        sreg_dst=lm.sreg_src,
+    )
+    prefill = layout["programs"]["prefill"]
+    addr = compiler.align_up(prefill["addr"] + prefill["size"])
+    dump_addr = compiler.align_up(addr + 4 * isa.DESC_BYTES, isa.DUMP_ALIGN)
+    prog = (
+        embed,
+        quant,
+        dataclasses.replace(lm, out_mode=OutMode.ARGMAX_DUMP, imm32=dump_addr),
+        isa.halt(),
+    )
+    used = int(layout["vsram"]["used"])
+    return Bringup(
+        program=prog,
+        addr=addr,
+        tok=tok,
+        shift=0,
+        sreg=(),
+        ranges=tuple((b, 0, used) for b in range(cfg.b_max)),
+        dump=(dump_addr, 4 * lm.n),
+        blob=isa.assemble(list(prog)),
+    )
+
+
+def vector_ops(image_dir: Path | str, cfg: Config, tok: int) -> Bringup:
+    """A directed program: ``EMBED`` and then the vector unit's four opcodes back to back.
+
+    ``VRMSNORM`` normalizes the embedding row with the model's own gamma row,
+    ``eps_c`` and ``sqrt(d)`` and tracks its absmax into ``SREG[0]``; the
+    ``VQUANT`` after it takes that absmax through ``USE_TRACKED``, so the SREG
+    bank carries a value from one vector descriptor to the next; ``VSUBC``
+    subtracts the model's own centering row; ``VSILUMUL`` gates the normalized
+    row with the centered one; a ``GROUP`` ``VQUANT`` writes one int8 scale per
+    64 elements; and a second ``VSILUMUL`` at ``sh_h = 0`` overflows int32 on
+    part of its output, so ``SAT_VPU`` is a counter with a value in it rather
+    than a zero on both sides.  The four scratch ranges sit past the compiler's
+    VSRAM map and are compared with the rest of the bank.
+    """
+    image_dir = Path(image_dir)
+    layout, descs = _decode_prog(image_dir, cfg)
+    embed = _lift(descs, Opcode.EMBED)
+    rms = _lift(descs, Opcode.VRMSNORM)
+    subc = _lift(descs, Opcode.VSUBC)
+    silu = _lift(descs, Opcode.VSILUMUL)
+    slots = {e["name"]: int(e["start"]) for e in layout["vsram"]["map"]}
+    n = embed.k
+    used = int(layout["vsram"]["used"])
+    centered, gated, packed, clipped = used, used + n, used + 2 * n, used + 3 * n
+    if clipped + n > cfg.vsram_words * 8:
+        raise ValueError(f"the scratch ranges do not fit VSRAM_WORDS={cfg.vsram_words}")
+    group = 64 if n % 64 == 0 else n
+    prog = (
+        embed,
+        dataclasses.replace(rms, vs_src=slots["X"], vs_dst=slots["XN"], n=n, sreg_dst=0),
+        isa.vquant(
+            vs_src=slots["XN"],
+            vs_dst=slots["A"],
+            n=n,
+            width=16,
+            frac_in=layout["frac"]["X"],
+            sreg_dst=1,
+            use_tracked=True,
+            sreg_src=0,
+        ),
+        dataclasses.replace(subc, vs_src=slots["X"], vs_dst=centered, n=n),
+        dataclasses.replace(
+            silu, vs_src=slots["XN"], vs_aux=centered, vs_dst=gated, n=n, sreg_dst=3
+        ),
+        isa.vquant(
+            vs_src=gated,
+            vs_dst=packed,
+            n=n,
+            width=8,
+            frac_in=layout["frac"]["X"],
+            sreg_dst=8,
+            group=group,
+        ),
+        # sh_h = 0 leaves silu * u unshifted, so part of the output saturates.
+        dataclasses.replace(
+            silu,
+            vs_src=slots["XN"],
+            vs_aux=centered,
+            vs_dst=clipped,
+            n=n,
+            sh1=0,
+            track_absmax=False,
+        ),
+        isa.halt(),
+    )
+    prefill = layout["programs"]["prefill"]
+    addr = compiler.align_up(prefill["addr"] + prefill["size"])
+    return Bringup(
+        program=prog,
+        addr=addr,
+        tok=tok,
+        shift=0,
+        sreg=(),
+        ranges=tuple((b, 0, clipped + n) for b in range(cfg.b_max)),
+        dump=(addr, 0),
+        blob=isa.assemble(list(prog)),
+    )
+
+
+#: The programs the comparison runs, by the name the CLI takes.
+PROGRAMS: dict[str, Callable[[Path, Config, int], Bringup]] = {
+    "bringup": bringup,
+    "vector": vector_ops,
+}
+
+#: Programs that raise an event counter on purpose. The harness fails a run on
+#: any ``SAT_*`` or ``ERR_*`` event unless it is told to report them instead;
+#: for these the count itself is compared against the simulator per descriptor,
+#: which is the stronger check. Every other program must leave all four at 0.
+EVENTFUL: frozenset[str] = frozenset({"vector"})
+
+
 # --------------------------------------------------------------------------- the simulator
 
 
@@ -118,15 +282,15 @@ def _sreg_word(value: Any) -> int:
 
 
 def reference(
-    image_dir: Path, b: Bringup, cfg: Config, *, step: bool = True
+    image_dir: Path, b: Bringup, cfg: Config, *, step: bool = True, row_en: int = 1
 ) -> tuple[list[Record], list[int]]:
-    """Run the bring-up program on :mod:`quettos.isa_sim` and record what the host would read."""
+    """Run one program on :mod:`quettos.isa_sim` and record what the host would read."""
     layout = compiler.load_layout(image_dir)
     m = isa_sim.Machine.from_file(image_dir / layout["image"]["file"], **cfg.widths)
     m.mem[b.addr : b.addr + len(b.blob)] = b.blob
     for bank, index, word in b.sreg:
         m.sreg[bank][index] = isa.sfloat_from_imm(word)
-    m.csr["TOK"], m.csr["POS"], m.csr["ROW_EN"] = b.tok, 0, 1
+    m.csr["TOK"], m.csr["POS"], m.csr["ROW_EN"] = b.tok, 0, row_en
     m.csr["PC"] = b.addr
 
     records: list[Record] = []
@@ -139,7 +303,7 @@ def reference(
         records.append(_capture(m, 0, b, cfg))
     addr, size = b.dump
     dumped = np.frombuffer(bytes(m.mem[addr : addr + size]), dtype="<i4")
-    return records, [int(v) for v in dumped]
+    return records, [int(v) for v in dumped]  # empty when the program dumps nothing
 
 
 def _capture(m: isa_sim.Machine, index: int, b: Bringup, cfg: Config) -> Record:
@@ -189,17 +353,21 @@ def run_rtl(
     out_dir: Path | None = None,
     quiet: bool = True,
     allow_error: bool = False,
+    name: str = "bringup",
+    row_en: int = 1,
 ) -> tuple[list[Record], list[int], dict[str, Any]]:
-    """Run the bring-up program on ``qcore_top`` through the harness and read its records back.
+    """Run one program on ``qcore_top`` through the harness and read its records back.
 
     ``allow_error`` keeps the records of a run the core stopped, which is what a
-    program the hardware cannot execute produces.
+    program the hardware cannot execute produces.  A program in :data:`EVENTFUL`
+    is run with ``--allow-sat``, so the harness reports its events instead of
+    failing on them and the per-descriptor comparison judges them.
     """
     out_dir = BUILD / "compare" if out_dir is None else out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"w{cfg.wb}-tok{b.tok}-lat{lat}-bw{bw_div}{'-step' if step else '-run'}"
-    prog_path = out_dir / f"bringup-{tag}.prog"
-    json_path = out_dir / f"bringup-{tag}.json"
+    tag = f"w{cfg.wb}-tok{b.tok}-rows{row_en}-lat{lat}-bw{bw_div}{'-step' if step else '-run'}"
+    prog_path = out_dir / f"{name}-{tag}.prog"
+    json_path = out_dir / f"{name}-{tag}.json"
     prog_path.write_bytes(b.blob)
 
     cmd = [
@@ -217,7 +385,7 @@ def run_rtl(
         "--pos",
         "0",
         "--row-en",
-        "1",
+        str(row_en),
         "--lat",
         str(lat),
         "--bw-div",
@@ -229,7 +397,10 @@ def run_rtl(
         cmd += ["--sreg", f"{bank}:{index}={word:#010x}"]
     for bank, start, count in b.ranges:
         cmd += ["--dump-vsram", f"{bank}:{start}:{count}"]
-    cmd += ["--dump-mem", f"{b.dump[0]}:{b.dump[1]}"]
+    if b.dump[1]:
+        cmd += ["--dump-mem", f"{b.dump[0]}:{b.dump[1]}"]
+    if name in EVENTFUL:
+        cmd.append("--allow-sat")
     if quiet:
         cmd.append("--quiet")
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
@@ -278,7 +449,7 @@ def compare(
     """Every difference between the two runs, the first element of each named."""
     out: list[Mismatch] = []
     names = [d.opcode.name for d in b.program]
-    if ref_mem is not None and got_mem is not None:
+    if b.dump[1] and ref_mem is not None and got_mem is not None:
         # The DUMP region is read after HALT, whose auto-fence has acknowledged
         # every write the program issued.
         i = _first_difference(ref_mem, got_mem)
@@ -339,12 +510,13 @@ def compare(
 
 @dataclass
 class Result:
-    """One image, one configuration, one token: what both models produced."""
+    """One image, one configuration, one program, one token: what both models produced."""
 
     image: Path
     config: Config
+    program: str
     tok: int
-    shift: int
+    descriptors: int
     argmax_tok: int
     argmax_val: int
     cycles: int
@@ -362,11 +534,12 @@ def check_image(
     cfg: Config,
     tok: int,
     *,
+    program: str = "bringup",
     timing: tuple[tuple[int, int], ...] = ((32, 1),),
     quiet: bool = True,
 ) -> Result:
     """Compare the RTL against the simulator on one image, and across the timing settings."""
-    b = compiler.build_bringup(image_dir, tok, **cfg.widths)
+    b = PROGRAMS[program](Path(image_dir), cfg, tok)
     ref, ref_mem = reference(image_dir, b, cfg)
     baseline: tuple[list[Record], list[int]] | None = None
     determinism: list[str] = []
@@ -374,7 +547,9 @@ def check_image(
     got_mem: list[int] = []
     cycles = 0
     for lat, bw_div in timing:
-        got, got_mem, blob = run_rtl(image_dir, b, cfg, lat=lat, bw_div=bw_div, quiet=quiet)
+        got, got_mem, blob = run_rtl(
+            image_dir, b, cfg, lat=lat, bw_div=bw_div, quiet=quiet, name=program
+        )
         if baseline is None:
             baseline = (got, got_mem)
             cycles = int(blob["run"]["clock_cycles"])  # the first setting is the reported one
@@ -386,8 +561,9 @@ def check_image(
     return Result(
         image=image_dir,
         config=cfg,
+        program=program,
         tok=tok,
-        shift=b.shift,
+        descriptors=len(b.program),
         argmax_tok=last.argmax_tok,
         argmax_val=last.argmax_val,
         cycles=cycles,
@@ -421,11 +597,12 @@ def sweep(
     *,
     seed: int = 0,
     tokens: int = 1,
+    programs: tuple[str, ...] = tuple(PROGRAMS),
     timing: tuple[tuple[int, int], ...] = ((32, 1), (1, 1), (200, 1), (32, 2)),
     out_dir: Path | None = None,
     quiet: bool = True,
 ) -> list[Result]:
-    """Every shape at every width, each compared at every timing setting."""
+    """Every program of every shape at every width, each compared at every timing setting."""
     out_dir = BUILD / "compare" if out_dir is None else out_dir
     rng = np.random.default_rng(seed)
     picked = [synthetic.random_shape(rng) for _ in range(shapes)]
@@ -437,7 +614,10 @@ def sweep(
             vocab = compiler.load_layout(image)["model"]["vocab"]
             for _ in range(tokens):
                 tok = int(rng.integers(0, vocab))
-                results.append(check_image(image, cfg, tok, timing=timing, quiet=quiet))
+                for program in programs:
+                    results.append(
+                        check_image(image, cfg, tok, program=program, timing=timing, quiet=quiet)
+                    )
     return results
 
 
@@ -445,14 +625,17 @@ def sweep(
 
 
 def _report(results: list[Result]) -> int:
-    print(f"{'model':<44} {'config':<32} {'tok':>6} {'argmax':>7} {'cycles':>10}  result")
+    print(
+        f"{'model':<30} {'config':<32} {'program':<8} {'desc':>5} {'tok':>6} "
+        f"{'argmax':>7} {'cycles':>10}  result"
+    )
     bad = 0
     for r in results:
         status = "ok" if r.ok else "MISMATCH"
         bad += 0 if r.ok else 1
         print(
-            f"{r.image.name:<44} {str(r.config):<32} {r.tok:>6} {r.argmax_tok:>7} "
-            f"{r.cycles:>10}  {status}"
+            f"{r.image.name:<30} {str(r.config):<32} {r.program:<8} {r.descriptors:>5} "
+            f"{r.tok:>6} {r.argmax_tok:>7} {r.cycles:>10}  {status}"
         )
         for m in r.mismatches[:8]:
             print(f"    {m}")
@@ -470,6 +653,11 @@ def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument("--lat", type=int, default=32, help="QMEM read latency in cycles")
     p.add_argument("--bw-div", type=int, default=1, help="one returned beat every N cycles")
     p.add_argument("--sweep", action="store_true", help="random shapes over several widths")
+    p.add_argument(
+        "--programs",
+        default=",".join(PROGRAMS),
+        help="comma-separated programs to run: " + ", ".join(PROGRAMS),
+    )
     p.add_argument("--shapes", type=int, default=5, help="how many random shapes to draw")
     p.add_argument("--widths", default="64,128", help="comma-separated WB values for --sweep")
     p.add_argument("--tokens", type=int, default=1, help="tokens per image in --sweep")
@@ -483,20 +671,31 @@ def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 def run(a: argparse.Namespace) -> int:
     """Run the comparison the parsed options describe and print the table; 1 on any mismatch."""
+    programs = tuple(name for name in a.programs.split(",") if name)
+    for name in programs:
+        if name not in PROGRAMS:
+            raise SystemExit(f"unknown program {name!r}; give one of {', '.join(PROGRAMS)}")
     if a.sweep:
         results = sweep(
             a.shapes,
             [int(w) for w in a.widths.split(",")],
             seed=a.seed,
             tokens=a.tokens,
+            programs=programs,
             out_dir=a.out_dir,
             quiet=not a.verbose,
         )
     elif a.image is not None:
         results = [
             check_image(
-                a.image, CONFIGS[a.wb], a.tok, timing=((a.lat, a.bw_div),), quiet=not a.verbose
+                a.image,
+                CONFIGS[a.wb],
+                a.tok,
+                program=name,
+                timing=((a.lat, a.bw_div),),
+                quiet=not a.verbose,
             )
+            for name in programs
         ]
     else:
         raise SystemExit("give --image or --sweep")

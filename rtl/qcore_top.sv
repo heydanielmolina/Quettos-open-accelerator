@@ -1,12 +1,12 @@
 // Quettos Core top level: the flat QMEM and CSR ports, the parameter root, and
 // the wiring of every unit. It holds one qcore_vsram and one qcore_row per
-// activation row, the VSRAM port-B crossbar, the SREG read select and write
-// mux, the fan-out of the arbiter's returned beat, and the arithmetic sum of
-// the units' per-cycle event counts into the four CSR counters.
-// The six V opcodes belong to qcore_vpu_top: this top carries the GEMV, EMBED
-// and KVWRITE units, and a V descriptor stops the program before it is popped
-// with STATUS.ERR, FAULT = OPCODE, FAULT_OP = its opcode byte and PC on the
-// descriptor.
+// activation row, the VSRAM port-A and port-B crossbars, the SREG read select
+// and write mux, the fan-out of the arbiter's returned beat, and the arithmetic
+// sum of the units' per-cycle event counts into the four CSR counters.
+// qcore_vpu_top executes VRMSNORM, VQUANT, VSILUMUL and VSUBC. VROPE and
+// VSOFTMAX name passes it does not carry, so a descriptor with either opcode
+// stops the program before it is popped, with STATUS.ERR, FAULT = OPCODE,
+// FAULT_OP = its opcode byte and PC on the descriptor.
 `include "qcore_csr_defs.svh"
 module qcore_top #(
   parameter int WB              = 64,
@@ -16,7 +16,13 @@ module qcore_top #(
   parameter int ACC_W           = 40,
   parameter int META_FIFO_BEATS = 16,
   parameter int MAX_BURST       = 64,
-  parameter int DQ_DEPTH        = 8
+  parameter int DQ_DEPTH        = 8,
+  parameter int VL              = 4,
+  parameter int VPU_FIFO_BEATS  = 16,
+  // Lookup-table images, forwarded to the ROMs qcore_vpu_top holds
+  parameter     ROM_FILE_SIGMOID = "",
+  parameter     ROM_FILE_RSQRT   = "",
+  parameter     ROM_FILE_RECIP   = ""
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -50,12 +56,8 @@ module qcore_top #(
   localparam int NVW = $clog2(WB) + 1;
   localparam int TW  = 20;
 
-  localparam logic [7:0] OP_VRMSNORM = 8'(`QCORE_OP_VRMSNORM);
-  localparam logic [7:0] OP_VQUANT   = 8'(`QCORE_OP_VQUANT);
   localparam logic [7:0] OP_VROPE    = 8'(`QCORE_OP_VROPE);
-  localparam logic [7:0] OP_VSILUMUL = 8'(`QCORE_OP_VSILUMUL);
   localparam logic [7:0] OP_VSOFTMAX = 8'(`QCORE_OP_VSOFTMAX);
-  localparam logic [7:0] OP_VSUBC    = 8'(`QCORE_OP_VSUBC);
   localparam logic [3:0]  FAULT_OPCODE = 4'(`QCORE_FAULT_OPCODE);
   localparam logic [31:0] ROW_EN_MASK  = 32'((32'd1 << B_MAX) - 32'd1);
 
@@ -187,16 +189,37 @@ module qcore_top #(
   logic            kv_vsb_en, kv_busy;
   logic [AW-1:0]   kv_vsb_addr;
   logic [1:0]      kv_err_bounds_inc;
-  logic            vsb_kv, vsb_en_sel;
+  logic            vsb_kv, vsb_vpu, vsb_en_sel;
   logic [3:0]      vsb_bank, sreg_wr_bank;
   logic [7:0]      vsb_we_sel;
   logic [AW-1:0]   vsb_addr;
-  logic [255:0]    vsb_rdata;
+  logic [255:0]    vsb_wdata, vsb_rdata;
+  logic            sreg_wr_en_sel;
+  logic [3:0]      sreg_wr_row_sel;
+  logic [7:0]      sreg_wr_idx_sel;
+  logic [31:0]     sreg_wr_data_sel;
 
   // ---------------------------------------------------------------- vector processor
-  logic            v_head, v_pop, v_stop_q;
-  logic [7:0]      head_op, v_stop_op_q;
-  logic [B_MAX*32+68-1:0] vpu_cmd;   // sreg_u32, sqrt_e, sqrt_m, vs_aux, len, 4 flags
+  logic            done_vpu, vpu_busy;
+  logic [3:0]      vpu_cur_row;
+  logic            vpu_vsa_en;
+  logic [AW-1:0]   vpu_vsa_addr;
+  logic [255:0]    vpu_vsa_rdata;
+  logic            vpu_vsb_sel_dst, vpu_vsb_en;
+  logic [7:0]      vpu_vsb_we;
+  logic [AW-1:0]   vpu_vsb_addr;
+  logic [255:0]    vpu_vsb_wdata;
+  logic            vpu_sreg_wr_en;
+  logic [3:0]      vpu_sreg_wr_row;
+  logic [7:0]      vpu_sreg_wr_idx;
+  logic [31:0]     vpu_sreg_wr_data;
+  logic [7:0]      vpu_sat_inc, vpu_err_shift_inc;
+  logic [3:0]      vpu_err_bounds_inc;
+  logic [3:0]      vpu_vsa_bank;
+
+  // The two V opcodes with no unit in this build, refused at the queue head.
+  logic            unimpl_head, unimpl_pop, unimpl_q;
+  logic [7:0]      head_op, unimpl_op_q;
 
   // ================================================================ control loop
   qcore_csr u_csr (
@@ -240,7 +263,7 @@ module qcore_top #(
     .sreg_rd_data(sreg_rd_data),
     .cmd_valid_gemv(cmd_valid_gemv), .cmd_valid_vpu(cmd_valid_vpu),
     .cmd_valid_kv(cmd_valid_kv),
-    .done_gemv(done_gemv), .done_vpu(1'b0), .done_kv(done_kv),   // no V op is issued
+    .done_gemv(done_gemv), .done_vpu(done_vpu), .done_kv(done_kv),
     .cmd_op(cmd_op), .cmd_out_mode(cmd_out_mode), .cmd_accumulate(cmd_accumulate),
     .cmd_unit_meta(cmd_unit_meta), .cmd_track_absmax(cmd_track_absmax),
     .cmd_vq_w8(cmd_vq_w8), .cmd_vq_use_tracked(cmd_vq_use_tracked),
@@ -337,8 +360,8 @@ module qcore_top #(
         .acc_nvalid(row_acc_nvalid[r*NVW +: NVW]), .acc_last(row_acc_last[r]),
         .sreg_rd_en(row_sreg_rd_en[r]), .sreg_rd_idx(sreg_rd_idx),
         .sreg_rd_data(row_sreg_rd_data[r*32 +: 32]),
-        .sreg_wr_en(row_sreg_wr_en[r]), .sreg_wr_idx(rq_sreg_wr_idx),
-        .sreg_wr_data(rq_sreg_wr_data), .sreg_err(row_sreg_err[r]),
+        .sreg_wr_en(row_sreg_wr_en[r]), .sreg_wr_idx(sreg_wr_idx_sel),
+        .sreg_wr_data(sreg_wr_data_sel), .sreg_err(row_sreg_err[r]),
         .err_bounds(row_err_bounds[r]), .ev_beat(row_ev_beat[r])
       );
 
@@ -347,7 +370,7 @@ module qcore_top #(
         .en_a(vs_en_a[r]), .addr_a(vs_addr_a[r*AW +: AW]),
         .rd_a(vs_rd_a[r*256 +: 256]),
         .en_b(vs_en_b[r]), .we_b(vs_we_b[r*8 +: 8]), .addr_b(vsb_addr),
-        .wd_b(rq_vsb_wdata), .rd_b(vs_rd_b[r*256 +: 256])
+        .wd_b(vsb_wdata), .rd_b(vs_rd_b[r*256 +: 256])
       );
     end
   endgenerate
@@ -392,6 +415,41 @@ module qcore_top #(
     .err_bounds_inc(kv_err_bounds_inc), .done(done_kv), .busy(kv_busy)
   );
 
+  // The vector unit owns both VSRAM ports of the row it is on while it is busy,
+  // and the arbiter's TAG_VPU read port. `rdd_last` is the shared bus flag of
+  // whichever tag returned this cycle, so every sink qualifies it with its own
+  // valid; the vector unit does that itself, as the stream controller and the
+  // fetch unit do. cmd_len and cmd_pos are the fields of the bundle VSOFTMAX and
+  // VROPE read, so they arrive with those two opcodes.
+  qcore_vpu_top #(
+    .WB(WB), .B_MAX(B_MAX), .VL(VL), .VSRAM_WORDS(VSRAM_WORDS),
+    .VPU_FIFO_BEATS(VPU_FIFO_BEATS), .MAX_BURST(MAX_BURST),
+    .ROM_FILE_SIGMOID(ROM_FILE_SIGMOID), .ROM_FILE_RSQRT(ROM_FILE_RSQRT),
+    .ROM_FILE_RECIP(ROM_FILE_RECIP)
+  ) u_vpu (
+    .clk(clk), .rst(rst),
+    .cmd_valid_vpu(cmd_valid_vpu), .cmd_op(cmd_op), .cmd_vq_w8(cmd_vq_w8),
+    .cmd_vq_use_tracked(cmd_vq_use_tracked), .cmd_vq_group(cmd_vq_group),
+    .cmd_vq_scale_mul(cmd_vq_scale_mul), .cmd_track_absmax(cmd_track_absmax),
+    .cmd_addr_a(cmd_addr_a), .cmd_n(cmd_n), .cmd_vs_src(cmd_vs_src),
+    .cmd_vs_dst(cmd_vs_dst), .cmd_vs_aux(cmd_vs_aux), .cmd_sreg_dst(cmd_sreg_dst),
+    .cmd_sh0(cmd_sh0), .cmd_sh1(cmd_sh1), .cmd_imm32(cmd_imm32),
+    .cmd_sqrt_m(cmd_sqrt_m), .cmd_sqrt_e(cmd_sqrt_e), .cmd_rows(cmd_rows),
+    .cmd_sreg_u32(cmd_sreg_u32),
+    .v_req_valid(v_req_valid), .v_req_ready(v_req_ready), .v_req_addr(v_req_addr),
+    .v_req_len(v_req_len), .v_req_tag(v_req_tag),
+    .rdv_valid(rdv_valid), .rd_data(rdd_data), .rd_data_last(rdd_last),
+    .cur_row(vpu_cur_row),
+    .vsa_en(vpu_vsa_en), .vsa_addr(vpu_vsa_addr), .vsa_rdata(vpu_vsa_rdata),
+    .vsb_sel_dst(vpu_vsb_sel_dst), .vsb_en(vpu_vsb_en), .vsb_we(vpu_vsb_we),
+    .vsb_addr(vpu_vsb_addr), .vsb_wdata(vpu_vsb_wdata), .vsb_rdata(vsb_rdata),
+    .sreg_wr_en(vpu_sreg_wr_en), .sreg_wr_row(vpu_sreg_wr_row),
+    .sreg_wr_idx(vpu_sreg_wr_idx), .sreg_wr_data(vpu_sreg_wr_data),
+    .sat_inc(vpu_sat_inc), .err_shift_inc(vpu_err_shift_inc),
+    .err_bounds_inc(vpu_err_bounds_inc),
+    .done(done_vpu), .busy(vpu_busy)
+  );
+
   // ================================================================ crossbar
   assign ws_ready  = &row_ws_ready;
   assign acc_valid = |row_acc_valid;
@@ -412,17 +470,30 @@ module qcore_top #(
     end
   end
 
-  // Port A: row r reads bank src_row + r while it participates.
+  // Port A has one owner per descriptor: the rows during a GEMV or EMBED, each
+  // reading bank src_row + r while it participates; the vector unit during a
+  // V op, reading bank src_row + cur_row.
+  assign vpu_vsa_bank = 4'(cmd_src_row + vpu_cur_row);
+
   always_comb begin
     vs_en_a       = {B_MAX{1'b0}};
     vs_addr_a     = {(B_MAX*AW){1'b0}};
     row_vsa_rdata = {(B_MAX*256){1'b0}};
+    vpu_vsa_rdata = 256'd0;
     for (int v = 0; v < B_MAX; v++) begin
-      for (int i = 0; i < B_MAX; i++) begin
-        if (cmd_rows[i] && (4'(cmd_src_row + 4'(i)) == 4'(v))) begin
-          vs_en_a[v]                  = row_vsa_en[i];
-          vs_addr_a[v*AW +: AW]       = row_vsa_addr[i*AW +: AW];
-          row_vsa_rdata[i*256 +: 256] = vs_rd_a[v*256 +: 256];
+      if (vpu_busy) begin
+        if (vpu_vsa_bank == 4'(v)) begin
+          vs_en_a[v]            = vpu_vsa_en;
+          vs_addr_a[v*AW +: AW] = vpu_vsa_addr;
+          vpu_vsa_rdata         = vs_rd_a[v*256 +: 256];
+        end
+      end else begin
+        for (int i = 0; i < B_MAX; i++) begin
+          if (cmd_rows[i] && (4'(cmd_src_row + 4'(i)) == 4'(v))) begin
+            vs_en_a[v]                  = row_vsa_en[i];
+            vs_addr_a[v*AW +: AW]       = row_vsa_addr[i*AW +: AW];
+            row_vsa_rdata[i*256 +: 256] = vs_rd_a[v*256 +: 256];
+          end
         end
       end
     end
@@ -430,13 +501,28 @@ module qcore_top #(
 
   // Port B has one owner per descriptor: the requant during a GEMV or EMBED
   // (old-word reads and output writes of bank dst_row + r), the KV writer
-  // during a KVWRITE (64-element reads of bank src_row + r).
+  // during a KVWRITE (64-element reads of bank src_row + r), the vector unit
+  // during a V op (second-operand reads of bank src_row + cur_row with
+  // vsb_sel_dst low, output writes of bank dst_row + cur_row with it high).
+  // Only one of the three is busy at a time: one descriptor is in flight.
+  assign vsb_vpu    = vpu_busy;
   assign vsb_kv     = kv_busy;
-  assign vsb_bank   = vsb_kv ? 4'(cmd_src_row + kv_vsb_row) : 4'(cmd_dst_row + rq_vsb_row);
-  assign vsb_en_sel = vsb_kv ? kv_vsb_en   : rq_vsb_en;
-  assign vsb_we_sel = vsb_kv ? 8'd0        : rq_vsb_we;
-  assign vsb_addr   = vsb_kv ? kv_vsb_addr : rq_vsb_addr;
-  assign sreg_wr_bank = 4'(cmd_dst_row + rq_sreg_wr_row);
+  assign vsb_bank   = vsb_vpu
+                      ? 4'((vpu_vsb_sel_dst ? cmd_dst_row : cmd_src_row) + vpu_cur_row)
+                      : (vsb_kv ? 4'(cmd_src_row + kv_vsb_row)
+                                : 4'(cmd_dst_row + rq_vsb_row));
+  assign vsb_en_sel = vsb_vpu ? vpu_vsb_en    : (vsb_kv ? kv_vsb_en   : rq_vsb_en);
+  assign vsb_we_sel = vsb_vpu ? vpu_vsb_we    : (vsb_kv ? 8'd0        : rq_vsb_we);
+  assign vsb_addr   = vsb_vpu ? vpu_vsb_addr  : (vsb_kv ? kv_vsb_addr : rq_vsb_addr);
+  assign vsb_wdata  = vsb_vpu ? vpu_vsb_wdata : rq_vsb_wdata;
+
+  // The SREG write port of bank dst_row + r: the requant's, or the vector
+  // unit's while it is busy (the scale or tracked absmax a V op leaves behind).
+  assign sreg_wr_en_sel   = vsb_vpu ? vpu_sreg_wr_en   : rq_sreg_wr_en;
+  assign sreg_wr_row_sel  = vsb_vpu ? vpu_sreg_wr_row  : rq_sreg_wr_row;
+  assign sreg_wr_idx_sel  = vsb_vpu ? vpu_sreg_wr_idx  : rq_sreg_wr_idx;
+  assign sreg_wr_data_sel = vsb_vpu ? vpu_sreg_wr_data : rq_sreg_wr_data;
+  assign sreg_wr_bank     = 4'(cmd_dst_row + sreg_wr_row_sel);
 
   // ROW_EN bits at or above B_MAX name rows this core does not have.
   assign disp_row_en  = B_MAX'(row_en_q & ROW_EN_MASK);
@@ -454,7 +540,7 @@ module qcore_top #(
         vs_we_b[v*8 +: 8] = vsb_we_sel;
         vsb_rdata         = vs_rd_b[v*256 +: 256];
       end
-      if (sreg_wr_bank == 4'(v)) row_sreg_wr_en[v] = rq_sreg_wr_en;
+      if (sreg_wr_bank == 4'(v)) row_sreg_wr_en[v] = sreg_wr_en_sel;
       if (sreg_rd_row == 4'(v)) begin
         row_sreg_rd_en[v] = sreg_rd_en;
         sreg_rd_data      = row_sreg_rd_data[v*32 +: 32];
@@ -465,20 +551,21 @@ module qcore_top #(
   // ================================================================ event counts
   // Per-cycle counts, added arithmetically (docs/RTL.md 2.8).
   assign sat_req_inc   = {5'd0, rq_sat_inc};
-  assign sat_vpu_inc   = 8'd0;
-  assign err_shift_inc = {6'd0, rq_err_shift_inc};
+  assign sat_vpu_inc   = vpu_sat_inc;
+  assign err_shift_inc = {6'd0, rq_err_shift_inc} + vpu_err_shift_inc;
 
   always_comb begin
     err_bounds_inc = {4'd0, disp_err_bounds_inc} + {6'd0, rq_err_bounds_inc} +
-                     {6'd0, kv_err_bounds_inc};
+                     {6'd0, kv_err_bounds_inc} + {4'd0, vpu_err_bounds_inc};
     for (int i = 0; i < B_MAX; i++) begin
       err_bounds_inc = err_bounds_inc + {7'd0, row_err_bounds[i]} +
                        {7'd0, row_sreg_err[i]};
     end
   end
 
-  // ================================================================ vector processor
-  // A V descriptor is held at the queue head instead of being popped, and the
+  // ================================================================ opcodes with no unit
+  // VROPE and VSOFTMAX name passes qcore_vpu_top does not carry. Such a
+  // descriptor is held at the queue head instead of being popped, and the
   // dispatcher ends the run: the descriptor in flight retires, the fetch queue
   // is flushed, the PERF counters are snapshotted and `done_set` drops `busy`.
   // The fault the ISA defines for an opcode the hardware cannot execute reaches
@@ -486,55 +573,84 @@ module qcore_top #(
   // opcode byte, PC on the descriptor. Nothing is issued and nothing is counted
   // for it.
   assign head_op        = 8'(qcore_pkg::desc_opcode(dq_desc));
-  assign v_head         = fq_valid &&
-                          ((head_op == OP_VRMSNORM) || (head_op == OP_VQUANT) ||
-                           (head_op == OP_VROPE)    || (head_op == OP_VSILUMUL) ||
-                           (head_op == OP_VSOFTMAX) || (head_op == OP_VSUBC));
-  assign v_pop          = v_head && dq_ready;
-  assign dq_valid       = fq_valid && !v_head;
-  assign fq_ready       = dq_ready && !v_head;
-  assign disp_abort_run = abort_run | v_stop_q;
+  assign unimpl_head    = fq_valid &&
+                          ((head_op == OP_VROPE) || (head_op == OP_VSOFTMAX));
+  assign unimpl_pop     = unimpl_head && dq_ready;
+  assign dq_valid       = fq_valid && !unimpl_head;
+  assign fq_ready       = dq_ready && !unimpl_head;
+  assign disp_abort_run = abort_run | unimpl_q;
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      v_stop_q    <= 1'b0;
-      v_stop_op_q <= 8'd0;
+      unimpl_q    <= 1'b0;
+      unimpl_op_q <= 8'd0;
     end else begin
-      if (v_pop && !v_stop_q) begin
-        v_stop_q    <= 1'b1;
-        v_stop_op_q <= head_op;
+      if (unimpl_pop && !unimpl_q) begin
+        unimpl_q    <= 1'b1;
+        unimpl_op_q <= head_op;
       end
-      if (!busy) v_stop_q <= 1'b0;
+      if (!busy) unimpl_q <= 1'b0;
     end
   end
 
-  assign csr_err_set    = err_set | (done_set && v_stop_q);
+  assign csr_err_set    = err_set | (done_set && unimpl_q);
   assign csr_fault_code = err_set ? fault_code : FAULT_OPCODE;
-  assign csr_fault_op   = err_set ? fault_op   : v_stop_op_q;
-
-  // The arbiter's VPU read port stays idle, so it is never granted and no
-  // TAG_VPU beat returns.
-  assign v_req_valid = 1'b0;
-  assign v_req_addr  = 32'd0;
-  assign v_req_len   = 8'd0;
-  assign v_req_tag   = qcore_pkg::TAG_VPU;
-
-  // The bundle fields qcore_vpu_top reads, held for the check below.
-  assign vpu_cmd = {cmd_sreg_u32, cmd_sqrt_e, cmd_sqrt_m, cmd_vs_aux, cmd_len,
-                    cmd_vq_scale_mul, cmd_vq_group, cmd_vq_use_tracked, cmd_vq_w8};
+  assign csr_fault_op   = err_set ? fault_op   : unimpl_op_q;
 
 `ifndef SYNTHESIS
+  // The V-op range rule of docs/ISA.md, checked here because this is where the
+  // element ranges and the row bases meet: the vector unit reads its operands
+  // ahead of its writes, so a destination range is either exactly a source
+  // range or disjoint from it -- but only within one bank. Row r reads bank
+  // src_row + r and writes bank dst_row + r, so different bases are different
+  // memories and no pair of element indices can alias. The two ranges have the
+  // same length, so they are equal when the distance is zero, disjoint when it
+  // is at least n, and partially overlapping in between. Element indices are 17
+  // bits and n is 24, so the comparison is 25 bits wide.
+  //
+  // v_has_dst is the opcode set the rule applies to, and it mirrors
+  // compiler.VECTOR_SOURCES: the vector opcodes that name a destination in
+  // vs_dst. VROPE is not one of them -- it rewrites vs_src in place and leaves
+  // vs_dst unused -- so its vs_dst field carries no range and comparing it
+  // against vs_src would report an overlap that does not exist.
+  localparam logic [7:0] OP_VRMSNORM = 8'(`QCORE_OP_VRMSNORM);
+  localparam logic [7:0] OP_VQUANT   = 8'(`QCORE_OP_VQUANT);
+  localparam logic [7:0] OP_VSILUMUL = 8'(`QCORE_OP_VSILUMUL);
+  localparam logic [7:0] OP_VSUBC    = 8'(`QCORE_OP_VSUBC);
+
+  logic [24:0] v_src_e, v_dst_e, v_aux_e, v_n_e, v_gap_sd, v_gap_ad;
+  logic        v_one_bank, v_has_dst;
+
+  assign v_src_e    = {9'd0, cmd_vs_src};
+  assign v_dst_e    = {9'd0, cmd_vs_dst};
+  assign v_aux_e    = {9'd0, cmd_vs_aux};
+  assign v_n_e      = {1'b0, cmd_n};
+  assign v_one_bank = (cmd_src_row == cmd_dst_row);
+  assign v_has_dst  = (cmd_op == OP_VRMSNORM) || (cmd_op == OP_VQUANT)
+                      || (cmd_op == OP_VSILUMUL) || (cmd_op == OP_VSOFTMAX)
+                      || (cmd_op == OP_VSUBC);
+  assign v_gap_sd   = (v_src_e > v_dst_e) ? (v_src_e - v_dst_e) : (v_dst_e - v_src_e);
+  assign v_gap_ad   = (v_aux_e > v_dst_e) ? (v_aux_e - v_dst_e) : (v_dst_e - v_aux_e);
+
   always @(posedge clk) begin
     if (!rst) begin
-      if (cmd_valid_vpu) begin
-        $error("qcore_top: V opcode %02h issued with no vector unit (bundle %h)",
-               cmd_op, vpu_cmd);
+      if (cmd_valid_vpu && v_has_dst && v_one_bank && (v_gap_sd != 25'd0)
+          && (v_gap_sd < v_n_e)) begin
+        $error("qcore_top: vs_dst %0d partially overlaps vs_src %0d over %0d elements of bank %0d",
+               cmd_vs_dst, cmd_vs_src, cmd_n, cmd_src_row);
       end
-      if (rdv_valid || (v_req_valid && v_req_ready)) begin
-        $error("qcore_top: the VPU port of the arbiter became active");
+      if (cmd_valid_vpu && v_one_bank && (cmd_op == OP_VSILUMUL) && (v_gap_ad != 25'd0)
+          && (v_gap_ad < v_n_e)) begin
+        $error("qcore_top: vs_dst %0d partially overlaps vs_aux %0d over %0d elements of bank %0d",
+               cmd_vs_dst, cmd_vs_aux, cmd_n, cmd_src_row);
       end
-      if (requant_busy && kv_busy) begin
-        $error("qcore_top: the requant and the KV writer both own VSRAM port B");
+      if (cmd_valid_vpu && ((cmd_op == OP_VROPE) || (cmd_op == OP_VSOFTMAX))) begin
+        $error("qcore_top: opcode %02h issued to the vector unit, which has no pass for it (len %0d, pos %0d)",
+               cmd_op, cmd_len, cmd_pos);
+      end
+      if (({2'd0, requant_busy} + {2'd0, kv_busy} + {2'd0, vpu_busy}) > 3'd1) begin
+        $error("qcore_top: %0d units claim VSRAM port B in one cycle",
+               {2'd0, requant_busy} + {2'd0, kv_busy} + {2'd0, vpu_busy});
       end
       for (int v = 0; v < B_MAX; v++) begin
         if (vs_en_a[v] && (vs_we_b[v*8 +: 8] != 8'd0) &&
