@@ -64,7 +64,7 @@ Longest topological path through the LUT fabric: 19 cells.
 ```
  0  $auto$alumacc.cc:512:replace_alu$2962.A
 14  s1_raw [9]
-19  rtl/qcore_vpu_scalar.sv:309
+19  rtl/qcore_vpu_scalar.sv:312
 ```
 
 ## Notes (hand-written)

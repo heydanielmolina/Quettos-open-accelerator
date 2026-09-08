@@ -207,10 +207,11 @@ async def test_status_bits_and_fault_fields(dut):
             assert word == isa.status_word(
                 done=True, step_halted=True, err=True, fault=fault, fault_op=op
             )
+    last = list(Fault)[-1]  # the pulse the fault fields still hold
     # write one to clear: only the bits written, and the fault fields go with ERR
     await host.write(STATUS, 1 << isa.STATUS_BITS["DONE"])
     assert await host.read(STATUS) == isa.status_word(
-        step_halted=True, err=True, fault=Fault.PC_ALIGN, fault_op=0xFF
+        step_halted=True, err=True, fault=last, fault_op=0xFF
     )
     await host.write(STATUS, 1 << isa.STATUS_BITS["ERR"])
     assert await host.read(STATUS) == isa.status_word(step_halted=True)

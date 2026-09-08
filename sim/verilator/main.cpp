@@ -35,32 +35,10 @@ std::vector<int64_t> read_prompt(const std::string& path) {
   return ids;
 }
 
-// VROPE and VSOFTMAX name passes qcore_vpu_top does not carry, so qcore_top
-// stops the program on one. --traffic rewrites those two to NOP first; every
-// other descriptor, the four vector opcodes included, then runs over the real
-// addresses, strides, meta and partial tiles, which is what a traffic and cycle
-// measurement needs. The values the program computes are not meaningful once
-// two of its passes are missing, and they are not checked.
-bool has_no_unit(uint32_t op) { return op == OP_VROPE || op == OP_VSOFTMAX; }
-
-uint64_t nop_out_vector_ops(MemBytes* bytes, const Program& p) {
-  static_assert(DESC_OPCODE_LSB == 0 && DESC_OPCODE_W == 8, "the opcode is byte 0");
-  uint64_t count = 0;
-  for (uint32_t off = 0; off + DESC_BYTES <= p.size; off += DESC_BYTES) {
-    if (has_no_unit(bytes->read_byte(p.addr + off))) {
-      bytes->write_byte(p.addr + off, static_cast<uint8_t>(OP_NOP));
-      count++;
-    }
-  }
-  return count;
-}
-
 // What makes a run's numbers something other than a clean end-to-end
-// measurement, recorded in perf.json next to the counters: the --traffic
-// rewrite and the stop that ended the run.
+// measurement, recorded in perf.json next to the counters: the stop that ended
+// the run.
 struct RunMarks {
-  bool traffic = false;
-  uint64_t rewritten = 0;
   bool stopped = false;
   std::string reason;
   uint32_t fault = 0;
@@ -303,8 +281,6 @@ void write_perf_json(const Options& o, const Layout& layout, const Machine& m, c
   j.kv("bw_div", o.bw_div);
   j.kv("max_new", static_cast<uint64_t>(o.max_new));
   j.kv_b("step", o.step);
-  j.kv_b("traffic", marks.traffic);
-  j.kv("traffic_descriptors_rewritten", marks.rewritten);
   j.kv_s("status", marks.status());
   if (marks.stopped) {
     j.kv_s("stop_reason", marks.reason);
@@ -435,16 +411,6 @@ int main_impl(int argc, char** argv) {
 
   // --- the compiled programs
   RunMarks marks;
-  marks.traffic = o.traffic;
-  if (o.traffic) {
-    marks.rewritten =
-        nop_out_vector_ops(&bytes, layout.decode) + nop_out_vector_ops(&bytes, layout.prefill);
-    o.allow_sat = true;
-    printf("traffic measurement: %llu VROPE / VSOFTMAX descriptors rewritten to NOP; every "
-           "other descriptor runs, and the addresses, strides, tiles and counters are the "
-           "program's, the values are not checked\n",
-           (unsigned long long)marks.rewritten);
-  }
 
   Run run{&m, &layout, &o, {}, {}, {}, 0, true};
   if (layout.has_tokens_bin) run.vocab.load(layout.tokens_path());
@@ -502,7 +468,7 @@ int main_impl(int argc, char** argv) {
              (long long)nxt, (unsigned long long)rec.delta[PERF_CYCLES],
              100.0 * rec.delta.mac_utilization());
     }
-    if (!o.traffic) out.push(static_cast<uint32_t>(nxt));
+    out.push(static_cast<uint32_t>(nxt));
     bool stop = false;
     for (int64_t e : o.eos_ids) stop = stop || e == nxt;
     if (stop) break;
@@ -515,7 +481,7 @@ int main_impl(int argc, char** argv) {
   printf("\n");
 
   Events ev = read_events(m);
-  const char* mode = o.traffic ? "traffic" : (o.step ? "step" : "token");
+  const char* mode = o.step ? "step" : "token";
   print_counters(total, "perf:");
   printf("events: SAT_REQ=%u SAT_VPU=%u ERR_SHIFT=%u ERR_BOUNDS=%u\n", ev.sat_req, ev.sat_vpu,
          ev.err_shift, ev.err_bounds);
@@ -565,10 +531,9 @@ int main_impl(int argc, char** argv) {
   } else if (!run.ok) {
     Status s = m.status();
     marks.set_stop("a descriptor faulted", s, m.read(CSR_PC));
-    printf("stopped: descriptor at PC=0x%08x faulted; %s has no VROPE or VSOFTMAX pass, so "
-           "either opcode ends the program (--traffic runs the rest as a traffic "
-           "measurement)\n",
-           marks.pc, Build::top);
+    printf("stopped: the descriptor at PC=0x%08x faulted; STATUS carries the fault code and the "
+           "opcode byte\n",
+           marks.pc);
     printf("%s PC=0x%08x\n", s.text().c_str(), marks.pc);
     rc = 2;
   }

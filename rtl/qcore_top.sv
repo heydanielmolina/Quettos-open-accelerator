@@ -3,10 +3,11 @@
 // activation row, the VSRAM port-A and port-B crossbars, the SREG read select
 // and write mux, the fan-out of the arbiter's returned beat, and the arithmetic
 // sum of the units' per-cycle event counts into the four CSR counters.
-// qcore_vpu_top executes VRMSNORM, VQUANT, VSILUMUL and VSUBC. VROPE and
-// VSOFTMAX name passes it does not carry, so a descriptor with either opcode
-// stops the program before it is popped, with STATUS.ERR, FAULT = OPCODE,
-// FAULT_OP = its opcode byte and PC on the descriptor.
+// qcore_vpu_top holds the passes of every V opcode, and this level hands it
+// cmd_len, cmd_pos and the exp2 table image the VSOFTMAX and VROPE passes read.
+// Every opcode of the ISA issues to a unit from here; a byte that is none of
+// them is decoded as unknown by qcore_seq_dispatch, which ends the run with
+// STATUS.ERR, FAULT = OPCODE, FAULT_OP = the byte and PC on the descriptor.
 `include "qcore_csr_defs.svh"
 module qcore_top #(
   parameter int WB              = 64,
@@ -21,6 +22,7 @@ module qcore_top #(
   parameter int VPU_FIFO_BEATS  = 16,
   // Lookup-table images, forwarded to the ROMs qcore_vpu_top holds
   parameter     ROM_FILE_SIGMOID = "",
+  parameter     ROM_FILE_EXP2    = "",
   parameter     ROM_FILE_RSQRT   = "",
   parameter     ROM_FILE_RECIP   = ""
 ) (
@@ -56,9 +58,6 @@ module qcore_top #(
   localparam int NVW = $clog2(WB) + 1;
   localparam int TW  = 20;
 
-  localparam logic [7:0] OP_VROPE    = 8'(`QCORE_OP_VROPE);
-  localparam logic [7:0] OP_VSOFTMAX = 8'(`QCORE_OP_VSOFTMAX);
-  localparam logic [3:0]  FAULT_OPCODE = 4'(`QCORE_FAULT_OPCODE);
   localparam logic [31:0] ROW_EN_MASK  = 32'((32'd1 << B_MAX) - 32'd1);
 
   // ---------------------------------------------------------------- control path
@@ -216,10 +215,6 @@ module qcore_top #(
   logic [7:0]      vpu_sat_inc, vpu_err_shift_inc;
   logic [3:0]      vpu_err_bounds_inc;
   logic [3:0]      vpu_vsa_bank;
-
-  // The two V opcodes with no unit in this build, refused at the queue head.
-  logic            unimpl_head, unimpl_pop, unimpl_q;
-  logic [7:0]      head_op, unimpl_op_q;
 
   // ================================================================ control loop
   qcore_csr u_csr (
@@ -424,14 +419,15 @@ module qcore_top #(
   qcore_vpu_top #(
     .WB(WB), .B_MAX(B_MAX), .VL(VL), .VSRAM_WORDS(VSRAM_WORDS),
     .VPU_FIFO_BEATS(VPU_FIFO_BEATS), .MAX_BURST(MAX_BURST),
-    .ROM_FILE_SIGMOID(ROM_FILE_SIGMOID), .ROM_FILE_RSQRT(ROM_FILE_RSQRT),
-    .ROM_FILE_RECIP(ROM_FILE_RECIP)
+    .ROM_FILE_SIGMOID(ROM_FILE_SIGMOID), .ROM_FILE_EXP2(ROM_FILE_EXP2),
+    .ROM_FILE_RSQRT(ROM_FILE_RSQRT), .ROM_FILE_RECIP(ROM_FILE_RECIP)
   ) u_vpu (
     .clk(clk), .rst(rst),
     .cmd_valid_vpu(cmd_valid_vpu), .cmd_op(cmd_op), .cmd_vq_w8(cmd_vq_w8),
     .cmd_vq_use_tracked(cmd_vq_use_tracked), .cmd_vq_group(cmd_vq_group),
     .cmd_vq_scale_mul(cmd_vq_scale_mul), .cmd_track_absmax(cmd_track_absmax),
-    .cmd_addr_a(cmd_addr_a), .cmd_n(cmd_n), .cmd_vs_src(cmd_vs_src),
+    .cmd_addr_a(cmd_addr_a), .cmd_n(cmd_n), .cmd_len(cmd_len), .cmd_pos(cmd_pos),
+    .cmd_vs_src(cmd_vs_src),
     .cmd_vs_dst(cmd_vs_dst), .cmd_vs_aux(cmd_vs_aux), .cmd_sreg_dst(cmd_sreg_dst),
     .cmd_sh0(cmd_sh0), .cmd_sh1(cmd_sh1), .cmd_imm32(cmd_imm32),
     .cmd_sqrt_m(cmd_sqrt_m), .cmd_sqrt_e(cmd_sqrt_e), .cmd_rows(cmd_rows),
@@ -563,39 +559,18 @@ module qcore_top #(
     end
   end
 
-  // ================================================================ opcodes with no unit
-  // VROPE and VSOFTMAX name passes qcore_vpu_top does not carry. Such a
-  // descriptor is held at the queue head instead of being popped, and the
-  // dispatcher ends the run: the descriptor in flight retires, the fetch queue
-  // is flushed, the PERF counters are snapshotted and `done_set` drops `busy`.
-  // The fault the ISA defines for an opcode the hardware cannot execute reaches
-  // STATUS in that same cycle: ERR with FAULT = OPCODE and FAULT_OP = the
-  // opcode byte, PC on the descriptor. Nothing is issued and nothing is counted
-  // for it.
-  assign head_op        = 8'(qcore_pkg::desc_opcode(dq_desc));
-  assign unimpl_head    = fq_valid &&
-                          ((head_op == OP_VROPE) || (head_op == OP_VSOFTMAX));
-  assign unimpl_pop     = unimpl_head && dq_ready;
-  assign dq_valid       = fq_valid && !unimpl_head;
-  assign fq_ready       = dq_ready && !unimpl_head;
-  assign disp_abort_run = abort_run | unimpl_q;
-
-  always_ff @(posedge clk) begin
-    if (rst) begin
-      unimpl_q    <= 1'b0;
-      unimpl_op_q <= 8'd0;
-    end else begin
-      if (unimpl_pop && !unimpl_q) begin
-        unimpl_q    <= 1'b1;
-        unimpl_op_q <= head_op;
-      end
-      if (!busy) unimpl_q <= 1'b0;
-    end
-  end
-
-  assign csr_err_set    = err_set | (done_set && unimpl_q);
-  assign csr_fault_code = err_set ? fault_code : FAULT_OPCODE;
-  assign csr_fault_op   = err_set ? fault_op   : unimpl_op_q;
+  // ================================================================ descriptor queue
+  // Every opcode of the ISA has a unit at this level, so the fetch queue's head
+  // goes straight to the dispatcher and the fault path is the dispatcher's
+  // alone: an opcode byte that is none of the twelve ends the run with
+  // FAULT = OPCODE and that byte in FAULT_OP (3.5), as do a row above B_MAX and
+  // a misaligned PC.
+  assign dq_valid       = fq_valid;
+  assign fq_ready       = dq_ready;
+  assign disp_abort_run = abort_run;
+  assign csr_err_set    = err_set;
+  assign csr_fault_code = fault_code;
+  assign csr_fault_op   = fault_op;
 
 `ifndef SYNTHESIS
   // The V-op range rule of docs/ISA.md, checked here because this is where the
@@ -616,6 +591,7 @@ module qcore_top #(
   localparam logic [7:0] OP_VRMSNORM = 8'(`QCORE_OP_VRMSNORM);
   localparam logic [7:0] OP_VQUANT   = 8'(`QCORE_OP_VQUANT);
   localparam logic [7:0] OP_VSILUMUL = 8'(`QCORE_OP_VSILUMUL);
+  localparam logic [7:0] OP_VSOFTMAX = 8'(`QCORE_OP_VSOFTMAX);
   localparam logic [7:0] OP_VSUBC    = 8'(`QCORE_OP_VSUBC);
 
   logic [24:0] v_src_e, v_dst_e, v_aux_e, v_n_e, v_gap_sd, v_gap_ad;
@@ -643,10 +619,6 @@ module qcore_top #(
           && (v_gap_ad < v_n_e)) begin
         $error("qcore_top: vs_dst %0d partially overlaps vs_aux %0d over %0d elements of bank %0d",
                cmd_vs_dst, cmd_vs_aux, cmd_n, cmd_src_row);
-      end
-      if (cmd_valid_vpu && ((cmd_op == OP_VROPE) || (cmd_op == OP_VSOFTMAX))) begin
-        $error("qcore_top: opcode %02h issued to the vector unit, which has no pass for it (len %0d, pos %0d)",
-               cmd_op, cmd_len, cmd_pos);
       end
       if (({2'd0, requant_busy} + {2'd0, kv_busy} + {2'd0, vpu_busy}) > 3'd1) begin
         $error("qcore_top: %0d units claim VSRAM port B in one cycle",

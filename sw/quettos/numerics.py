@@ -681,6 +681,45 @@ def subc(x: np.ndarray, c: np.ndarray, stats: Stats | None = None) -> np.ndarray
 SOFTMAX_EXT_BITS = 8  # extra fraction bits carried by e_t and p_t beyond Q1.15
 SOFTMAX_CLAMP = 15 + SOFTMAX_EXT_BITS + 2  # distances beyond this many log2 units round to 0
 
+# The score class ``FRAC_S`` a softmax is defined over.  A fixed-point class is
+# at most 30 (a signed int32 holds 30 fraction bits and a unit), and below 16
+# the exp2 argument would have to be widened to reach its 16-bit fraction
+# instead of narrowed, which the datapath does not do: the two ends are
+# different functions, so this module and the hardware refuse the same set.
+# ``isa.CLASS_WINDOW`` carries the window into the descriptor and the decoder
+# faults a VSOFTMAX outside it.
+SOFTMAX_FRAC_MIN, SOFTMAX_FRAC_MAX = 16, 30
+
+# ``SREG_out = 2**(1 + e_max)`` is written as ``{2**15, e_max - 14}`` and that
+# exponent is an i8 in the SREG word, so the largest live V-scale exponent of a
+# row has to lie in this window for the result to have a representation.
+SOFTMAX_EMAX_MIN, SOFTMAX_EMAX_MAX = E8_MIN + 14, E8_MAX + 14
+
+
+def softmax_frac_check(frac_s: int) -> None:
+    """Raise unless ``frac_s`` lies in ``[SOFTMAX_FRAC_MIN, SOFTMAX_FRAC_MAX]``."""
+    if not SOFTMAX_FRAC_MIN <= frac_s <= SOFTMAX_FRAC_MAX:
+        raise ValueError(
+            f"softmax: FRAC_S {frac_s} outside "
+            f"[{SOFTMAX_FRAC_MIN}, {SOFTMAX_FRAC_MAX}], the class window the ISA defines"
+        )
+
+
+def softmax_sreg(e_max: int) -> SFloat:
+    """``SREG_out`` for a row whose largest live V-scale exponent is ``e_max``.
+
+    ``2**(1 + e_max) = {2**15, e_max - 14}``; an ``e_max`` whose exponent leaves
+    the i8 of the SREG word has no representation and is refused here rather
+    than wrapped.
+    """
+    if not SOFTMAX_EMAX_MIN <= e_max <= SOFTMAX_EMAX_MAX:
+        raise ValueError(
+            f"softmax: e_max {e_max} outside [{SOFTMAX_EMAX_MIN}, {SOFTMAX_EMAX_MAX}]: "
+            f"the SREG_out exponent {e_max - 14} does not fit the i8 "
+            f"[{E8_MIN}, {E8_MAX}] the SREG word carries"
+        )
+    return SFloat(1 << 15, 1 + e_max - 15)
+
 
 def softmax(
     scores: np.ndarray,
@@ -728,7 +767,12 @@ def softmax(
     scales.  The largest score always contributes ``2**23`` to ``total`` and
     ``length < 2**24``, so ``7 + e_s`` lies in ``[15, 38]``, inside the
     ``[0, 63]`` the hardware clamps a shift to.
+
+    Domain: ``frac_s`` in ``[SOFTMAX_FRAC_MIN, SOFTMAX_FRAC_MAX]`` and the
+    row's ``e_max`` in ``[SOFTMAX_EMAX_MIN, SOFTMAX_EMAX_MAX]``, the set a
+    descriptor can name and an SREG word can hold; outside it this raises.
     """
+    softmax_frac_check(frac_s)
     if length < 1 or length > scores.size or len(v_scales) < length:
         raise ValueError("softmax: bad length")
     ext = SOFTMAX_EXT_BITS
@@ -737,7 +781,7 @@ def softmax(
     d = np.clip(m - s, 0, SOFTMAX_CLAMP << frac_s)
     n = (d + (1 << frac_s) - 1) >> frac_s
     g = (n << frac_s) - d
-    f16 = g >> (frac_s - 16) if frac_s >= 16 else g << (16 - frac_s)
+    f16 = g >> (frac_s - 16)  # one shift: the window makes frac_s >= 16
     e2 = exp2_q15(f16, tables) << ext
     half = np.where(n > 0, np.left_shift(1, np.maximum(n - 1, 0)), 0)
     e_t = (e2 + half) >> n
@@ -752,6 +796,7 @@ def softmax(
     if not np.any(nonzero):
         return np.zeros_like(scores), SFLOAT_ZERO
     e_max = int(np.max(sv_e[nonzero]))
+    sreg = softmax_sreg(e_max)
     # zero-scale tokens get a dummy shift; shifts above 40 give 0 since p * Sv_m < 2**39
     shifts = np.minimum(np.where(nonzero, 16 + ext + e_max - sv_e, 16), 40)
     w = np.zeros_like(scores)
@@ -760,7 +805,7 @@ def softmax(
     if stats is not None:
         stats.clip += int(np.count_nonzero(w_len > I16_MAX))
     w[:length] = np.minimum(w_len, I16_MAX)
-    return w, SFloat(1 << 15, 1 + e_max - 15)
+    return w, sreg
 
 
 # --------------------------------------------------------------------------- SiLU
@@ -928,8 +973,10 @@ def softmax_rows(
     with ``v_scales[j] = {sv_m[j], sv_e[j]}`` shared by every row.  Returns the
     ``[T, L]`` int16 weights (zero at and beyond each row's length) and the
     per-row ``SREG_out`` as ``(m[T], e[T])`` arrays, ``{0, 0}`` for a row whose
-    V scales are all zero.  ``Stats.clip`` adds up to the per-row totals.
+    V scales are all zero.  ``Stats.clip`` adds up to the per-row totals.  The
+    domain of :func:`softmax` holds row by row.
     """
+    softmax_frac_check(frac_s)
     scores = np.asarray(scores, dtype=np.int64)
     if scores.ndim != 2:
         raise ValueError("softmax_rows: scores must be [T, L]")
@@ -949,7 +996,7 @@ def softmax_rows(
     d = np.clip(m - np.where(mask, scores, m), 0, SOFTMAX_CLAMP << frac_s)
     n = (d + (1 << frac_s) - 1) >> frac_s
     g = (n << frac_s) - d
-    f16 = g >> (frac_s - 16) if frac_s >= 16 else g << (16 - frac_s)
+    f16 = g >> (frac_s - 16)  # one shift: the window makes frac_s >= 16
     e2 = exp2_q15(f16, tables) << ext
     half = np.where(n > 0, np.left_shift(np.int64(1), np.maximum(n - 1, 0)), 0)
     e_t = np.where(mask, (e2 + half) >> n, 0)
@@ -966,6 +1013,9 @@ def softmax_rows(
     any_nz = np.any(nonzero, axis=1)
     e_max = np.max(np.where(nonzero, sve[None, :], s_min), axis=1)
     e_max_safe = np.where(any_nz, e_max, 0)
+    bad = any_nz & ((e_max_safe < SOFTMAX_EMAX_MIN) | (e_max_safe > SOFTMAX_EMAX_MAX))
+    if np.any(bad):
+        softmax_sreg(int(e_max_safe[bad][0]))  # raises with the offending row's exponent
     shifts = np.minimum(np.where(nonzero, 16 + ext + e_max_safe[:, None] - sve[None, :], 16), 40)
     prod = p * svm[None, :]
     w_len = np.where(nonzero, (prod + np.left_shift(np.int64(1), shifts - 1)) >> shifts, 0)

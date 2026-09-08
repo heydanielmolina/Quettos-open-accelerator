@@ -12,6 +12,7 @@ bounds events of every POS-derived case against the simulator.
 from __future__ import annotations
 
 import dataclasses
+import os
 import random
 
 import cocotb
@@ -20,9 +21,12 @@ from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge
 from quettos import isa, isa_sim
 from quettos.isa import Fault, Opcode, OutMode
+from quettos.program import MAX_CTX
 
 BASE = 0x0000_1000
 MASK32 = (1 << 32) - 1
+WB = int(os.environ.get("QC_WB", 16))  # the port width the entry elaborates the module with
+HEAD_DIM = isa.HEAD_DIM
 BUCKETS = ("MAC_ACTIVE", "STALL_MEM", "STALL_VPU", "STALL_KV", "STALL_SEQ", "STALL_DRAIN")
 
 # The bundle fields that are a plain descriptor field, as {port suffix: descriptor field}.
@@ -585,7 +589,7 @@ def every_opcode(rows: int = 1) -> list[isa.Descriptor]:
 @cocotb.test()
 async def test_program_of_every_opcode(dut):
     """Every opcode issues in program order with the bundle isa.decode says it carries."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.row_en = (1 << env.b_max) - 1
     env.pos, env.tok = 63, 7
     program = every_opcode(rows=(1 << env.b_max) - 1)
@@ -612,7 +616,7 @@ async def test_program_of_every_opcode(dut):
 @cocotb.test()
 async def test_issue_follows_a_pop_by_three_cycles(dut):
     """One descriptor is in flight and its issue pulse follows the pop by at least three cycles."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     program = [d for d in every_opcode() if d.opcode not in (Opcode.NOP, Opcode.FENCE)]
     await run_program(dut, env, program)
     assert len(env.pops) == len(program), f"{len(env.pops)} pops for {len(program)} descriptors"
@@ -633,7 +637,7 @@ async def test_issue_follows_a_pop_by_three_cycles(dut):
 @cocotb.test()
 async def test_pos_derived_fields(dut):
     """cmd_n, cmd_k, cmd_len and the ERR_BOUNDS count follow gemv_dims and softmax_len."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     program = [d for d in every_opcode() if d.opcode in (Opcode.GEMV, Opcode.VSOFTMAX)]
     program.append(isa.Descriptor(opcode=Opcode.HALT))
     for pos in (0, 1, 63, 64, 2047):
@@ -660,7 +664,7 @@ async def test_pos_derived_fields(dut):
 @cocotb.test()
 async def test_macs_and_wt_bytes_per_row(dut):
     """MACS and WT_BYTES are the per-row totals isa_sim counts, for one row and for two."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     for rows in (1, (1 << env.b_max) - 1):
         for pos in (0, 63, 2047):
             env.row_en = rows
@@ -703,7 +707,7 @@ def bucket_counts(env: Env, first: int, last: int) -> dict[str, int]:
 @cocotb.test()
 async def test_auto_fence_ordering(dut):
     """Only the QMEM-reading opcodes, FENCE and HALT wait for wr_idle; the wait is STALL_KV."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.wr_idle = 0
     by_op = {d.opcode: d for d in every_opcode()}
     free = [by_op[op] for op in (Opcode.VQUANT, Opcode.VSILUMUL, Opcode.KVWRITE)]
@@ -729,7 +733,7 @@ async def test_auto_fence_ordering(dut):
 @cocotb.test()
 async def test_gemv_buckets_and_stream_idle_gate(dut):
     """A GEMV retires only once the stream is idle; its cycles split MAC_ACTIVE / DRAIN / MEM."""
-    env, _ = await setup(dut, wb=16, gemv_beats=6, gemv_drain=5)
+    env, _ = await setup(dut, wb=WB, gemv_beats=6, gemv_drain=5)
     gemv = next(d for d in every_opcode() if d.opcode == Opcode.GEMV)
     embed = next(d for d in every_opcode() if d.opcode == Opcode.EMBED)
     for d, macs in ((gemv, 6), (embed, 0)):
@@ -763,7 +767,7 @@ async def test_gemv_buckets_and_stream_idle_gate(dut):
 @cocotb.test()
 async def test_zero_work_retires_without_an_issue(dut):
     """N == 0, K == 0, an empty row set and a V op with n == 0 retire with nothing issued."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.pos = 40
     program = [
         isa.Descriptor(opcode=Opcode.GEMV, n=0, k=48, addr_a=0x1000, addr_m=0x2000),
@@ -772,7 +776,7 @@ async def test_zero_work_retires_without_an_issue(dut):
         isa.Descriptor(opcode=Opcode.GEMV, row_mask=0, n=64, k=48, addr_a=0x1000),
         isa.Descriptor(opcode=Opcode.EMBED, k=0, addr_a=0x2000, addr_m=0x3000),
         isa.Descriptor(opcode=Opcode.GEMV, n_from_pos=True, n=0, k=48, addr_a=0x1000),
-        isa.Descriptor(opcode=Opcode.VSOFTMAX, n=0, len_from_pos=True, addr_a=0x5000),
+        isa.Descriptor(opcode=Opcode.VSOFTMAX, n=0, len_from_pos=True, addr_a=0x5000, sh0=16),
         isa.Descriptor(opcode=Opcode.HALT),
     ]
     await run_program(dut, env, program)
@@ -790,7 +794,7 @@ async def test_zero_work_retires_without_an_issue(dut):
 @cocotb.test()
 async def test_step_mode(dut):
     """CTRL.STEP runs exactly one descriptor, snapshots PERF and sets STEP_HALTED (DONE at HALT)."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     program = every_opcode()
     env.load(program)
     for i, d in enumerate(program):
@@ -812,15 +816,32 @@ async def test_step_mode(dut):
 
 @cocotb.test()
 async def test_fault_halt(dut):
-    """An unknown opcode, an out-of-range row and a misaligned PC each stop the program."""
-    env, _ = await setup(dut, wb=16)
+    """An unknown opcode, an out-of-range row, a bad class and a misaligned PC stop the program."""
+    env, _ = await setup(dut, wb=WB)
     env.row_en = (1 << env.b_max) - 1
     unknown = (isa.Descriptor(opcode=Opcode.GEMV).word() & ~0xFF) | 0x77
     gemv = next(d for d in every_opcode() if d.opcode == Opcode.GEMV)
+    softmax = next(d for d in every_opcode() if d.opcode == Opcode.VSOFTMAX)
+    frac_lo, frac_hi = isa.CLASS_WINDOW[Opcode.VSOFTMAX]
     bad_row = isa.Descriptor(
         opcode=Opcode.GEMV, row_mask=(1 << env.b_max) - 1, src_row=1, n=64, k=48, addr_a=0x1000
     )
     cases = (
+        *(
+            (
+                [
+                    isa.Descriptor(opcode=Opcode.NOP),
+                    dataclasses.replace(softmax, sh0=frac_s),
+                    isa.Descriptor(opcode=Opcode.HALT),
+                ],
+                BASE + isa.DESC_BYTES,
+                Fault.CLASS,
+                int(Opcode.VSOFTMAX),
+                1,
+                0,
+            )
+            for frac_s in (frac_lo - 1, frac_hi + 1)
+        ),
         (
             [isa.Descriptor(opcode=Opcode.NOP), unknown, isa.Descriptor(opcode=Opcode.HALT)],
             BASE + isa.DESC_BYTES,
@@ -864,9 +885,49 @@ async def test_fault_halt(dut):
 
 
 @cocotb.test()
+async def test_softmax_class_window(dut):
+    """Both edges of the VSOFTMAX class window and one class between them issue; outside faults."""
+    env, _ = await setup(dut, wb=WB)
+    softmax = next(d for d in every_opcode() if d.opcode == Opcode.VSOFTMAX)
+    lo, hi = isa.CLASS_WINDOW[Opcode.VSOFTMAX]
+    env.pos = 31
+    inside = [dataclasses.replace(softmax, sh0=frac_s) for frac_s in (lo, (lo + hi) // 2, hi)]
+    await run_program(dut, env, [*inside, isa.Descriptor(opcode=Opcode.HALT)])
+    assert env.fault is None, f"a class inside [{lo}, {hi}] faulted: {env.fault}"
+    assert env.descriptors == len(inside) + 1, f"{env.descriptors} descriptors retired"
+    assert [i["sh0"] for i in env.issues] == [d.sh0 for d in inside]
+    assert (env.done, env.err) == (1, 0)
+    for frac_s in (0, lo - 1, hi + 1, 63, 255):
+        env.issues.clear()
+        env.descriptors = env.done = env.err = env.snapshots = 0
+        env.fault = None
+        program = [dataclasses.replace(softmax, sh0=frac_s), isa.Descriptor(opcode=Opcode.HALT)]
+        await run_program(dut, env, program)
+        assert env.fault == (int(Fault.CLASS), int(Opcode.VSOFTMAX)), (
+            f"sh0 {frac_s}: fault {env.fault}"
+        )
+        assert env.descriptors == 0, f"sh0 {frac_s}: {env.descriptors} descriptors retired"
+        assert not env.issues, f"sh0 {frac_s}: the descriptor was issued"
+        assert env.pc == BASE, f"sh0 {frac_s}: PC {env.pc:#x}, expected the faulting descriptor"
+        assert (env.done, env.err, env.snapshots) == (1, 1, 1), f"sh0 {frac_s}: status"
+    # the fault describes the descriptor and not its work, so an empty
+    # participating set and a zero-work shape do not excuse it
+    for what, bad in (
+        ("no participating row", dataclasses.replace(softmax, sh0=lo - 1, row_mask=0)),
+        ("zero work", dataclasses.replace(softmax, sh0=hi + 1, n=0)),
+    ):
+        env.issues.clear()
+        env.descriptors = env.done = env.err = env.snapshots = 0
+        env.fault = None
+        await run_program(dut, env, [bad, isa.Descriptor(opcode=Opcode.HALT)])
+        assert env.fault == (int(Fault.CLASS), int(Opcode.VSOFTMAX)), f"{what}: {env.fault}"
+        assert env.descriptors == 0 and not env.issues, f"{what}: the descriptor was executed"
+
+
+@cocotb.test()
 async def test_abort_lets_the_descriptor_in_flight_retire(dut):
     """ABORT stops further issue, retires what is in flight and ends the run with DONE."""
-    env, _ = await setup(dut, wb=16, vpu_cycles=12)
+    env, _ = await setup(dut, wb=WB, vpu_cycles=12)
     program = [d for d in every_opcode() if d.opcode in VPU_OPS] * 2
     program.append(isa.Descriptor(opcode=Opcode.HALT))
     env.load(program)
@@ -888,7 +949,7 @@ async def test_abort_lets_the_descriptor_in_flight_retire(dut):
 @cocotb.test()
 async def test_sreg_reads_per_participating_row(dut):
     """GEMV, KVWRITE and a tracked VQUANT read one SREG word per participating row, ascending."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.row_en = (1 << env.b_max) - 1
     rows = (1 << env.b_max) - 1
     program = [
@@ -910,7 +971,7 @@ async def test_sreg_reads_per_participating_row(dut):
 @cocotb.test()
 async def test_stall_bucket_invariant(dut):
     """Every busy cycle of a random program lands in exactly one bucket and no idle cycle does."""
-    env, rng = await setup(dut, wb=16, dq_delay=3)
+    env, rng = await setup(dut, wb=WB, dq_delay=3)
     pool = [d for d in every_opcode() if d.opcode not in (Opcode.HALT,)]
     pool += [isa.Descriptor(opcode=Opcode.NOP), isa.Descriptor(opcode=Opcode.FENCE)]
     for trial in range(4):
@@ -937,7 +998,7 @@ async def test_stall_bucket_invariant(dut):
 async def test_the_issue_cycle_of_a_gemv_is_stall_mem(dut):
     """The stream re-evaluates stream_done at the command pulse, so on the issue cycle the level
     still belongs to the descriptor before it; the new one is waiting for its first beat."""
-    env, _ = await setup(dut, wb=16, gemv_beats=6, gemv_drain=5)
+    env, _ = await setup(dut, wb=WB, gemv_beats=6, gemv_drain=5)
     gemv = next(d for d in every_opcode() if d.opcode == Opcode.GEMV)
     embed = next(d for d in every_opcode() if d.opcode == Opcode.EMBED)
     program = [gemv, gemv, embed, gemv, isa.Descriptor(opcode=Opcode.HALT)]
@@ -965,7 +1026,7 @@ async def test_the_issue_cycle_of_a_gemv_is_stall_mem(dut):
 @cocotb.test()
 async def test_a_fault_declares_done_only_after_the_writes_land(dut):
     """A fault stops the program at once and waits on the write fence before DONE, as HALT does."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.wr_idle = 0
     unknown = (isa.Descriptor(opcode=Opcode.GEMV).word() & ~0xFF) | 0x77
     program = [isa.Descriptor(opcode=Opcode.NOP), unknown, isa.Descriptor(opcode=Opcode.HALT)]
@@ -989,7 +1050,7 @@ async def test_a_fault_declares_done_only_after_the_writes_land(dut):
 @cocotb.test()
 async def test_an_abort_declares_done_only_after_the_writes_land(dut):
     """ABORT stops issuing at once; DONE waits for the writes of the descriptor that retired."""
-    env, _ = await setup(dut, wb=16, kv_cycles=8)
+    env, _ = await setup(dut, wb=WB, kv_cycles=8)
     env.wr_idle = 0
     kv = next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE)
     program = [kv, kv, kv, isa.Descriptor(opcode=Opcode.HALT)]
@@ -1017,7 +1078,7 @@ async def test_an_abort_declares_done_only_after_the_writes_land(dut):
 @cocotb.test()
 async def test_abort_stops_a_descriptor_waiting_on_the_fence(dut):
     """A descriptor popped but held at the auto-fence is not issued: ABORT leaves PC on it."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.wr_idle = 0
     gemv = next(d for d in every_opcode() if d.opcode == Opcode.GEMV)
     env.load([gemv, isa.Descriptor(opcode=Opcode.HALT)])
@@ -1040,7 +1101,7 @@ async def test_abort_stops_a_descriptor_waiting_on_the_fence(dut):
 @cocotb.test()
 async def test_abort_at_every_point_of_a_descriptor_setup(dut):
     """Wherever ABORT lands, nothing is issued after it and PC ends on a retired boundary."""
-    env, _ = await setup(dut, wb=16, dq_delay=2)
+    env, _ = await setup(dut, wb=WB, dq_delay=2)
     program = [
         next(d for d in every_opcode() if d.opcode == Opcode.GEMV),
         next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE),
@@ -1070,7 +1131,7 @@ async def test_abort_at_every_point_of_a_descriptor_setup(dut):
 @cocotb.test()
 async def test_the_prefetch_takes_the_write_fence(dut):
     """fetch_hold holds the descriptor prefetch exactly while a write is unacknowledged."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     for idle in (1, 0, 1, 0):
         env.wr_idle = idle
         await qc_stream.cycles(dut.clk, 2)
@@ -1100,7 +1161,7 @@ CAPPED_GEMV = isa.Descriptor(
 @cocotb.test()
 async def test_an_unexecuted_descriptor_counts_no_bounds_event(dut):
     """ERR_BOUNDS follows the descriptors the core commits to, not the ones an ABORT discards."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.pos = 2047
     halt = isa.Descriptor(opcode=Opcode.HALT)
     per = expect_events(CAPPED_GEMV, pos=env.pos, row_en=env.row_en, b_max=env.b_max, wb=env.wb)[
@@ -1152,10 +1213,10 @@ async def test_an_unexecuted_descriptor_counts_no_bounds_event(dut):
 @cocotb.test()
 async def test_a_zero_work_descriptor_still_counts_its_bounds_event(dut):
     """A capped VSOFTMAX with n == 0 retires without an issue and still counts its clamped len."""
-    env, _ = await setup(dut, wb=16)
+    env, _ = await setup(dut, wb=WB)
     env.pos = 2047
     program = [
-        isa.Descriptor(opcode=Opcode.VSOFTMAX, n=0, len_from_pos=True, addr_a=0x5000),
+        isa.Descriptor(opcode=Opcode.VSOFTMAX, n=0, len_from_pos=True, addr_a=0x5000, sh0=16),
         isa.Descriptor(opcode=Opcode.HALT),
     ]
     env.err_bounds = 0
@@ -1172,7 +1233,7 @@ async def test_a_zero_work_descriptor_still_counts_its_bounds_event(dut):
 @cocotb.test()
 async def test_a_stepped_descriptor_halts_on_the_write_fence(dut):
     """STEP_HALTED waits on the same write fence every other stop takes."""
-    env, _ = await setup(dut, wb=16, kv_cycles=6)
+    env, _ = await setup(dut, wb=WB, kv_cycles=6)
     kv = next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE)
     env.load([kv, isa.Descriptor(opcode=Opcode.HALT)])
     env.wr_idle = 0
@@ -1198,7 +1259,7 @@ async def test_a_stepped_descriptor_halts_on_the_write_fence(dut):
 @cocotb.test()
 async def test_a_step_an_abort_cuts_short_ends_on_done(dut):
     """An ABORT written during a step ends the run on the fence with DONE, not STEP_HALTED."""
-    env, _ = await setup(dut, wb=16, kv_cycles=8)
+    env, _ = await setup(dut, wb=WB, kv_cycles=8)
     kv = next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE)
     env.load([kv, isa.Descriptor(opcode=Opcode.HALT)])
     env.wr_idle = 0
@@ -1325,7 +1386,7 @@ def pos_shapes() -> list[isa.Descriptor]:
 async def test_pos_derived_sweep_against_the_simulator(dut):
     """Every shape at every position and row set: the decoded extents, the MAC and weight-byte
     totals and the bounds events are the ones quettos.isa_sim counts."""
-    env, _ = await setup(dut, wb=16, gemv_beats=2, gemv_drain=1, vpu_cycles=2)
+    env, _ = await setup(dut, wb=WB, gemv_beats=2, gemv_drain=1, vpu_cycles=2)
     shapes = pos_shapes()
     checked = 0
     for pos in SWEEP_POSITIONS:
@@ -1360,7 +1421,169 @@ async def test_pos_derived_sweep_against_the_simulator(dut):
                 f"{where}: ERR_BOUNDS {env.err_bounds} != {totals['err_bounds']}"
             )
             assert (env.done, env.err) == (1, 0), f"{where}: the sweep run did not end on HALT"
-    assert checked == len(shapes) * len(SWEEP_POSITIONS) * len(SWEEP_ROWS), (
-        f"{checked} descriptors checked"
+    # A row set the core does not have makes the descriptor zero work, so the shapes that
+    # issue are the ones whose participating set survives ROW_EN at this B_MAX.
+    active = sum(1 for m, e in SWEEP_ROWS if m & e & ((1 << env.b_max) - 1))
+    assert checked == len(shapes) * len(SWEEP_POSITIONS) * active, (
+        f"{checked} descriptors checked over {active} row sets"
     )
     env.row_en = 1
+
+
+# --------------------------------------------------------------------------- attention
+
+
+# One (layer, KV head) region small enough to hand sw/quettos/isa_sim.py as an image, with
+# each sub-region given the room it takes at the widest port: 16 KB of meta per cache,
+# 64*MAX_CTX bytes of K^T and ceil(64/WB)*MAX_CTX*WB of V, which is 256 KB at WB = 128.
+KMETA_AT, VMETA_AT, KT_AT, V_AT = 0x0000, 0x0001_0000, 0x0002_0000, 0x0004_0000
+KV_IMAGE_BYTES = 0x0009_0000
+
+
+def attention_head(max_ctx: int = MAX_CTX, rows: int = 1) -> list[isa.Descriptor]:
+    """The scores GEMV, the softmax and the PV GEMV of one head, as compiler.py emits them."""
+    return [
+        isa.gemv(
+            addr_a=KT_AT,
+            addr_m=KMETA_AT,
+            n=max_ctx,
+            k=HEAD_DIM,
+            vs_src=0,
+            vs_dst=1024,
+            sreg_src=1,
+            s1=9,
+            sbias=-2,
+            n_from_pos=True,
+            row_mask=rows,
+        ),
+        isa.vsoftmax(
+            vs_src=1024,
+            vs_dst=4096,
+            n=max_ctx,
+            addr_a=VMETA_AT,
+            frac_s=24,
+            sreg_dst=6,
+            row_mask=rows,
+        ),
+        isa.gemv(
+            addr_a=V_AT,
+            n=HEAD_DIM,
+            k=max_ctx,
+            vs_src=4096,
+            vs_dst=8192,
+            sreg_src=6,
+            s1=14,
+            sbias=-1,
+            unit_meta=True,
+            k_from_pos=True,
+            row_mask=rows,
+        ),
+    ]
+
+
+@cocotb.test()
+async def test_attention_step_extents(dut):
+    """The three descriptors of an attention head at every position, against the simulator.
+
+    The scores GEMV takes ``N`` from POS and keeps the capacity as its tile
+    stride, the softmax takes ``len`` from POS, and the PV GEMV takes ``K`` from
+    POS with the unit-scale bit and ``MAX_CTX`` as its tile stride.  Neither GEMV
+    contributes to ``WT_BYTES`` -- a POS-derived extent makes the weight bytes a
+    run-time quantity -- and both contribute their per-row MACs.
+    """
+    env, _ = await setup(dut, wb=WB, gemv_beats=3, gemv_drain=2, vpu_cycles=3)
+    for rows in (1, (1 << env.b_max) - 1):
+        for pos in (0, 1, 63, 64, 65, MAX_CTX - 1, MAX_CTX, MAX_CTX + 1):
+            head = attention_head(rows=rows)
+            head.append(isa.Descriptor(opcode=Opcode.HALT))
+            env.pos, env.row_en = pos, rows
+            env.issues.clear()
+            env.macs = env.wt_bytes = env.err_bounds = env.done = env.err = 0
+            env.descriptors = 0
+            await run_program(dut, env, head)
+            want = issuing(head, pos=pos, row_en=rows, b_max=env.b_max, wb=env.wb)
+            where = f"rows {rows:#x} POS {pos}"
+            assert len(env.issues) == len(want), f"{where}: {len(env.issues)} issues"
+            for got, d in zip(env.issues, want, strict=True):
+                check_bundle(
+                    got,
+                    expect(d, pos=pos, tok=env.tok, row_en=rows, b_max=env.b_max, wb=env.wb),
+                    f"{where} ({d.opcode.name})",
+                )
+            scores, softmax, pv = env.issues
+            n_want, _, _ = isa_sim.gemv_dims(head[0], pos, env.wb)
+            _, k_want, _ = isa_sim.gemv_dims(head[2], pos, env.wb)
+            assert scores["n"] == n_want and scores["k_stride"] == HEAD_DIM, (
+                f"{where}: scores N {scores['n']} stride {scores['k_stride']}"
+            )
+            assert softmax["len"] == isa_sim.softmax_len(head[1], pos)[0], f"{where}: len"
+            assert pv["k"] == k_want and pv["k_stride"] == MAX_CTX and pv["unit_meta"] == 1, (
+                f"{where}: PV K {pv['k']} stride {pv['k_stride']} unit_meta {pv['unit_meta']}"
+            )
+            totals = {"err_bounds": 0, "macs": 0, "wt_bytes": 0}
+            for d in head:
+                for key, v in expect_events(
+                    d, pos=pos, row_en=rows, b_max=env.b_max, wb=env.wb
+                ).items():
+                    totals[key] += v
+            assert env.wt_bytes == 0 and totals["wt_bytes"] == 0, (
+                f"{where}: a POS-derived GEMV counted {env.wt_bytes} weight bytes"
+            )
+            assert env.macs == totals["macs"], f"{where}: MACS {env.macs} != {totals['macs']}"
+            assert env.err_bounds == totals["err_bounds"], (
+                f"{where}: ERR_BOUNDS {env.err_bounds} != {totals['err_bounds']}"
+            )
+            assert (env.done, env.err) == (1, 0), f"{where}: the head did not end on HALT"
+            # and the same head on the reference machine, counter for counter
+            m = isa_sim.Machine(bytes(KV_IMAGE_BYTES), wb=env.wb, b_max=env.b_max, vsram_words=2048)
+            isa_sim.run_token(m, head, env.tok, pos, row_en=rows)
+            for counter, got in (
+                ("MACS", env.macs),
+                ("WT_BYTES", env.wt_bytes),
+                ("DESCRIPTORS", env.descriptors),
+            ):
+                assert got == m.perf_value(counter), (
+                    f"{where}: {counter} {got} != {m.perf_value(counter)} in isa_sim"
+                )
+            assert env.err_bounds == m.err_bounds, (
+                f"{where}: ERR_BOUNDS {env.err_bounds} != {m.err_bounds} in isa_sim"
+            )
+    env.row_en = 1
+
+
+@cocotb.test()
+async def test_every_bucket_has_one_owner(dut):
+    """Each descriptor class owns its in-flight cycles, and the six buckets sum to BUSY.
+
+    A V op's cycles are STALL_VPU -- all six opcodes, VROPE and VSOFTMAX with the
+    rest -- a KVWRITE's are STALL_KV, and over a whole run every busy cycle falls
+    in exactly one bucket, which is the invariant qcore_perf asserts.
+    """
+    env, _ = await setup(dut, wb=WB, gemv_beats=4, gemv_drain=3, vpu_cycles=7, kv_cycles=5)
+    by_op = {d.opcode: d for d in every_opcode()}
+    owners = [(op, "STALL_VPU") for op in VPU_OPS] + [(Opcode.KVWRITE, "STALL_KV")]
+    for op, bucket in owners:
+        env.issues.clear()
+        env.retires.clear()
+        await run_program(dut, env, [by_op[op], isa.Descriptor(opcode=Opcode.HALT)])
+        issue, retire = env.issues[0]["cycle"], env.retires[0]["cycle"]
+        counts = bucket_counts(env, issue, retire - 1)
+        assert counts[bucket] == retire - issue, (
+            f"{op.name}: {counts[bucket]} of {retire - issue} in-flight cycles in {bucket}"
+        )
+        for name, n in counts.items():
+            assert name == bucket or n == 0, f"{op.name}: {n} cycles in {name}"
+    # The whole-run sum, over a program that mixes every class.
+    mark = len(env.trace)
+    env.pos = 64
+    await run_program(dut, env, every_opcode())
+    per_bucket = dict.fromkeys(BUCKETS, 0)
+    busy = 0
+    for on, mask in env.trace[mark:]:
+        busy += on
+        assert bool(on) == bool(mask), f"bucket {bucket_name(mask)} with busy {on}"
+        for i, name in enumerate(BUCKETS):
+            per_bucket[name] += (mask >> i) & 1
+    total = sum(per_bucket.values())
+    assert total == busy, f"the buckets sum to {total}, BUSY is {busy}"
+    assert all(per_bucket.values()), f"a bucket never owned a cycle in the mixed run: {per_bucket}"

@@ -76,7 +76,15 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   `always_ff @(posedge clk) if (rst) ... else ...`.
 - **`unique case` / `priority case`**, `unique if`, `priority if`.
 - **`interface`**, **`class`**, `modport`, `program`, `clocking`, `assert
-  property`, `always_latch`, `initial` blocks in synthesizable modules.
+  property`, `always_latch`, `initial` blocks in synthesizable modules -- with
+  one exception, for one reason. The table images the ROM rule above mandates
+  reach their memory through `$readmemh`, and an initializing `$readmemh` has
+  no placement outside an `initial` block that Verilator, Yosys and Icarus all
+  read the same way. `rtl/qcore_lut_rom.sv` therefore carries
+  `initial $readmemh(ROM_FILE, mem);` and is the only file under `rtl/` with an
+  `initial` block (`docs/RTL.md` 3.15). State a reset can reach is initialized
+  in `always_ff` under `rst` instead, and a second initial block needs a reason
+  of the same kind.
 - Literal **`$readmemh("...")`** with a string constant (CI greps for it).
 - Multi-dimensional unpacked memories, `automatic` variables, `real`,
   `string` variables and `string` parameters, `$clog2` on anything but
@@ -110,8 +118,11 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
 
 ## 4. Three-parser lint recipe
 
-`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` module and
-every `sim/cocotb/wrappers/*.sv` block assembly as its own top. The file list is
+`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` file -- the
+seventeen modules and the package -- and every `sim/cocotb/wrappers/*.sv` block
+assembly as its own top: nineteen tops. The package is taken the way each tool
+takes a package (Verilator elaborates it as the top unit, Yosys parses it, and
+Icarus, which needs a module, gets an empty wrapper). The file list is
 `qcore_pkg.sv` first and then every other file once: Yosys and Icarus resolve
 `qcore_pkg::` references only after parsing the package, and a file named twice
 is a duplicate declaration (Verilator `MODDUP`, an Icarus syntax error).
@@ -170,13 +181,21 @@ message.
 - Every performance, synthesis or quality number in `README.md` comes from a
   command in this repository (`make perf`, `make synth`, `make bringup-sweep`,
   `uv run quettos check`) and the row names that command.
-- Synthesis numbers are never typed by hand: `scripts/synth_report.py` writes
-  each `syn/reports/*.md` from the Yosys log of the run that produced it, and
-  `make synth` regenerates them and fails on any difference. A wall-clock figure
-  is a median with its range and the number of runs, and it is quoted once, on
-  the page that owns it: `docs/PERFORMANCE.md` for a harness run, that tool's
-  own `sim/<tool>/README.md` for a `make` target of its own. Everywhere else
-  names the command and points at that page.
+- Synthesis figures are never typed by hand: `scripts/synth_report.py` writes
+  each `syn/reports/*.md` from the Yosys log of the run that produced it -- the
+  tool version, the elaborated parameters, the `stat -tech xilinx` table, the
+  hard-block instances with the source line each was inferred from, and the
+  `ltp` path. `make synth` regenerates the page and fails when the run no
+  longer reproduces it: byte for byte on the Yosys build the report records,
+  and on any other build against its parameters and its hard-block inventory,
+  since LUT packing and path length belong to the build. One section of a
+  report is a person's, `## Notes (hand-written)` at the end, which the
+  generator carries forward unchanged; whoever changes a block owns keeping its
+  note true.
+- A wall-clock figure is a median with its range and the number of runs, and
+  it is quoted once, on the page that owns it: `docs/PERFORMANCE.md` for a
+  harness run, that tool's own `sim/<tool>/README.md` for a `make` target of
+  its own. Everywhere else names the command and points at that page.
 - Analytical projections live in `docs/`, labeled **estimate**.
 - FPGA tokens/s figures state the clock and memory bandwidth they are derived
   from (100 MHz and 6.4 GB/s for WB=64).

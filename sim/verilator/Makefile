@@ -5,7 +5,7 @@
 #
 #   make -C sim/verilator build                  build the default configuration
 #   make -C sim/verilator run IMAGE=<dir>        run it on a compiled model
-#   make -C sim/verilator run ARGS="--traffic"   pass harness flags
+#   make -C sim/verilator run ARGS="--max-new 4"   pass harness flags
 #   make -C sim/verilator csr-check              CSR driver against rtl/qcore_csr.sv
 #   make -C sim/verilator clean
 
@@ -42,6 +42,7 @@ SRCS := $(HERE)/main.cpp $(HDRS)
 # a string parameter is set quoted on the Verilator command line, so the quotes
 # are escaped through the shell that runs the build.
 ROMS := -GROM_FILE_SIGMOID=\"$(RTL)/gen/sigmoid.hex\" \
+        -GROM_FILE_EXP2=\"$(RTL)/gen/exp2.hex\" \
         -GROM_FILE_RSQRT=\"$(RTL)/gen/rsqrt.hex\" \
         -GROM_FILE_RECIP=\"$(RTL)/gen/recip.hex\"
 

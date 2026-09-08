@@ -1,4 +1,4 @@
-"""cocotb tests of qcore_vpu_top: VRMSNORM, VQUANT, VSILUMUL and VSUBC.
+"""cocotb tests of qcore_vpu_top: the six V opcodes of ``docs/ISA.md``.
 
 Every descriptor is run twice -- once on the DUT against a model of the VSRAM
 banks, the SREG banks and the QMEM read port, once on ``sw/quettos/isa_sim.py``
@@ -12,12 +12,14 @@ word, both activation rows, every flag combination of VQUANT and, in a quarter
 of the cases, a destination written over its source; the directed coroutines
 pin the boundary of each operation (the zero vector, an absmax of 2^31, the
 sigmoid clamp and its odd symmetry, the saturating subtract, the reciprocal
-bound of the quantizer, the epsilon-only RMS, the top of the RMS shift field),
-the in-place and cross-bank halves of the range rule, the group index that
-saturates rather than wrapping onto a register it already wrote, and the ranges
-that leave the VSRAM.  Memory latencies 1, 32 and 200, a throttled arbiter and
-a sparse request grant are swept over the two operations that stream an
-operand.
+bound of the quantizer, the epsilon-only RMS, the top of the RMS shift field,
+the rotation's saturating edge, the softmax row of equal scores, the row far
+enough below its maximum to round to zero, the token that reaches the weight
+clip and the V scales that are the canonical zero), the in-place and cross-bank
+halves of the range rule, the group index that saturates rather than wrapping
+onto a register it already wrote, and the ranges that leave the VSRAM.  Memory
+latencies 1, 32 and 200, a throttled arbiter and a sparse request grant are
+swept over every operation that streams an operand.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import dataclasses
 import math
 import os
 import random
+import struct
 
 import cocotb
 import numpy as np
@@ -35,6 +38,7 @@ from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge
 from quettos import compiler, isa, isa_sim, numerics
 from quettos.isa import Descriptor, Opcode, VquantFlag
+from quettos.isa_sim import softmax_len
 from quettos.numerics import SFloat
 
 WB = int(os.environ["QC_WB"])
@@ -82,6 +86,11 @@ class Env:
         self.writes: list[tuple[int, int]] = []  # (bank, word) of every accepted write
         self.src_row = 0
         self.dst_row = 0
+        self.pos = 0
+        # The bank the crossbar has to give port B for this descriptor's reads
+        # and for its writes: 1 selects dst_row + row, 0 selects src_row + row.
+        self.sel_read = 0
+        self.sel_write = 1
         self._pending: list[tuple[int, int, int]] = []
         self._last_deliver = -1
         self._read_b_prev = False
@@ -144,14 +153,18 @@ class Env:
             assert addr_a < VSRAM_WORDS and bank_a < B_MAX, f"cycle {self.cycle}: bad port A read"
         if we:
             assert addr_b < VSRAM_WORDS and bank_b < B_MAX, f"cycle {self.cycle}: bad port B write"
-            assert sel == 1, f"cycle {self.cycle}: a write with vsb_sel_dst low"
+            assert sel == self.sel_write, (
+                f"cycle {self.cycle}: vsb_sel_dst {sel} on a write, expected {self.sel_write}"
+            )
             assert not (ena and bank_a == bank_b and addr_a == addr_b), (
                 f"cycle {self.cycle}: word {addr_a} read on port A while port B writes it"
             )
             self.write_word(bank_b, addr_b, we, v(dut.vsb_wdata))
             self.writes.append((bank_b, addr_b))
         if enb:
-            assert sel == 0, f"cycle {self.cycle}: a port B read with vsb_sel_dst high"
+            assert sel == self.sel_read, (
+                f"cycle {self.cycle}: vsb_sel_dst {sel} on a read, expected {self.sel_read}"
+            )
 
         if int(dut.sreg_wr_en.value):
             idx = v(dut.sreg_wr_idx)
@@ -230,6 +243,8 @@ class Env:
         dut.cmd_track_absmax.value = int(d.track_absmax)
         dut.cmd_addr_a.value = d.addr_a
         dut.cmd_n.value = d.n
+        dut.cmd_len.value = softmax_len(d, self.pos)[0] if d.opcode == Opcode.VSOFTMAX else 0
+        dut.cmd_pos.value = self.pos
         dut.cmd_vs_src.value = d.vs_src
         dut.cmd_vs_dst.value = d.vs_dst
         dut.cmd_vs_aux.value = d.vs_aux
@@ -244,6 +259,11 @@ class Env:
         dut.cmd_valid_vpu.value = 1
         self.src_row = d.src_row
         self.dst_row = d.dst_row
+        # VROPE rewrites its own source, so both its port-B reads and its
+        # port-B writes address bank src_row + row; the softmax weight pass
+        # reads and writes the destination bank.
+        self.sel_read = 1 if d.opcode == Opcode.VSOFTMAX else 0
+        self.sel_write = 0 if d.opcode == Opcode.VROPE else 1
         await self.step()
         dut.cmd_valid_vpu.value = 0
 
@@ -288,7 +308,10 @@ def sreg_index_errors(d: Descriptor, rows: list) -> tuple[int, int]:
     writes = reads = 0
     flags = VquantFlag(d.flags) if d.opcode == Opcode.VQUANT else VquantFlag(0)
     for _ in rows:
-        if d.opcode == Opcode.VQUANT:
+        if d.opcode == Opcode.VSOFTMAX:
+            # the output scale is written whether or not track_absmax is set
+            writes += int(d.sreg_dst >= isa.SREG_COUNT)
+        elif d.opcode == Opcode.VQUANT:
             if flags & VquantFlag.GROUP:
                 groups = -(-d.n // d.vs_aux) if d.vs_aux else 1
                 writes += sum(1 for g in range(groups) if d.sreg_dst + g >= isa.SREG_COUNT)
@@ -305,6 +328,7 @@ def reference(env: Env, d: Descriptor, row_en: int, sreg_pre: dict) -> isa_sim.M
     """The same descriptor on isa_sim over the same image, VSRAM and SREG state."""
     m = isa_sim.Machine(env.image, wb=WB, b_max=B_MAX, vsram_words=VSRAM_WORDS, tables=qn.tables())
     m.csr["ROW_EN"] = row_en
+    m.csr["POS"] = env.pos
     m.vsram[:] = env.vsram
     for (bank, idx), val in sreg_pre.items():
         m.sreg[bank][idx] = val
@@ -423,13 +447,19 @@ async def run_one(
     assert env.err_shift - esh0 == m.stats_vpu.err_shift, (
         f"{describe(d)}: ERR_SHIFT {env.err_shift - esh0} != {m.stats_vpu.err_shift}"
     )
-    assert env.err_bounds - ebd0 == m.err_bounds - w_err - r_err, (
-        f"{describe(d)}: ERR_BOUNDS {env.err_bounds - ebd0} != {m.err_bounds - w_err - r_err}"
+    # the length clamp of a VSOFTMAX is the dispatcher's ERR_BOUNDS event, not
+    # the unit's: the unit is handed cmd_len already inside [1, n]
+    clamped = 0
+    if d.opcode == Opcode.VSOFTMAX:
+        clamped = softmax_len(d, env.pos)[1] * len(rows)
+    want_bounds = m.err_bounds - w_err - r_err - clamped
+    assert env.err_bounds - ebd0 == want_bounds, (
+        f"{describe(d)}: ERR_BOUNDS {env.err_bounds - ebd0} != {want_bounds}"
     )
     assert env.sreg_err - serr0 == w_err, (
         f"{describe(d)}: SREG index errors {env.sreg_err - serr0} != {w_err}"
     )
-    if d.opcode == Opcode.VQUANT:
+    if d.opcode in (Opcode.VQUANT, Opcode.VSOFTMAX):
         assert int(env.dut.clip_count.value) == m.stats_vpu.clip, (
             f"{describe(d)}: clips {int(env.dut.clip_count.value)} != {m.stats_vpu.clip}"
         )
@@ -522,6 +552,8 @@ async def setup(dut, seed: int, *, latency: int = 32, req_ready=None) -> tuple[E
         dut.cmd_track_absmax,
         dut.cmd_addr_a,
         dut.cmd_n,
+        dut.cmd_len,
+        dut.cmd_pos,
         dut.cmd_vs_src,
         dut.cmd_vs_dst,
         dut.cmd_vs_aux,
@@ -1025,6 +1057,425 @@ async def test_vsilumul(dut) -> None:
     assert saturating >= 3, f"only {saturating} of {CASES} VSILUMUL cases saturated"
 
 
+# --------------------------------------------------------------------------- VROPE
+
+HEAD = isa.HEAD_DIM  # 64 elements, 32 pairs
+ROPE_BYTES = isa.ROPE_ROW_BYTES  # 32 cos then 32 sin, int16 Q1.14
+POSITIONS = (0, 1, 31, 32, 63, 64, 65, 255, 400)  # POS edges the table row is addressed from
+
+
+def rope_row_bytes(rng: random.Random, *, full: bool = False) -> bytes:
+    """One table row: ``HEAD/2`` cosines then ``HEAD/2`` sines.
+
+    ``full`` draws over the whole int16 range instead of Q1.14, which is what
+    puts ``a * cos - b * sin`` past the int32 the lane saturates to.
+    """
+    hi = (1 << 15) if full else ((1 << 14) + 1)
+    vals = [rng.randrange(-hi, hi) for _ in range(HEAD)]
+    return np.array(vals, dtype="<i2").tobytes()
+
+
+def rope_descriptor(rng: random.Random, heads: int) -> tuple[Descriptor, int]:
+    """A VROPE over ``heads`` heads with a random offset, row layout and table base."""
+    src, _, _ = offsets(rng)
+    mask, _, sr, _ = rows_of(rng)
+    addr = ROW_BASE + ROPE_BYTES * rng.randrange(4)
+    d = isa.vrope(vs_src=src, n=heads * HEAD, addr_a=addr, src_row=sr, row_mask=mask)
+    return d, addr
+
+
+@cocotb.test()
+async def test_vrope(dut) -> None:
+    """Random VROPE descriptors over every head count, offset, row layout and POS edge."""
+    env, rng = await setup(dut, 66)
+    row_en = 3 if B_MAX > 1 else 1
+    saturating = 0
+    for case in range(CASES):
+        heads = (1, 2, 3, 4, 8)[case % 5] if case < 5 else rng.randrange(1, 6)
+        d, addr = rope_descriptor(rng, heads)
+        env.pos = POSITIONS[case % len(POSITIONS)]
+        full = case % 3 == 0
+        env.image = image_with(rope_row_bytes(rng, full=full), addr + env.pos * ROPE_BYTES)
+        scatter(env, rng)
+        fill_sources(env, rng, d, row_en, bits=31 if full else rng.randrange(2, 32))
+        before = env.sat
+        await run_one(env, d, row_en)
+        if env.sat > before:
+            saturating += 1
+    assert saturating >= 3, f"only {saturating} of {CASES} VROPE cases saturated"
+
+
+@cocotb.test()
+async def test_vrope_pairs_and_saturation(dut) -> None:
+    """The two halves of every pair, the rotation identity, and the int32 edge of both results."""
+    env, rng = await setup(dut, 77)
+
+    # cos = 1.0, sin = 0 in Q1.14 leaves the vector alone: any element that
+    # moved would be a pair the unit crossed the wrong way.
+    row = np.zeros(HEAD, dtype=np.int64)
+    row[: HEAD // 2] = 1 << 14
+    d = isa.vrope(vs_src=64, n=2 * HEAD, addr_a=ROW_BASE)
+    env.pos = 7
+    env.image = image_with(row.astype("<i2").tobytes(), ROW_BASE + env.pos * ROPE_BYTES)
+    scatter(env, rng)
+    x = rand_vec(rng, d.n, 16)
+    fill_sources(env, rng, d, 1, values=x)
+    await run_one(env, d, 1)
+    got = env.vsram[0, d.vs_src : d.vs_src + d.n]
+    bad = first_diff(x, got)
+    assert bad is None, f"the identity rotation moved element {bad}: {x[bad]} -> {got[bad]}"
+
+    # cos = 0, sin = 1.0 swaps the halves with a sign: a' = -b, b' = a. Every
+    # element of both halves therefore has to change, which is what makes this
+    # a check of the pairing rather than of the arithmetic.
+    row = np.zeros(HEAD, dtype=np.int64)
+    row[HEAD // 2 :] = 1 << 14
+    env.image = image_with(row.astype("<i2").tobytes(), ROW_BASE + env.pos * ROPE_BYTES)
+    scatter(env, rng)
+    x = rand_vec(rng, d.n, 16)
+    fill_sources(env, rng, d, 1, values=x)
+    await run_one(env, d, 1)
+    got = env.vsram[0, d.vs_src : d.vs_src + d.n]
+    want = x.copy().reshape(-1, HEAD)
+    a, b = x.reshape(-1, HEAD)[:, : HEAD // 2], x.reshape(-1, HEAD)[:, HEAD // 2 :]
+    want[:, : HEAD // 2], want[:, HEAD // 2 :] = -b, a
+    bad = first_diff(want.reshape(-1), got)
+    assert bad is None, f"the quarter turn differs first at element {bad}"
+
+    # the saturating edge: the most negative int32 against the most negative
+    # cosine and a zero sine puts both a' and b' past int32, and each counts once
+    row = np.zeros(HEAD, dtype=np.int64)
+    row[: HEAD // 2] = -(1 << 15)
+    env.image = image_with(row.astype("<i2").tobytes(), ROW_BASE + env.pos * ROPE_BYTES)
+    d = isa.vrope(vs_src=64, n=HEAD, addr_a=ROW_BASE)
+    scatter(env, rng)
+    fill_sources(env, rng, d, 1, values=np.full(d.n, -(1 << 31), dtype=np.int64))
+    before = env.sat
+    await run_one(env, d, 1)
+    assert env.sat - before == d.n, (
+        f"{env.sat - before} of the {d.n} rotation results saturated, expected all of them"
+    )
+
+
+# --------------------------------------------------------------------------- VSOFTMAX
+
+
+def meta_bytes(scales: list[SFloat]) -> bytes:
+    """The 8-byte meta records of ``docs/MEMORY_MAP.md``: bias, mantissa, exponent, pad."""
+    return b"".join(struct.pack("<iHbB", 0, s.m, s.e, 0) for s in scales)
+
+
+def rand_scales(rng: random.Random, count: int, *, zeros: str = "mixed") -> list[SFloat]:
+    """``count`` V scales: ``none``, ``mixed`` or ``all`` of them the canonical zero."""
+    base = rng.randrange(-40, 40)
+    spread = rng.choice((1, 2, 4, 20))
+    out: list[SFloat] = []
+    for _ in range(count):
+        if zeros == "all" or (zeros == "mixed" and rng.randrange(4) == 0):
+            out.append(SFloat(0, 0))
+        else:
+            e = max(-128, min(127, base + rng.randrange(-spread, spread + 1)))
+            out.append(SFloat(rng.randrange(1 << 15, 1 << 16), e))
+    return out
+
+
+def rand_scores(rng: random.Random, count: int, frac_s: int, *, spread: int = 4) -> np.ndarray:
+    """``count`` int32 scores in the log2 domain of class ``frac_s``, ``spread`` units wide."""
+    step = min(spread << frac_s, (1 << 31) - 1)
+    base = rng.randrange(-(1 << 20), 1 << 20)
+    lo, hi = -(1 << 31), (1 << 31) - 1
+    return np.array(
+        [max(lo, min(hi, base + rng.randrange(-step, step + 1))) for _ in range(count)],
+        dtype=np.int64,
+    )
+
+
+def softmax_descriptor(
+    rng: random.Random,
+    n: int,
+    length: int | None,
+    *,
+    over: str = "",
+    addr: int = ROW_BASE,
+) -> Descriptor:
+    src, dst, _ = offsets(rng, over)
+    mask, _, sr, dr = rows_of(rng)
+    return isa.vsoftmax(
+        vs_src=src,
+        vs_dst=dst,
+        n=n,
+        addr_a=addr,
+        frac_s=rng.randrange(16, 31),
+        sreg_dst=rng.randrange(0, isa.SREG_COUNT),
+        length=length,
+        src_row=sr,
+        dst_row=dr,
+        row_mask=mask,
+    )
+
+
+async def run_softmax(
+    env: Env,
+    rng: random.Random,
+    d: Descriptor,
+    length: int,
+    row_en: int,
+    *,
+    scales: list[SFloat] | None = None,
+    scores: np.ndarray | None = None,
+    addr: int = ROW_BASE,
+) -> None:
+    """Lay the V-scale records and the scores down, then compare the descriptor."""
+    sc = scales if scales is not None else rand_scales(rng, length)
+    env.image = image_with(meta_bytes(sc), addr)
+    scatter(env, rng)
+    s = scores if scores is not None else rand_scores(rng, d.n, d.sh0)
+    for _, src, _ in participants(d, row_en):
+        fill(env, rng, src, d.vs_src, s)
+    await run_one(env, d, row_en)
+
+
+@cocotb.test()
+async def test_vsoftmax(dut) -> None:
+    """Random VSOFTMAX rows over every length class, offset, row layout and scale mix."""
+    env, rng = await setup(dut, 88)
+    row_en = 3 if B_MAX > 1 else 1
+    zero_scale_rows = 0
+    clipped = 0
+    for case in range(CASES // 2):
+        length = LENGTHS[case % len(LENGTHS)] if case < len(LENGTHS) else rng.choice(LENGTHS)
+        n = length if case % 3 == 0 else length + rng.choice((1, 7, 8, 64))
+        env.pos = length - 1
+        from_pos = case % 2 == 0
+        d = softmax_descriptor(rng, n, None if from_pos else length, over=in_place(case))
+        mix = ("mixed", "none", "mixed", "all")[case % 4]
+        before = int(dut.clip_count.value)
+        await run_softmax(env, rng, d, length, row_en, scales=rand_scales(rng, length, zeros=mix))
+        if mix == "all":
+            zero_scale_rows += 1
+        if int(dut.clip_count.value) > before:
+            clipped += 1
+    assert zero_scale_rows >= 3, "the all-zero V scale row was never driven"
+    print(f"VSOFTMAX: {clipped} of {CASES // 2} rows reached the weight clip")
+
+
+@cocotb.test()
+async def test_vsoftmax_boundaries(dut) -> None:
+    """The rows numerics.softmax singles out: equal scores, the clamp, the clip, the zero scale."""
+    env, rng = await setup(dut, 99)
+    frac_s = 20
+    step = 1 << frac_s
+
+    # every score equal: every distance is 0, every e_t is 2^23 and the weights
+    # differ only by their V scales
+    for length in (1, 2, 63, 64, 65):
+        n = length + 8
+        env.pos = length - 1
+        d = isa.vsoftmax(
+            vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=frac_s, sreg_dst=2, length=length
+        )
+        scores = np.full(n, 12345, dtype=np.int64)
+        scales = [SFloat(1 << 15, 3) for _ in range(length)]
+        await run_softmax(env, rng, d, length, 1, scales=scales, scores=scores)
+
+    # far below the maximum: 25 log2 units and beyond round to a zero weight,
+    # and the token at the boundary is the one that decides it
+    length, n = 32, 40
+    env.pos = length - 1
+    d = isa.vsoftmax(
+        vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=frac_s, sreg_dst=3, length=length
+    )
+    for below in (24, 25, 26, 40, 60):
+        scores = np.zeros(n, dtype=np.int64)
+        scores[1:length] = -below * step
+        scores[2] = -(below * step) - (step // 2)
+        scales = [SFloat(1 << 15, 0) for _ in range(length)]
+        await run_softmax(env, rng, d, length, 1, scales=scales, scores=scores)
+
+    # the token that reaches the clip: one score at the maximum with the largest
+    # V mantissa and every other token 25 units below, so p = 1.0 and
+    # w = round_shift(2^23 * 65535, 24) = 32768, clipped to 32767
+    scores = np.full(n, -(30 * step), dtype=np.int64)
+    scores[0] = 0
+    scales = [SFloat((1 << 16) - 1, -5)] + [SFloat(1 << 15, -5) for _ in range(length - 1)]
+    before = int(dut.clip_count.value)
+    sat_before = env.sat
+    await run_softmax(env, rng, d, length, 1, scales=scales, scores=scores)
+    assert int(dut.clip_count.value) - before == 1, (
+        f"{int(dut.clip_count.value) - before} clips, expected the one token at 32768"
+    )
+    assert env.vsram[0, d.vs_dst] == 32767, "the clipped weight is not the int16 maximum"
+    assert env.sat == sat_before, "the weight clip raised SAT_VPU instead of counting as a clip"
+
+    # the weight shift at its cap: one token holds the whole probability and its
+    # own V scale sits `gap` exponents below e_max, so its shift is 24 + gap,
+    # and 40 is the cap past which the product no longer reaches the weight
+    length2, n2 = 4, 8
+    env.pos = length2 - 1
+    d2 = isa.vsoftmax(
+        vs_src=64, vs_dst=4096, n=n2, addr_a=ROW_BASE, frac_s=frac_s, sreg_dst=8, length=length2
+    )
+    scores = np.full(n2, -(30 * step), dtype=np.int64)
+    scores[0] = 0
+    for gap in (14, 15, 16, 17):
+        scales = [SFloat((1 << 16) - 1, 0), SFloat(1 << 15, gap)]
+        scales += [SFloat(1 << 15, 0) for _ in range(length2 - 2)]
+        await run_softmax(env, rng, d2, length2, 1, scales=scales, scores=scores)
+
+    # a V scale far below the row's largest one: 24 + e_max - Sv_e runs past the
+    # 40 the weight shift is capped at, and past the six bits the lane's shift
+    # field holds, so the cap is what keeps those tokens at a zero weight
+    scores = np.zeros(n, dtype=np.int64)
+    scales = [SFloat(1 << 15, 60)] + [SFloat(1 << 15, -60) for _ in range(length - 1)]
+    await run_softmax(env, rng, d, length, 1, scales=scales, scores=scores)
+    assert env.vsram[0, d.vs_dst] > 0, "the token holding e_max lost its weight"
+    assert not env.vsram[0, d.vs_dst + 1 : d.vs_dst + length].any(), (
+        "a token 120 log2 units of scale below e_max kept a weight"
+    )
+
+    # a V scale that is the canonical zero takes no part in e_max and gets a
+    # zero weight; a row of nothing but zero scales is the zero vector and the
+    # zero scale register
+    scales = [SFloat(1 << 15, 7)] + [SFloat(0, 0)] * (length - 1)
+    await run_softmax(env, rng, d, length, 1, scales=scales)
+    scales = [SFloat(0, 0)] * length
+    await run_softmax(env, rng, d, length, 1, scales=scales)
+    assert env.sreg[0][3] == 0, "an all-zero row has to leave the canonical zero scale"
+    assert not env.vsram[0, d.vs_dst : d.vs_dst + n].any(), "an all-zero row has to be zeros"
+
+    # extreme scores at both ends of int32, which is where the 33-bit difference
+    # and the clamp are the only thing keeping the distance in range
+    for frac in (16, 23, 30):
+        d = isa.vsoftmax(
+            vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=frac, sreg_dst=4, length=length
+        )
+        scores = np.array(
+            [(1 << 31) - 1 if i % 3 == 0 else -(1 << 31) for i in range(n)], dtype=np.int64
+        )
+        await run_softmax(env, rng, d, length, 1)
+        await run_softmax(env, rng, d, length, 1, scores=scores)
+
+
+@cocotb.test()
+async def test_vsoftmax_class_window(dut) -> None:
+    """Every class the ISA lets a VSOFTMAX carry: both edges of the window and one between them.
+
+    The sequencer faults a descriptor outside ``isa.CLASS_WINDOW`` (docs/RTL.md
+    3.5), so these three classes are the whole set this block is issued, and
+    each one is compared against ``numerics.softmax`` on structured distances
+    and on random rows.
+    """
+    env, rng = await setup(dut, 91)
+    lo, hi = isa.CLASS_WINDOW[Opcode.VSOFTMAX]
+    for frac_s in (lo, (lo + hi) // 2, hi):
+        step = 1 << frac_s
+        # whole log2 units past the 25-unit clamp, and half units between them,
+        # as many as an int32 score holds at this class
+        units = max(1, min(26, ((1 << 31) - 1) // step))
+        for length, n in ((1, 8), (5, 5), (33, 40), (64, 72)):
+            env.pos = length - 1
+            d = isa.vsoftmax(
+                vs_src=64,
+                vs_dst=4096,
+                n=n,
+                addr_a=ROW_BASE,
+                frac_s=frac_s,
+                sreg_dst=4,
+                length=length,
+            )
+            scores = np.zeros(n, dtype=np.int64)
+            for i in range(1, length):
+                scores[i] = -((i % (units + 1)) * step) - (step // 2 if i % 3 else 0)
+            await run_softmax(
+                env, rng, d, length, 1, scales=rand_scales(rng, length), scores=scores
+            )
+            await run_softmax(
+                env,
+                rng,
+                d,
+                length,
+                1,
+                scales=rand_scales(rng, length, zeros="none"),
+                scores=rand_scores(rng, n, frac_s),
+            )
+
+
+@cocotb.test()
+async def test_vsoftmax_length_and_fill(dut) -> None:
+    """``len`` from POS and from the immediate, its clamp, and the zeros past it."""
+    env, rng = await setup(dut, 121)
+    n = 128
+    for pos in (0, 1, 62, 63, 64, 127, 200):
+        env.pos = pos
+        length = min(pos + 1, n)
+        d = isa.vsoftmax(
+            vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=18, sreg_dst=5, length=None
+        )
+        await run_softmax(env, rng, d, length, 1, scales=rand_scales(rng, n))
+        tail = env.vsram[0, d.vs_dst + length : d.vs_dst + n]
+        assert not tail.any(), f"POS {pos}: {int(np.count_nonzero(tail))} weights past len are set"
+
+    # the immediate form, including a length of exactly n (no fill pass at all)
+    for length in (1, n // 2, n):
+        env.pos = 0
+        d = isa.vsoftmax(
+            vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=18, sreg_dst=6, length=length
+        )
+        await run_softmax(env, rng, d, length, 1)
+
+    # the longest row the bench can lay down: MAX_CTX tokens, which is the
+    # capacity a compiled attention step gives the destination
+    long_n = 2048
+    env.pos = long_n - 1
+    d = isa.vsoftmax(
+        vs_src=64, vs_dst=4096, n=long_n, addr_a=ROW_BASE, frac_s=22, sreg_dst=7, length=None
+    )
+    await run_softmax(env, rng, d, long_n, 1)
+
+
+@cocotb.test()
+async def test_vsoftmax_memory(dut) -> None:
+    """The V-scale stream at latencies 1, 32 and 200, and the two runs of it a row makes."""
+    env, rng = await setup(dut, 131)
+    grants = {
+        "free": lambda c: 1,
+        "every 4th": lambda c: (c % 4) == 0,
+        "every 17th": lambda c: (c % 17) == 3,
+    }
+    for latency in (1, 32, 200):
+        for name, pattern in grants.items():
+            env.latency = latency
+            env.req_ready = pattern
+            length = rng.choice((1, 8, 33, 100))
+            n = length + rng.choice((0, 9))
+            env.pos = length - 1
+            d = softmax_descriptor(rng, n, length)
+            beats = env.beats_returned
+            # every V scale is real, so the weight pass runs and streams the
+            # records a second time
+            await run_softmax(env, rng, d, length, 1, scales=rand_scales(rng, length, zeros="none"))
+            per_pass = -(-length // (WB // 8))
+            want = 2 * per_pass * len(participants(d, 1))
+            assert env.beats_returned - beats == want, (
+                f"VSOFTMAX len={length} at latency {latency} ({name}) returned "
+                f"{env.beats_returned - beats} beats, expected {want}"
+            )
+
+            heads = rng.choice((1, 2))
+            d, addr = rope_descriptor(rng, heads)
+            env.pos = rng.choice(POSITIONS)
+            env.image = image_with(rope_row_bytes(rng), addr + env.pos * ROPE_BYTES)
+            scatter(env, rng)
+            fill_sources(env, rng, d, 1, bits=20)
+            beats = env.beats_returned
+            await run_one(env, d, 1)
+            want = -(-ROPE_BYTES // WB) * len(participants(d, 1))
+            assert env.beats_returned - beats == want, (
+                f"VROPE at latency {latency} ({name}) returned "
+                f"{env.beats_returned - beats} beats, expected {want}"
+            )
+
+
 # --------------------------------------------------------------------------- boundary values
 
 
@@ -1361,13 +1812,53 @@ async def test_ranges(dut) -> None:
         isa.vsilumul(
             vs_src=ELEMS - 2, vs_aux=8192, vs_dst=ELEMS - 2, n=n, frac_gu=16, sh_h=16, sreg_dst=1
         ),
+        # VROPE reads and writes one range and counts it twice, as isa_sim does
+        isa.vrope(vs_src=ELEMS - 5, n=HEAD, addr_a=ROW_BASE),
+        # VSOFTMAX counts the vs_src + len read and the vs_dst + n write
+        isa.vsoftmax(
+            vs_src=ELEMS - 5,
+            vs_dst=4096,
+            n=n,
+            addr_a=ROW_BASE,
+            frac_s=20,
+            sreg_dst=1,
+            length=n,
+        ),
+        isa.vsoftmax(
+            vs_src=64,
+            vs_dst=ELEMS - 5,
+            n=n,
+            addr_a=ROW_BASE,
+            frac_s=20,
+            sreg_dst=1,
+            length=n,
+        ),
     ]
     for d in cases:
+        if d.opcode == Opcode.VROPE:
+            env.pos = 2
+            env.image = image_with(rope_row_bytes(rng), d.addr_a + env.pos * ROPE_BYTES)
+        elif d.opcode == Opcode.VSOFTMAX:
+            env.pos = n - 1
+            env.image = image_with(meta_bytes(rand_scales(rng, n)), d.addr_a)
         scatter(env, rng)
         fill_sources(env, rng, d, 1, bits=20)
         before = env.err_bounds
         await run_one(env, d, 1)
         assert env.err_bounds > before, f"{describe(d)} raised no ERR_BOUNDS"
+
+    # the read of a VSOFTMAX is vs_src + len, not vs_src + n: a source that
+    # only its capacity would run past the end raises nothing
+    env.pos = 4
+    d = isa.vsoftmax(
+        vs_src=ELEMS - n, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=20, sreg_dst=1, length=5
+    )
+    env.image = image_with(meta_bytes(rand_scales(rng, n)), d.addr_a)
+    scatter(env, rng)
+    fill_sources(env, rng, d, 1, bits=20)
+    before = env.err_bounds
+    await run_one(env, d, 1)
+    assert env.err_bounds == before, "a VSOFTMAX read inside its length raised ERR_BOUNDS"
 
     # a VSUBC whose ranges are both inside raises nothing
     d = isa.vsubc(vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE)
@@ -1419,9 +1910,24 @@ async def test_ranges(dut) -> None:
             sh1=0,
             imm32=eps_of(16, 16),
         ),
+        # VSOFTMAX writes its output scale whether or not track_absmax is set
+        Descriptor(
+            opcode=Opcode.VSOFTMAX,
+            row_mask=1,
+            addr_a=ROW_BASE,
+            n=16,
+            vs_src=64,
+            vs_dst=4096,
+            sreg_dst=77,
+            sh0=20,
+            imm32=16,
+        ),
     ):
         if d.opcode == Opcode.VRMSNORM:
             env.image = image_with(gamma_bytes(np.ones(16, dtype=np.int64)), ROW_BASE)
+        elif d.opcode == Opcode.VSOFTMAX:
+            env.pos = 15
+            env.image = image_with(meta_bytes(rand_scales(rng, 16, zeros="none")), ROW_BASE)
         scatter(env, rng)
         fill_sources(env, rng, d, 1, bits=18)
         before = env.sreg_err
@@ -1647,6 +2153,34 @@ async def test_protocol(dut) -> None:
     )
     assert quant_cycles < 2 * n / VL + 80, "the one-product passes fell behind VL per cycle"
     assert silu_cycles < 2 * n / VL + 80, "the two-product pass fell behind VL per two cycles"
+
+    # VROPE reads its table row once per row and is compute-bound after that:
+    # one head is 32 pairs at VL a chunk, a chunk every two cycles.
+    heads = n // HEAD
+    d = isa.vrope(vs_src=64, n=n, addr_a=ROW_BASE)
+    env.pos = 5
+    env.image = image_with(rope_row_bytes(rng), ROW_BASE + env.pos * ROPE_BYTES)
+    scatter(env, rng)
+    fill_sources(env, rng, d, 1, bits=20)
+    rope_cycles = await run_one(env, d, 1)
+    assert rope_cycles < n / VL + 40 * heads, (
+        f"VROPE took {rope_cycles} cycles for {heads} heads of {HEAD}"
+    )
+
+    # VSOFTMAX walks four passes and streams the V-scale records twice, so its
+    # cost is reported rather than bounded: at the narrow beat it is the
+    # operand stream, not the lanes, that sets the rate.
+    env.pos = n - 1
+    d = isa.vsoftmax(vs_src=64, vs_dst=4096, n=n, addr_a=ROW_BASE, frac_s=20, sreg_dst=1, length=n)
+    env.image = image_with(meta_bytes(rand_scales(rng, n, zeros="none")), ROW_BASE)
+    scatter(env, rng)
+    fill(env, rng, 0, d.vs_src, rand_scores(rng, n, d.sh0))
+    soft_cycles = await run_one(env, d, 1)
+    print(
+        f"VPU_TOP throughput: VROPE {rope_cycles} cycles for {heads} heads "
+        f"({rope_cycles / (n / VL):.2f} x n/VL), VSOFTMAX {soft_cycles} cycles for "
+        f"len = n = {n} ({soft_cycles / (n / VL):.2f} x n/VL)"
+    )
 
 
 # --------------------------------------------------------------------------- offsets and tables

@@ -1,10 +1,13 @@
 """cocotb tests of qcore_stream_ctrl: GEMV weight and meta streams at latencies 1, 32 and 200
 with random response gaps and backpressure, the FIFO reservation bound, weight-port utilization
-at latency 32, the EMBED gather, unit_meta, empty and back-to-back descriptors. The QMEM bus
-model answers the controller's request port directly and routes its beats by tag."""
+at latency 32, the EMBED gather, unit_meta, the attention step's two KV regions, empty and
+back-to-back descriptors. The QMEM bus model answers the controller's request port directly and
+routes its beats by tag. The bench takes the port width from ``QC_WB`` (the tiny 16 by default),
+so the same cases run on any configuration the entry elaborates."""
 
 from __future__ import annotations
 
+import os
 import random
 from collections.abc import Mapping
 
@@ -16,18 +19,22 @@ from cocotb.triggers import FallingEdge, RisingEdge
 from cocotb.types import Logic
 from qc_qmem import QmemModel
 from qc_stream import ReadySource
-from quettos import isa
+from quettos import isa, isa_sim, program
 from quettos.numerics import SFloat
 
-WB = 16
+WB = int(os.environ.get("QC_WB", 16))
 DW = WB * 8
-FIFO_BEATS = 128
-META_FIFO_BEATS = 16
-MAX_BURST = 64
+FIFO_BEATS = int(os.environ.get("QC_FIFO_BEATS", 128))
+META_FIFO_BEATS = int(os.environ.get("QC_META_FIFO_BEATS", 16))
+MAX_BURST = int(os.environ.get("QC_MAX_BURST", 64))
 TAG_WEIGHT, TAG_META = 1, 2  # qcore_pkg read tags
 OP_GEMV, OP_EMBED = int(isa.Opcode.GEMV), int(isa.Opcode.EMBED)
 WEIGHT_BASE = 0x0020_0000
 META_BASE = 0x0030_0000
+HEAD_DIM = isa.HEAD_DIM
+KT_BASE = 0x0100_0000  # the K^T, V and K-meta sub-regions of one (layer, KV head)
+V_BASE = 0x0200_0000
+KMETA_BASE = 0x0300_0000
 TIMEOUT = 300_000
 WS_FIELDS = ("data", "k", "tile", "tile_start", "tile_end", "nvalid", "last", "embed")
 
@@ -430,30 +437,44 @@ async def gemv_response_gaps(dut):
 
 @cocotb.test()
 async def utilization_lat32(dut):
-    """Weight beats per busy cycle at latency 32 with the rows always ready: at least 0.98."""
-    bench = await _setup(dut, 32)
-    d = Desc(OP_GEMV, WEIGHT_BASE, META_BASE, n=4 * WB, k=1024, k_stride=1024)
+    """Every busy cycle at latency 32 that carries no weight beat is one of three known ones.
+
+    With the rows always ready the controller may lose a cycle only to the read
+    latency before its first beat (plus the two FIFO registers behind it), to the
+    eight meta beats each tile interleaves between its weight bursts, and to the
+    last tile's ``WB`` records still leaving the serializer one per cycle after the
+    final weight beat -- the records the requant has not drained yet.  Stating the
+    budget in cycles rather than as a ratio keeps it the same statement at every
+    port width: the tail is ``WB`` records long, so a ratio moves with ``WB`` while
+    the cycles the controller actually wastes stay at zero.
+    """
+    lat, tiles = 32, 4
+    bench = await _setup(dut, lat)
+    d = Desc(OP_GEMV, WEIGHT_BASE, META_BASE, n=tiles * WB, k=1024, k_stride=1024)
     await bench.run(d)
     beats = len(bench.ws.seen)
-    ratio = beats / bench.busy_cycles
+    budget = lat + 5 + 8 * tiles + (WB - 8)
+    over = bench.busy_cycles - beats
     dut._log.info(
-        "utilization LAT=32: %d weight beats in %d busy cycles = %.4f (max held %d)",
+        "utilization LAT=32: %d weight beats in %d busy cycles = %.4f (%d over, budget %d)",
         beats,
         bench.busy_cycles,
-        ratio,
-        bench.max_w,
+        beats / bench.busy_cycles,
+        over,
+        budget,
     )
-    assert ratio >= 0.98, ratio
-    d2 = Desc(OP_GEMV, WEIGHT_BASE, META_BASE, n=4 * WB, k=1024, k_stride=1024, unit_meta=1)
+    assert over <= budget, f"{over} busy cycles carried no weight beat, budget {budget}"
+    d2 = Desc(OP_GEMV, WEIGHT_BASE, META_BASE, n=tiles * WB, k=1024, k_stride=1024, unit_meta=1)
     await bench.run(d2)
-    ratio2 = len(bench.ws.seen) / bench.busy_cycles
+    over2 = bench.busy_cycles - len(bench.ws.seen)
     dut._log.info(
-        "utilization LAT=32 unit_meta: %d beats in %d busy cycles = %.4f",
+        "utilization LAT=32 unit_meta: %d beats in %d busy cycles = %.4f (%d over)",
         len(bench.ws.seen),
         bench.busy_cycles,
-        ratio2,
+        len(bench.ws.seen) / bench.busy_cycles,
+        over2,
     )
-    assert ratio2 >= 0.98, ratio2
+    assert over2 <= lat + 5, f"{over2} busy cycles without a weight beat and without meta"
 
 
 @cocotb.test()
@@ -563,3 +584,126 @@ async def contiguous_tiles_exact_bursts(dut):
     d = Desc(OP_GEMV, WEIGHT_BASE, META_BASE, n=3 * WB, k=3 * MAX_BURST, k_stride=3 * MAX_BURST)
     await bench.run(d)
     assert all(length == MAX_BURST or tag == TAG_META for _, length, tag in bench.model.requests)
+
+
+# ---- the attention step's two KV regions
+
+
+def attention_descs(pos: int, max_ctx: int) -> tuple[Desc, Desc]:
+    """The scores and PV GEMVs of one head at ``pos``, as sw/quettos/compiler.py emits them.
+
+    Both come from ``quettos.isa`` and their executed extents are
+    ``isa_sim.gemv_dims`` at ``pos``: the scores GEMV walks the transposed K
+    region with the tokens as output channels and ``k_stride = 64``, the PV GEMV
+    walks the row-major V region with the tokens as ``K`` and
+    ``k_stride = max_ctx``, and only the first of the two carries a meta stream.
+    """
+    scores = isa.gemv(
+        addr_a=KT_BASE,
+        addr_m=KMETA_BASE,
+        n=max_ctx,
+        k=HEAD_DIM,
+        vs_src=0,
+        vs_dst=64,
+        sreg_src=1,
+        s1=8,
+        sbias=-4,
+        n_from_pos=True,
+    )
+    pv = isa.gemv(
+        addr_a=V_BASE,
+        n=HEAD_DIM,
+        k=max_ctx,
+        vs_src=64,
+        vs_dst=128,
+        sreg_src=2,
+        s1=8,
+        sbias=-4,
+        unit_meta=True,
+        k_from_pos=True,
+    )
+    sn, sk, _ = isa_sim.gemv_dims(scores, pos, WB)
+    pn, pk, _ = isa_sim.gemv_dims(pv, pos, WB)
+    return (
+        Desc(OP_GEMV, scores.addr_a, scores.addr_m, n=sn, k=sk, k_stride=scores.k),
+        Desc(OP_GEMV, pv.addr_a, pv.addr_m, n=pn, k=pk, k_stride=pv.k, unit_meta=1),
+    )
+
+
+def _fill_requests(mem: QmemModel, rng: random.Random, d: Desc) -> None:
+    """Random contents under every burst ``d`` asks for, so a misread address shows up."""
+    for addr, length, tag in d.requests():
+        if tag == TAG_WEIGHT:
+            mem.write_bytes(addr, rng.randbytes(length * WB))
+        else:
+            _fill_meta(mem, rng, addr, length * WB // 8)
+
+
+async def _attention_case(dut, latency: int, bw_div: int, ws_p: float, meta_p: float) -> None:
+    """One head over every position, with the requests, the beats and the records compared."""
+    max_ctx = 16 * WB
+    bench = await _setup(dut, latency, bw_div, seed=latency * 7 + bw_div)
+    bench.ws_ready.pattern = _random_ready(bench.rng, ws_p)
+    bench.meta_ready.pattern = _random_ready(bench.rng, meta_p)
+    for pos in (0, 1, 63, 64, 65, max_ctx - 1):
+        for name, d in zip(("scores", "pv"), attention_descs(pos, max_ctx), strict=True):
+            _fill_requests(bench.model, bench.rng, d)
+            await bench.run(d)
+            meta = [a for a, _, t in bench.model.requests if t == TAG_META]
+            want = [d.addr_m + t * WB * 8 for t in range(d.tiles)] if d.meta() else []
+            assert meta == want, (
+                f"{name} POS={pos}: meta bursts at {meta[:4]}..., expected {want[:4]}..."
+            )
+            dut._log.info(
+                "%s POS=%d LAT=%d: N=%d K=%d stride=%d, %d beats, %d records",
+                name,
+                pos,
+                latency,
+                d.n,
+                d.k,
+                d.k_stride,
+                len(bench.ws.seen),
+                len(bench.meta.seen),
+            )
+
+
+@cocotb.test()
+async def attention_lat1(dut):
+    """The attention step's two regions at latency 1 with backpressure on both streams."""
+    await _attention_case(dut, 1, 1, 0.7, 0.5)
+
+
+@cocotb.test()
+async def attention_lat32_response_gaps(dut):
+    """The same at latency 32 with one memory beat every three cycles."""
+    await _attention_case(dut, 32, 3, 0.6, 0.4)
+
+
+@cocotb.test()
+async def attention_lat200(dut):
+    """The same at latency 200, where the in-flight window throttles the stream."""
+    await _attention_case(dut, 200, 1, 0.9, 0.9)
+
+
+@cocotb.test()
+async def attention_at_the_context_limit(dut):
+    """POS at the ISA's MAX_CTX: the PV GEMV's tile stride is 2048 and its depth is 2048.
+
+    The scores GEMV streams the whole capacity, so its K^T tiles are ``MAX_CTX/WB``
+    apart in tile index and ``64*WB`` apart in bytes, while the PV GEMV's four
+    tiles are ``MAX_CTX*WB`` bytes apart with 2048 beats each.
+    """
+    max_ctx = program.MAX_CTX
+    bench = await _setup(dut, 32, seed=21)
+    bench.ws_ready.pattern = _random_ready(bench.rng, 0.9)
+    bench.meta_ready.pattern = _random_ready(bench.rng, 0.8)
+    for name, d in zip(("scores", "pv"), attention_descs(max_ctx - 1, max_ctx), strict=True):
+        _fill_requests(bench.model, bench.rng, d)
+        await bench.run(d)
+        assert d.k == (HEAD_DIM if name == "scores" else max_ctx)
+        dut._log.info(
+            "%s at the limit: %d beats, %d records",
+            name,
+            len(bench.ws.seen),
+            len(bench.meta.seen),
+        )

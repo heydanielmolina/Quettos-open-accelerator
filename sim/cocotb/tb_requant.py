@@ -15,7 +15,7 @@ import qc_numerics as qn
 from cocotb.clock import Clock
 from cocotb.triggers import FallingEdge, ReadOnly
 from qc_numerics import SFLOAT_ONE, SFLOAT_ZERO, SFloat, Stats
-from quettos import numerics
+from quettos import isa, numerics
 
 OP_GEMV = 0x10
 OP_EMBED = 0x11
@@ -26,6 +26,7 @@ DUMP_MODES = (OUT_ARGMAX_DUMP, OUT_VSRAM_DUMP)
 MASK32 = (1 << 32) - 1
 MASK40 = (1 << 40) - 1
 INT32_MIN = -(1 << 31)
+HEAD_DIM_OUT = isa.HEAD_DIM  # the PV GEMV's output channels
 
 
 def _u(sig) -> int:
@@ -105,8 +106,8 @@ class Desc:
         return sw, bias
 
     def records(self, wb: int) -> list[int]:
-        """The meta side-stream records the stream controller pushes: nvalid per tile."""
-        if self.unit_meta:
+        """The records the requant consumes: nvalid per tile, none with no row to drain."""
+        if self.unit_meta or self.rows == 0:
             return []
         if self.is_embed:
             return [qn.meta_record56(self.emb[0], self.emb[1])]
@@ -884,3 +885,72 @@ async def test_throughput_and_latency(dut):
         )
         assert latency == 16, f"first write latency {latency}"
         assert res.cycles <= tiles * g.wb * nrows + 40
+
+
+@cocotb.test()
+async def test_attention_requant_forms(dut):
+    """The two requant forms an attention step uses.
+
+    The scores GEMV drains a tile-rounded ``N`` whose channels past the written
+    positions carry the canonical-zero K scale the compiler leaves over the whole
+    capacity, so those channels have to leave zero behind and raise no event.  The
+    PV GEMV runs the unit-scale form: ``Sw = 1.0`` and ``bias_q = 0`` for every
+    channel with no record on the side-stream at all, so the whole output scale is
+    the softmax's ``SREG_out`` riding on ``Sx``.
+    """
+    env, g, rng = await setup(dut, 0x1006)
+    wb, rows = g.wb, (1 << g.b_max) - 1
+    for live in (1, 2, wb - 1, wb, wb + 1, 3 * wb + 5):
+        n = -(-live // wb) * wb  # the scores GEMV rounds N up to a whole tile
+        sxe = rng.randrange(-40, 0)
+        d = Desc(
+            op=OP_GEMV,
+            out_mode=OUT_VSRAM,
+            n=n,
+            vs_dst=8 * rng.randrange(0, (g.elems - n) // 8),
+            sh0=rng.randrange(0, 24),
+            sh1=rng.randrange(-40, 40),
+            rows=rows,
+        )
+        d.sx = [sfloat(rng, sxe) for _ in range(g.b_max)]
+        d.meta = [
+            (0, sfloat(rng, d.sh1 - sxe - rng.randrange(0, 64)) if c < live else SFLOAT_ZERO)
+            for c in range(n)
+        ]
+        d.acc = {
+            r: [rand_acc(rng) if c < live else 0 for c in range(n)] for r in d.part_rows(g.b_max)
+        }
+        res = await run_and_check(env, d, f"scores live={live} N={n}")
+        assert len(d.records(wb)) == n, "the scores GEMV reads one record per channel"
+        for r in d.part_rows(g.b_max):
+            for c in range(live, n):
+                e = d.vs_dst + c
+                got = _elem_get(env.vsram[r][e >> 3], e & 7)
+                assert got == 0, f"live={live}: row {r} left {got} at unwritten token {c}"
+        assert res.sat >= 0 and res.err_bounds == 0
+
+    for k in (1, 2, wb, 4 * wb + 3):
+        d = Desc(
+            op=OP_GEMV,
+            out_mode=OUT_VSRAM,
+            unit_meta=True,
+            n=HEAD_DIM_OUT,
+            vs_dst=8 * rng.randrange(0, (g.elems - HEAD_DIM_OUT) // 8),
+            sh0=rng.randrange(0, 24),
+            sh1=rng.randrange(0, 40),
+            rows=rows,
+            track_absmax=True,
+            sreg_dst=rng.randrange(32),
+        )
+        # SREG_out = 2**(1 + e_max): the mantissa is exactly 2**15, and it is the only
+        # scale in the descriptor -- the meta stream carries nothing at all.
+        d.sx = [SFloat(1 << 15, rng.randrange(-30, 0)) for _ in range(g.b_max)]
+        d.meta = [(0, SFLOAT_ONE)] * HEAD_DIM_OUT
+        bound = k * 32767 * 127  # K softmax weights against int8 V values
+        d.acc = {
+            r: [rng.randrange(-bound, bound + 1) for _ in range(HEAD_DIM_OUT)]
+            for r in d.part_rows(g.b_max)
+        }
+        res = await run_and_check(env, d, f"pv K={k}")
+        assert d.records(wb) == [], "the unit-scale form reads no meta record"
+        assert res.meta_left == 0

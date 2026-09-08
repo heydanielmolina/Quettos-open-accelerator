@@ -561,8 +561,8 @@ def test_status_word_carries_the_fault_fields() -> None:
     for f in isa.Fault:
         w = isa.status_word(err=True, fault=f, fault_op=int(Opcode.GEMV))
         assert isa.status_fault(w) == (f, 0x10) and w >> 16 == 0
-    assert [f.value for f in isa.Fault] == [0, 1, 2, 3]
-    assert {f.name for f in isa.Fault} == {"NONE", "OPCODE", "ROW", "PC_ALIGN"}
+    assert [f.value for f in isa.Fault] == [0, 1, 2, 3, 4]
+    assert {f.name for f in isa.Fault} == {"NONE", "OPCODE", "ROW", "PC_ALIGN", "CLASS"}
     with pytest.raises(ValueError):
         isa.status_word(fault_op=256)
 
@@ -592,6 +592,8 @@ def test_generated_headers_agree_with_isa() -> None:
     assert defs["STATUS_ERR"] == 3 and defs["STATUS_FAULT_LSB"] == 4 and defs["STATUS_FAULT_W"] == 4
     assert defs["STATUS_FAULT_OP_LSB"] == 8 and defs["STATUS_FAULT_OP_W"] == 8
     assert defs["FAULT_NONE"] == 0 and defs["FAULT_OPCODE"] == 1 and defs["FAULT_PC_ALIGN"] == 3
+    assert defs["FAULT_CLASS"] == 4
+    assert defs["SOFTMAX_FRAC_MIN"] == 16 and defs["SOFTMAX_FRAC_MAX"] == 30
     assert "KV_TILE_TOKENS" not in defs and defs["DUMP_ALIGN"] == 64
     # the include is macros only (a module or package restates what it uses), guarded, no imports
     sv_text = csrgen.svh_text()
@@ -688,6 +690,25 @@ def test_helpers_reject_out_of_range_fixed_point_classes() -> None:
         isa.vsilumul(vs_src=0, vs_aux=64, vs_dst=128, n=64, frac_gu=5, sh_h=10, sreg_dst=0)
     with pytest.raises(ValueError):
         isa.vsoftmax(vs_src=0, vs_dst=64, n=64, frac_s=3, addr_a=64, sreg_dst=0)
+
+
+def test_class_window_is_the_set_the_decoder_faults_outside_of() -> None:
+    """A VSOFTMAX class outside ``[16, 30]`` is a ``CLASS`` fault the helper refuses to emit."""
+    assert isa.CLASS_WINDOW == {Opcode.VSOFTMAX: (16, 30)}
+    lo, hi = isa.CLASS_WINDOW[Opcode.VSOFTMAX]
+    for frac_s in (lo, 23, hi):
+        d = isa.vsoftmax(vs_src=0, vs_dst=64, n=64, addr_a=64, frac_s=frac_s, sreg_dst=0)
+        assert d.sh0 == frac_s and not isa.class_fault(d)
+        assert not isa.class_fault(isa.decode(isa.encode(d)))
+    for frac_s in (0, lo - 1, hi + 1, 63, 255):
+        with pytest.raises(ValueError, match="frac_s"):
+            isa.vsoftmax(vs_src=0, vs_dst=64, n=64, addr_a=64, frac_s=frac_s, sreg_dst=0)
+        d = Descriptor(opcode=Opcode.VSOFTMAX, n=64, vs_src=0, vs_dst=64, sh0=frac_s)
+        assert isa.class_fault(d) and isa.class_fault(isa.decode(isa.encode(d)))
+    # the check is the opcode's own: no other opcode carries a checked class field
+    for op in Opcode:
+        if op is not Opcode.VSOFTMAX:
+            assert not isa.class_fault(Descriptor(opcode=op, sh0=255))
 
 
 # --------------------------------------------------------------------------- bring-up program

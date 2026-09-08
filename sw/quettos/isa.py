@@ -16,7 +16,14 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 
-from quettos.numerics import E8_MAX, E8_MIN, SFloat, quant_scale_exponents
+from quettos.numerics import (
+    E8_MAX,
+    E8_MIN,
+    SOFTMAX_FRAC_MAX,
+    SOFTMAX_FRAC_MIN,
+    SFloat,
+    quant_scale_exponents,
+)
 
 ISA_VERSION = 1
 DESC_BITS = 256
@@ -329,6 +336,24 @@ def disassemble_one(d: Descriptor) -> str:
 def disassemble(program: Sequence[Descriptor]) -> str:
     """The ``.lst`` listing: one ``index  OPCODE fields`` line per descriptor."""
     return "".join(f"{i:5d}  {disassemble_one(d)}\n" for i, d in enumerate(program))
+
+
+# --------------------------------------------------------------------------- class windows
+
+# The window an opcode's class field (``sh0``) is defined over.  Outside it the
+# reference and the datapath are different functions, so the descriptor is
+# refused at decode with ``FAULT = CLASS`` and the opcode byte in ``FAULT_OP``,
+# the way an unknown opcode is refused; an opcode absent from this table has no
+# class field the decoder checks.
+CLASS_WINDOW: dict[Opcode, tuple[int, int]] = {
+    Opcode.VSOFTMAX: (SOFTMAX_FRAC_MIN, SOFTMAX_FRAC_MAX),
+}
+
+
+def class_fault(d: Descriptor) -> bool:
+    """True when ``d``'s class field leaves :data:`CLASS_WINDOW` (``FAULT = CLASS``)."""
+    window = CLASS_WINDOW.get(Opcode(d.opcode))
+    return window is not None and not window[0] <= d.sh0 <= window[1]
 
 
 # --------------------------------------------------------------------------- opcode helpers
@@ -660,7 +685,7 @@ def vsoftmax(
     ``vs_dst`` (zeros from ``len`` to ``n``) and ``SREG_out`` to
     ``SREG[sreg_dst]``; ``sh0 = frac_s``.
     """
-    _check_shift("frac_s", frac_s, 16, 30)
+    _check_shift("frac_s", frac_s, SOFTMAX_FRAC_MIN, SOFTMAX_FRAC_MAX)
     if length is not None and not 1 <= length <= n:
         raise ValueError(f"vsoftmax: length {length} outside [1, {n}]")
     _check_sreg(sreg_dst=sreg_dst)
@@ -783,6 +808,7 @@ class Fault(IntEnum):
     OPCODE = 1  # the opcode byte is none of the twelve
     ROW = 2  # a participating row addresses a VSRAM / SREG bank at or above B_MAX
     PC_ALIGN = 3  # START or STEP with a PC that is not a multiple of DESC_BYTES
+    CLASS = 4  # a class field outside CLASS_WINDOW, the set the opcode is defined over
 
 
 CTRL_BITS: dict[str, int] = {"START": 0, "STEP": 1, "ABORT": 2}
@@ -911,6 +937,8 @@ def definitions() -> list[tuple[str, int]]:
         ("ROPE_SHIFT", ROPE_SHIFT),
         ("HEAD_DIM", HEAD_DIM),
         ("DUMP_ALIGN", DUMP_ALIGN),
+        ("SOFTMAX_FRAC_MIN", SOFTMAX_FRAC_MIN),
+        ("SOFTMAX_FRAC_MAX", SOFTMAX_FRAC_MAX),
     ]
     for f in FIELDS:
         defs.append((f"DESC_{f.name.upper()}_LSB", f.lsb))

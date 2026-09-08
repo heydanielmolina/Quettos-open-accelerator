@@ -81,9 +81,15 @@ Signedness and shifts:
   such values (`sh0` on EMBED additionally lies in `[8, 24]`, the
   `embed_dequant` window).
 - Class fields (`sh0` of VRMSNORM, VQUANT, VSILUMUL and VSOFTMAX) carry a
-  `FRAC` in `[0, 30]` (`[13, 30]` on VSILUMUL, `[16, 30]` on VSOFTMAX). The
-  compiler's helpers and the quantizer enforce these ranges; the hardware does
-  not check them.
+  `FRAC` in `[0, 30]` -- 30 fraction bits and a unit are all a signed int32
+  class holds -- narrowed to `[13, 30]` on VSILUMUL, whose sigmoid index is
+  `|g| >> (FRAC_GU - 5)` with the eight bits below it, and to `[16, 30]` on
+  VSOFTMAX, whose exp2 argument is the single shift `d >> (FRAC_S - 16)`.
+  The compiler's helpers and the quantizer enforce every one of them. The
+  hardware enforces the windows `isa.CLASS_WINDOW` carries -- VSOFTMAX's
+  today -- and faults a descriptor outside one at its decode with
+  `FAULT = CLASS`, so a class the datapath is not defined over stops the
+  program instead of running a different function.
 - `flags` bits: VQUANT bit 0 `W8` (int8 output; clear = int16), bit 1
   `USE_TRACKED`, bit 2 `GROUP`, bit 3 `SCALE_MUL`; KVWRITE bit 0 `TRANSPOSED`
   (K^T byte scatter; clear = V tiles). `GROUP` together with `USE_TRACKED` is
@@ -145,7 +151,10 @@ On-chip ranges:
 
 - A VSRAM range that runs past `VSRAM_WORDS * 8` elements counts once in
   `ERR_BOUNDS` per read or write operand; the missing elements read as 0 and
-  the writes to them are dropped, everything else executes.
+  the writes to them are dropped, everything else executes. A VSOFTMAX reads
+  `vs_src` for the executed `len` and writes `vs_dst` for the whole `n`, so its
+  two ranges differ; VROPE reads and writes one range, `vs_src + n`, and counts
+  it once as the read and once as the write.
 - An SREG index at or above 32 counts once in `ERR_BOUNDS` per access; the
   read returns the zero scale (or absmax 0) and the write is dropped.
 - SREG entries hold either an sfloat (`VQUANT` scales, `SREG_out`) or a tracked
@@ -176,12 +185,17 @@ Program end:
 | `FAULT` | Name | Raised when | `FAULT_OP` |
 |---|---|---|---|
 | 0 | `NONE` | no fault; the value while a program runs | 0 |
-| 1 | `OPCODE` | the opcode byte is none of the twelve (`isa.opcode_of` / `isa.is_opcode` probe it before decoding), or it names a pass the build does not carry -- `qcore_top` refuses VROPE and VSOFTMAX this way, the two `qcore_vpu_top` has no pass for | that byte |
+| 1 | `OPCODE` | the opcode byte is none of the twelve (`isa.opcode_of` / `isa.is_opcode` probe it before decoding). Every opcode this table defines has a unit, so the fault names an undecodable byte and nothing else | that byte |
 | 2 | `ROW` | a participating row's `src_row + r` or `dst_row + r` is at or above `B_MAX` | the opcode |
 | 3 | `PC_ALIGN` | `START` or `STEP` with a `PC` that is not a multiple of 32 | 0 |
+| 4 | `CLASS` | the descriptor's class field is outside the window its opcode is defined over (`isa.CLASS_WINDOW`, `isa.class_fault`): VSOFTMAX `sh0` outside `[16, 30]`, the range the softmax of `docs/NUMERICS.md` is defined over | the opcode |
 
-  `isa.status_word()` builds the word and `isa.status_fault()` reads the two
-  fields back; `quettos.isa_sim` reports the `OPCODE` fault the same way.
+  The decode cycle checks `OPCODE`, then `ROW`, then `CLASS`, so a descriptor
+  that breaks two of them reports the first; `PC_ALIGN` is checked before the
+  first fetch. `isa.status_word()` builds the word and `isa.status_fault()`
+  reads the two fields back; `quettos.isa_sim` reports the `OPCODE` fault of a
+  run, and the `CLASS` fault of a run and of a single `CTRL.STEP`, the same
+  way.
 
 Compiler assertions: GEMV / EMBED `vs_dst` is 8-aligned, `K < 2^16`,
 `n < 2^24`, every VSRAM range fits the map, every SREG index is below 32, the
@@ -204,9 +218,9 @@ int32 the lane carries it in, and every `eps_c` keeps `S1` non-negative
 | `0x11` | EMBED | gather `k` bytes of row `TOK` from tiled table `addr_a` (byte `(TOK/WB)*k*WB + i*WB + TOK%WB` for `i < k`); the row scale from `meta[addr_m + TOK*8]` is `Sw`, `Sx = 1.0 = {2^15, -15}`, `acc = q << 24`, `sbias = -(FRAC_X + s1) + 24` with `8 <= s1 <= 24`; `n` is written equal to `k` |
 | `0x20` | VRMSNORM | `vs_src -> vs_dst`, `n` elements; gamma int16 streamed from `addr_a`; `imm32 = eps_c`; `sh0 = FRAC_X`, `sh1 = G` (shift); `addr_m` low 24 bits = sqrt(d) sfloat constant; absmax -> `SREG[sreg_dst]` |
 | `0x21` | VQUANT | `vs_src -> vs_dst`, `n` elements; flags `W8` (int8, else int16), `USE_TRACKED` (absmax from `SREG[sreg_src]`), `GROUP` (`vs_aux` = group length -> consecutive `SREG[sreg_dst..]`, at most the 32 the file holds), `SCALE_MUL` (`SREG *= sfloat imm32`); `sh0 = FRAC_in` |
-| `0x22` | VROPE | in place at `vs_src` of row `src_row + r` (`dst_row` ignored), `n = heads*64` (the compiler covers the contiguous q and k heads with one VROPE), table row `addr_a + POS*128`, pairs `(i, i+32)`, shift 14 |
+| `0x22` | VROPE | in place at `vs_src` of row `src_row + r` (`dst_row` ignored), `n = heads*64` (the compiler covers the contiguous q and k heads with one VROPE). The table row is the 128 bytes at `addr_a + POS*128`: 32 int16 Q1.14 cosines then 32 sines. For head `h` and `i < 32`, `a = x[64h + i]` and `b = x[64h + 32 + i]` become `a' = sat32(round_shift(a*cos_i - b*sin_i, 14))` and `b' = sat32(round_shift(b*cos_i + a*sin_i, 14))`, both from the values the pair held before the descriptor; heads ascend and `n >> 6` of them run. No SREG is written and `track_absmax` is ignored |
 | `0x23` | VSILUMUL | `dst = silu(src) * aux`; `sh0 = FRAC_GU` (sigmoid index), `sh1 = 2 FRAC_GU - FRAC_H` (shift); absmax -> SREG |
-| `0x24` | VSOFTMAX | scores at `vs_src`, `len = POS+1` or `imm`, clamped into `[1, n]`; V-scale meta at `addr_a`; `w` int16 to `vs_dst` (zeros from `len` to `n`); `SREG[sreg_dst] = sfloat(2^(1+e_max))`; `sh0 = FRAC_S` |
+| `0x24` | VSOFTMAX | scores at `vs_src` in class `FRAC_S = sh0`, `len = POS+1` or `imm32`, clamped into `[1, n]`; the `len` per-token V-scale records at `addr_a` (only `m` and `e` are read). The int16 weights, sign-extended to int32, go to `vs_dst[0..len)` and zeros to `vs_dst[len..n)`; `SREG[sreg_dst] = sfloat(2^(1+e_max))`, the scale that makes `sum_t w_t V_t SREG_out` reproduce `sum_t p_t Sv_t V_t`, or the zero scale when every record's mantissa is zero. A token whose record mantissa is zero takes weight 0 and stays out of `e_max`; a weight of 32768 is clipped to 32767 and counted as a clip, like VQUANT's, not as a saturation. `e_max` lies in `[-114, 141]`, the window whose packed exponent `e_max - 14` fits the i8 of an SREG word, so the output scale has no encoding below `2^-113`; a compiled program's V scales sit far inside it, and `numerics.softmax` refuses a row outside it instead of wrapping |
 | `0x25` | VSUBC | `dst = sat32(src - const row streamed from addr_a)`, `n` elements |
 | `0x30` | KVWRITE | the 64 int8 values at `vs_src` (low byte of each element), `k` = token capacity; flag `TRANSPOSED`: 64 single-byte-strobe writes into `addr_a + (POS/WB)*64*WB + d*WB + POS%WB`; else `ceil(64/WB)` `WB`-byte beats, tile `t` at `addr_a + (t*k + POS)*WB` holding dims `t*WB ..` zero-padded; meta `{0, SREG[sreg_src]}` -> `addr_m + POS*8`; `POS >= k` writes nothing and counts in `ERR_BOUNDS` |
 | `0x31` | FENCE | wait for write-ack count == issued (the auto-fence ahead of every memory-reading descriptor is implicit; an explicit FENCE parks a program at a point where every issued write is acknowledged) |
@@ -328,6 +342,41 @@ inside the same window. The host writes the program address to `PC`, the token
 under test to `TOK`, `POS = 0` and `ROW_EN = 1`, then pulses `START` and waits
 for `STATUS.DONE`.
 
+### The attention step
+
+The two programs above run at `POS = 0` and touch no descriptor whose extent
+comes from the position. The descriptors that do are the attention half of a layer,
+in the order `_emit_layer` of `sw/quettos/compiler.py` writes them, and a
+program over them at a real `POS` is what brings the attention path up:
+
+| Step | Descriptors | Exercises |
+|---|---|---|
+| 1 | `VROPE` over the contiguous q and k heads | the table row at `addr_a + POS*128`, the pair rotation, the in-place write |
+| 2 | `VQUANT` `GROUP` over q, one scale per head, `SCALE_MUL` folding `log2e/8` | the per-head q scales the scores GEMV reads as `Sx` |
+| 3 | `VSUBC` over k, then `VQUANT` `GROUP` `W8` over k and over v | the streamed centering row and the per-KV-head K and V scales |
+| 4 | `KVWRITE` per KV head: `TRANSPOSED` for K^T, the tile form for V | the byte scatter, the tiled write, the meta record at `addr_m + POS*8`, and the `POS >= k` refusal |
+| 5 | `GEMV` `n_from_pos` per query head over the K^T region | the position-derived length, the tile rounding, the per-token K scales as the meta stream |
+| 6 | `VSOFTMAX` per query head over the scores | the length clamp, the four passes, the V-scale records, the output scale into `SREG` |
+| 7 | `GEMV` `k_from_pos` `unit_meta` per query head over the V region | the position-derived depth, the unit scale, the softmax weights as activations |
+
+Run on `qcore_top` and on `quettos.isa_sim` from the same image at the same
+`TOK` and `POS`, and compared element by element after every descriptor, that
+sequence covers every value the attention path produces; swept over `POS` it
+covers the tile rounding of `n_from_pos`, the `[1, n]` clamp of `len` and the
+growing `K` of the PV GEMV, and a `POS` at the region's token capacity covers
+the `POS >= k` refusal of KVWRITE. The KV region
+it reads is the one its own `KVWRITE` descriptors filled, so the program is
+closed over the image the compiler emits.
+
+`quettos.compare` assembles it as the `attention` program: `decode.prog` from
+its `EMBED` through the last value `GEMV` of layer 0, with a `HALT` after it,
+so the descriptors and their order are the compiler's own. It runs at six
+positions -- the first, one inside the first weight-port tile, the last of that
+tile, the one that opens the second, one past it, and the last the cache holds
+-- one after another on one machine, each with its own token, so the cache a
+position writes is what the next one reads. The `layer` program continues the
+same prefix to the end of the decoder layer.
+
 ## CSR table
 
 The host sees 64 32-bit words (256 bytes). `sw/quettos/isa.py` is the source;
@@ -354,7 +403,7 @@ written to a bit acts once; reads return 0), `w1c` read plus write-one-to-clear
 | 6 | `ARGMAX_TOK` | ro | index of the largest output of the most recent ARGMAX-mode GEMV (strict `>`, so ties resolve to the lowest id) |
 | 7 | `ARGMAX_VAL` | ro | that output, int32 |
 | 8 | `SAT_REQ` | ro | requant `sat40` / `sat32` events since `START` |
-| 9 | `SAT_VPU` | ro | vector-unit `sat32` events since `START`, one per saturating element of a writing pass. The two passes that carry an intermediate through the lane report its saturation too -- VRMSNORM's `xhat`, VSILUMUL's `silu` -- as one event for the element whether one of its two products saturated or both. VQUANT raises none: its clip is the defined result, not a saturation |
+| 9 | `SAT_VPU` | ro | vector-unit `sat32` events since `START`, one per saturating element of a writing pass. A pass that carries an intermediate through the lane reports its saturation too -- VRMSNORM's `xhat`, VSILUMUL's `silu`, VSOFTMAX's `p` -- as one event for the element whether one of its two products saturated or both. VROPE's two outputs are two results rather than an intermediate and a result, so each is its own event. VQUANT and VSOFTMAX raise none for their clips: a clip is the defined result, not a saturation |
 | 10 | `ERR_SHIFT` | ro | shift amounts clamped into `[0, 63]` since `START`, one per output element: requant stage-2 `S`, VRMSNORM `S1`, and the descriptor shift fields `s1`, `G`, `sh_h` |
 | 11 | `ERR_BOUNDS` | ro | since `START`: POS-derived values above their capacity field, VSOFTMAX `len` outside `[1, n]`, KVWRITE at `POS >= k`, VSRAM operand ranges past the end, SREG indices at or above 32 |
 | 12 | `ISA_VERSION` | ro | the constant `ISA_VERSION` |

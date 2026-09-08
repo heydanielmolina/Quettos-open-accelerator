@@ -18,7 +18,7 @@
 # ---- demo: WB = 64, B_MAX = 1, VL = 4, VSRAM_WORDS = 4096
 log ==== qreport config demo
 read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_lut_rom.sv rtl/qcore_lut_interp.sv rtl/qcore_vpu_lane.sv rtl/qcore_vpu_scalar.sv rtl/qcore_vpu_top.sv
-chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 64 -set B_MAX 1 -set VL 4 -set VSRAM_WORDS 4096 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
+chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_EXP2 "rtl/gen/exp2.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 64 -set B_MAX 1 -set VL 4 -set VSRAM_WORDS 4096 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
 hierarchy -check -top qcore_vpu_top
 synth_xilinx -family xc7 -flatten -top qcore_vpu_top
 script syn/report.ys
@@ -27,7 +27,7 @@ script syn/report.ys
 design -reset
 log ==== qreport config tiny
 read_verilog -sv -defer -Irtl rtl/qcore_pkg.sv rtl/qcore_lut_rom.sv rtl/qcore_lut_interp.sv rtl/qcore_vpu_lane.sv rtl/qcore_vpu_scalar.sv rtl/qcore_vpu_top.sv
-chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 16 -set B_MAX 2 -set VL 2 -set VSRAM_WORDS 2048 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
+chparam -set ROM_FILE_SIGMOID "rtl/gen/sigmoid.hex" -set ROM_FILE_EXP2 "rtl/gen/exp2.hex" -set ROM_FILE_RSQRT "rtl/gen/rsqrt.hex" -set ROM_FILE_RECIP "rtl/gen/recip.hex" -set WB 16 -set B_MAX 2 -set VL 2 -set VSRAM_WORDS 2048 -set VPU_FIFO_BEATS 16 -set MAX_BURST 64 qcore_vpu_top
 hierarchy -check -top qcore_vpu_top
 synth_xilinx -family xc7 -flatten -top qcore_vpu_top
 script syn/report.ys

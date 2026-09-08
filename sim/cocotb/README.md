@@ -13,8 +13,8 @@ parameter, so one build of each covers every configuration.
 `uv run pytest -q sim/cocotb/test_vsram.py`. Build products go to
 `build/cocotb/<top>/<key>/`, where `key` is a digest of the sources and the
 parameters, so two configurations of one top never share object files. From an
-emptied `build/cocotb` the whole set takes 99.62 s, the median of five runs
-(98.32 - 100.74, n=5, on the machine `docs/PERFORMANCE.md` names), Verilator
+emptied `build/cocotb` the whole set takes 106.2 s, the median of three runs
+(106.1 - 106.9, n=3, on the machine `docs/PERFORMANCE.md` names), Verilator
 builds included; a rerun keeps the builds it can.
 
 | File | Role |

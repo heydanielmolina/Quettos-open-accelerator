@@ -24,7 +24,9 @@ command in this repository (`uv run quettos calibrate <alias>`,
   and the RTL counters can be compared.
 - `Stats` holds three counters: `sat` (sat40/sat32 events), `err_shift`
   (a requant stage-2 shift or an RMSNorm `S1` outside `[0, 63]`; must stay 0 on
-  a correct program) and `clip` (VQUANT clips at `+-(2^(w-1) - 1)` and the softmax weight
+  a correct program -- the hardware counts the descriptor shift fields `s1`,
+  `G` and `sh_h` there as well, which this module refuses to encode at all,
+  `docs/ISA.md`) and `clip` (VQUANT clips at `+-(2^(w-1) - 1)` and the softmax weight
   clip at 32767; expected, not a fault).
 - Vectors are `int64` arrays, scalars are Python ints; every intermediate
   product fits in 63 bits by construction (see the width notes below).
@@ -429,7 +431,24 @@ w_t   = round_shift(p_t * Sv_m[t], 24 + e_max - Sv_e[t])         in [0, 32768]; 
 SREG_out = 2^(1 + e_max) = {2^15, e_max - 14}
 ```
 
-`g` becomes a 16-bit fraction by `g >> (FRAC_S - 16)` (or `<< (16 - FRAC_S)`).
+`g` becomes a 16-bit fraction by `g >> (FRAC_S - 16)`, so the op is defined
+over `FRAC_S` in `[16, 30]` (`SOFTMAX_FRAC_MIN` / `SOFTMAX_FRAC_MAX`): 30 is
+all a signed int32 class carries, 30 fraction bits and a unit, and below 16 the
+exp2 argument would have to be widened to reach its 16-bit fraction instead of
+narrowed, which is a different function and one the datapath does not perform.
+This module refuses a `FRAC_S` outside the window (`softmax_frac_check`) and
+the hardware refuses the descriptor that carries one, at its decode, with
+`FAULT = CLASS` (`isa.CLASS_WINDOW`, `docs/ISA.md`).
+
+`SREG_out = 2^(1 + e_max)` is encoded as `{2^15, e_max - 14}`, and that
+exponent travels as the i8 of an SREG word, so the row's largest live V-scale
+exponent has to lie in `[-114, 141]` (`SOFTMAX_EMAX_MIN` / `SOFTMAX_EMAX_MAX`)
+and the output scale has no encoding below `2^-113`; `softmax_sreg` raises on
+an `e_max` outside it rather than wrapping the exponent. A compiled program
+stays far inside: the int8 VQUANT that writes the V scales produces exponents
+in `[-37, -6]` at `FRAC_in = 16` (`quant_scale_exponents`), which the compiler
+checks descriptor by descriptor.
+
 Tokens whose V scale is the canonical zero get `w_t = 0` and do not enter
 `e_max`; a row of all-zero scales returns zeros and the zero `SREG`. `w_t`
 reaches 32768 only when `p_t = 1.0` (every other token at least 25 log2 units
@@ -448,7 +467,7 @@ long contexts). Widths: `m - s_t` is a 33-bit signed difference before the
 clamp, `n <= 25`, `e_t * inv` and `p_t * Sv_m` fit 39 bits, and the per-token
 `w` shift lies in `[24, 54]` for real V scales (larger amounts saturate to
 40 and give a zero weight). Measured against a
-float64 softmax over random rows (lengths 1..600, `FRAC_S` 14/16/18, V
+float64 softmax over random rows (lengths 1..600, `FRAC_S` 16/20/24, V
 exponents spread over 6 octaves) and sink-dominated rows of 2048 and 8192
 tokens, in units of `2^-15 * max Sv`, the per-token error stays within the
 property-tested budget (`sw/tests/test_numerics.py`,

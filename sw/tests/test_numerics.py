@@ -1140,7 +1140,7 @@ def test_softmax_random_rows_rigorous_and_statistical_bounds(tables: N.Tables) -
     rng = np.random.default_rng(61)
     worst_tok = worst_sum = 0.0
     for it in range(300):
-        frac_s = (14, 16, 18)[it % 3]
+        frac_s = (16, 20, 24)[it % 3]
         length = int(rng.integers(1, 601))
         spread = rng.uniform(0.5, 20)
         s = N.to_fixed(rng.standard_normal(length) * spread, frac_s)
@@ -1165,8 +1165,8 @@ def test_softmax_random_rows_rigorous_and_statistical_bounds(tables: N.Tables) -
         worst_sum = max(worst_sum, tot)
         # statistical bound for this seed: rounding is random-signed, so it grows like sqrt(L)
         assert tot <= 6.0 + 2.5 * math.sqrt(length), (it, tot)
-    assert worst_tok <= 64.0  # measured: 25.7 units (long rows with a dominant token)
-    assert worst_sum <= 80.0  # measured: 39.2 units
+    assert worst_tok <= 64.0  # measured: 1.12 units
+    assert worst_sum <= 80.0  # measured: 29.9 units
 
 
 def test_softmax_exact_powers_of_two_distances(tables: N.Tables) -> None:
@@ -1175,7 +1175,7 @@ def test_softmax_exact_powers_of_two_distances(tables: N.Tables) -> None:
     rng = np.random.default_rng(62)
     worst = 0.0
     for it in range(200):
-        frac_s = 14 if it % 2 else 16
+        frac_s = 20 if it % 2 else 16
         length = int(rng.integers(1, 601))
         k = rng.integers(0, 17, size=length)  # 16 -> e_t = 0
         k[rng.integers(length)] = 0
@@ -1187,14 +1187,14 @@ def test_softmax_exact_powers_of_two_distances(tables: N.Tables) -> None:
         assert float(tok.max()) <= 5.0, (it, float(tok.max()))
         worst = max(worst, float(tok.max()))
         assert w[:length][k >= 16].sum() == 0  # 2**-16 and below vanish
-    assert worst <= 5.0  # measured: 1.09 units
+    assert worst <= 5.0  # measured: 0.63 units
 
 
 def test_softmax_length_one_and_all_equal(tables: N.Tables) -> None:
     scores = np.array([12345, -7, 99], dtype=np.int64)
     for sv in (SFloat(40000, -20), SFloat(40001, -20), SFloat(1 << 15, -3), SFloat(65534, 4)):
         st = Stats()
-        w, sreg = N.softmax(scores, 1, 14, [sv], tables, stats=st)
+        w, sreg = N.softmax(scores, 1, 16, [sv], tables, stats=st)
         assert st == Stats() and w.tolist()[1:] == [0, 0]
         assert sreg == SFloat(1 << 15, 1 + sv.e - 15)
         got = Fraction(int(w[0])) * frac_value(sreg)
@@ -1220,14 +1220,14 @@ def test_softmax_length_one_full_scale_mantissa_saturates_w() -> None:
     tables = N.load_tables()
     st = Stats()
     w, sreg = N.softmax(
-        np.array([5], dtype=np.int64), 1, 14, [SFloat(65535, -20)], tables, stats=st
+        np.array([5], dtype=np.int64), 1, 16, [SFloat(65535, -20)], tables, stats=st
     )
     assert w.tolist() == [32767] and sreg == SFloat(1 << 15, -34)
     assert st.sat == 0 and st.clip == 1
 
 
 def test_softmax_zero_v_scales_extreme_scores_and_errors(tables: N.Tables) -> None:
-    frac_s = 14
+    frac_s = 16
     m = 1000 << frac_s
     scores = np.array(
         [
@@ -1273,6 +1273,54 @@ def test_softmax_zero_v_scales_extreme_scores_and_errors(tables: N.Tables) -> No
             N.softmax(scores, bad_len, frac_s, vs + vs, tables)
     with pytest.raises(ValueError):
         N.softmax(scores, 6, frac_s, vs, tables)  # fewer scales than length
+
+
+def test_softmax_class_window_is_the_one_the_isa_names(tables: N.Tables) -> None:
+    """``FRAC_S`` outside ``[16, 30]`` is refused by name, at both ends and to the byte's end."""
+    assert (N.SOFTMAX_FRAC_MIN, N.SOFTMAX_FRAC_MAX) == (16, 30)
+    scores = np.array([9 << 16, 4 << 16, 0, -5 << 16], dtype=np.int64)
+    vs = [SFloat(40000, -20), SFloat(50000, -21), SFloat(60000, -19), SFloat(33000, -22)]
+    sv_m = np.array([v.m for v in vs], dtype=np.int64)
+    sv_e = np.array([v.e for v in vs], dtype=np.int64)
+    for frac_s in (N.SOFTMAX_FRAC_MIN, 23, N.SOFTMAX_FRAC_MAX):
+        w, sreg = N.softmax(scores, 4, frac_s, vs, tables)
+        assert int(w[0]) > 0 and sreg == SFloat(1 << 15, 1 - 19 - 15)
+        wr, m, e = N.softmax_rows(scores[None, :], np.array([4]), frac_s, sv_m, sv_e, tables)
+        assert wr[0].tolist() == w.tolist() and (int(m[0]), int(e[0])) == (sreg.m, sreg.e)
+    # one below the window, one above it, and the largest value the u8 field holds:
+    # each is a named domain error rather than an overflow out of the clamp shift
+    for frac_s in (0, N.SOFTMAX_FRAC_MIN - 1, N.SOFTMAX_FRAC_MAX + 1, 63, 255):
+        with pytest.raises(ValueError, match="FRAC_S"):
+            N.softmax(scores, 4, frac_s, vs, tables)
+        with pytest.raises(ValueError, match="FRAC_S"):
+            N.softmax_rows(scores[None, :], np.array([4]), frac_s, sv_m, sv_e, tables)
+
+
+def test_softmax_refuses_a_scale_register_exponent_the_i8_cannot_hold(tables: N.Tables) -> None:
+    """``SREG_out = {2**15, e_max - 14}``: ``e_max`` below ``E8_MIN + 14`` has no encoding."""
+    assert (N.SOFTMAX_EMAX_MIN, N.SOFTMAX_EMAX_MAX) == (N.E8_MIN + 14, N.E8_MAX + 14)
+    assert (N.SOFTMAX_EMAX_MIN, N.SOFTMAX_EMAX_MAX) == (-114, 141)
+    scores = np.array([0, -(3 << 16)], dtype=np.int64)
+    for e_max in (N.SOFTMAX_EMAX_MIN, -50, N.SOFTMAX_EMAX_MAX):
+        vs = [SFloat(40000, e_max), SFloat(50000, e_max - 1)]
+        w, sreg = N.softmax(scores, 2, 16, vs, tables)
+        assert sreg == SFloat(1 << 15, e_max - 14) and N.E8_MIN <= sreg.e <= N.E8_MAX
+        assert int(w[0]) > 0
+    for e_max in (N.SOFTMAX_EMAX_MIN - 1, -200, N.SOFTMAX_EMAX_MAX + 1):
+        vs = [SFloat(40000, e_max), SFloat(50000, e_max - 1)]
+        sv_m = np.array([v.m for v in vs], dtype=np.int64)
+        sv_e = np.array([v.e for v in vs], dtype=np.int64)
+        with pytest.raises(ValueError, match="e_max"):
+            N.softmax(scores, 2, 16, vs, tables)
+        with pytest.raises(ValueError, match="e_max"):
+            N.softmax_rows(scores[None, :], np.array([2]), 16, sv_m, sv_e, tables)
+    # a token whose scale is the canonical zero takes no part in e_max, so it
+    # cannot pull a row out of the window, and an all-zero row has no exponent
+    vs = [SFloat(40000, N.SOFTMAX_EMAX_MIN), SFLOAT_ZERO]
+    w, sreg = N.softmax(scores, 2, 16, vs, tables)
+    assert int(w[1]) == 0 and sreg == SFloat(1 << 15, N.SOFTMAX_EMAX_MIN - 14)
+    w0, s0 = N.softmax(scores, 2, 16, [SFLOAT_ZERO, SFLOAT_ZERO], tables)
+    assert not w0.any() and s0 == SFLOAT_ZERO
 
 
 # =========================================================================== SiLU

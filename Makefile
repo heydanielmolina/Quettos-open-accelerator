@@ -1,23 +1,23 @@
 # Quettos Core -- top-level Makefile. Everything runs from the repo root.
-# Every target runs except demo, demo-toolcall, demo-qwen and regen-prefix,
-# which generate text and so need the VROPE and VSOFTMAX passes of
-# qcore_vpu_top (see docs/ROADMAP.md).
 
 UV       := uv
 VERILATOR := verilator
 YOSYS    := yosys
 IVERILOG := iverilog
 
-MODEL    ?= qwen
 TOPS     ?=
 
 # The compiled model the Verilator harness runs and the flags it runs with
 # (sim/verilator, docs/PERFORMANCE.md). HARNESS_CFG selects the RTL widths.
 IMAGE       ?= build/images/qwen2.5-0.5b-instruct-l2
+FULL_IMAGE  ?= build/images/qwen2.5-0.5b-instruct
 HARNESS_CFG ?= WB=64 B_MAX=1 VL=4 VSRAM_WORDS=4096
-PERF_ARGS   ?= --traffic --max-new 1
+PERF_ARGS   ?= --max-new 1
+MAX_NEW     ?= 20
+DEMO_ARGS   ?= --max-new $(MAX_NEW)
+PREFIX_KV   ?= build/kv/prefix.kv
 
-.PHONY: all help demo demo-toolcall demo-qwen regen-prefix ci test lint style cocotb synth gatesim perf waves probe harness harness-csr bringup bringup-sweep clean
+.PHONY: all help demo demo-qwen regen-prefix ci test lint style cocotb synth gatesim perf waves probe harness harness-csr bringup bringup-sweep clean
 
 all: help
 
@@ -30,13 +30,12 @@ help:
 	@echo "  make probe         Verilator speed probe (sim/probe)"
 	@echo "  make harness       build the Verilator harness (sim/verilator)"
 	@echo "  make harness-csr   run the harness CSR driver against rtl/qcore_csr.sv"
-	@echo "  make bringup       RTL vs isa_sim on the tiny configuration, both programs (sw/quettos/compare.py)"
+	@echo "  make bringup       RTL vs isa_sim on the tiny configuration, four programs (sw/quettos/compare.py)"
 	@echo "  make bringup-sweep the same over random shapes at WB=64 and WB=128"
 	@echo "  make clean         remove build/ and Verilator obj_dir directories"
-	@echo "  make demo          Qwen 32+20 end to end; needs the VROPE and VSOFTMAX passes"
-	@echo "  make demo-toolcall tool-call demo with prefix-KV reuse; needs the same two passes"
-	@echo "  make demo-qwen     the recorded Qwen demo; needs the same two passes"
-	@echo "  make regen-prefix  regenerate the 512-token demo prefix; needs the same two passes"
+	@echo "  make demo          IMAGE's own prompt plus MAX_NEW tokens on qcore_top"
+	@echo "  make demo-qwen     the same on the whole Qwen model (FULL_IMAGE)"
+	@echo "  make regen-prefix  prefill IMAGE's prompt and save the KV region to PREFIX_KV"
 	@echo "  make ci            the CI job set, run locally"
 	@echo "  make synth         Yosys synth_xilinx of every syn/synth_*.ys script; logs in build/synth/, and every syn/reports/*.md has to still reproduce"
 	@echo "  make gatesim       gate-level equivalence: each Yosys netlist against the source it came from (sim/gatesim)"
@@ -69,17 +68,28 @@ clean:
 	rm -rf build
 	find . -type d -name 'obj_dir*' -prune -exec rm -rf {} +
 
+# The end-to-end run: the image's own prompt through prefill.prog, then MAX_NEW
+# decode steps, with each token printed as it leaves the RTL and the counters
+# and the memory traffic at the end. `make demo` runs the two-layer image and
+# `make demo-qwen` the whole model; both take the same flags through DEMO_ARGS.
 demo:
-	@echo "make demo: the Qwen 32+20 run executes VROPE and VSOFTMAX; qcore_vpu_top carries VRMSNORM, VQUANT, VSILUMUL and VSUBC (docs/ROADMAP.md)"; exit 1
-
-demo-toolcall:
-	@echo "make demo-toolcall: the tool-call run executes VROPE and VSOFTMAX; qcore_vpu_top carries VRMSNORM, VQUANT, VSILUMUL and VSUBC (docs/ROADMAP.md)"; exit 1
+	@test -f $(IMAGE)/layout.json || { \
+	  echo "make demo: $(IMAGE)/layout.json not found (uv run quettos compile <model>)"; exit 1; }
+	$(MAKE) -C sim/verilator run $(HARNESS_CFG) IMAGE=$(IMAGE) ARGS="$(DEMO_ARGS)"
 
 demo-qwen:
-	@echo "make demo-qwen: the recorded Qwen run executes VROPE and VSOFTMAX; qcore_vpu_top carries VRMSNORM, VQUANT, VSILUMUL and VSUBC (docs/ROADMAP.md)"; exit 1
+	$(MAKE) demo IMAGE=$(FULL_IMAGE)
 
+# The prefix a later run restores: prefill every prompt token of IMAGE, generate
+# nothing, and write the KV region out at its image layout, so the file belongs
+# to the model and the port width that produced it (docs/ARCHITECTURE.md).
 regen-prefix:
-	@echo "make regen-prefix: regenerating the demo prefix executes VROPE and VSOFTMAX; qcore_vpu_top carries VRMSNORM, VQUANT, VSILUMUL and VSUBC (docs/ROADMAP.md)"; exit 1
+	@test -f $(IMAGE)/layout.json || { \
+	  echo "make regen-prefix: $(IMAGE)/layout.json not found (uv run quettos compile <model>)"; exit 1; }
+	@mkdir -p $(dir $(PREFIX_KV))
+	$(MAKE) -C sim/verilator run $(HARNESS_CFG) IMAGE=$(IMAGE) \
+	  ARGS="--max-new 0 --kv-save $(abspath $(PREFIX_KV))"
+	@echo "regen-prefix: $(PREFIX_KV)"
 
 ci: lint style test cocotb synth gatesim harness-csr bringup
 	@echo "ci: OK (the job set of .github/workflows/ci.yml, run locally)"
@@ -112,10 +122,11 @@ harness-csr:
 	$(MAKE) -C sim/verilator csr-check
 
 # The bring-up comparison: the four-descriptor EMBED / VQUANT / GEMV(ARGMAX) /
-# HALT program and the directed vector program of docs/ISA.md over a random tiny
-# model, run on qcore_top and on sw/quettos/isa_sim.py and compared element by
+# HALT program of docs/ISA.md, the directed vector program, the attention step
+# of decode.prog at six positions and the whole decoder layer at the same six,
+# each run on qcore_top and on sw/quettos/isa_sim.py and compared element by
 # element. BRINGUP_TINY is the CI configuration; BRINGUP_ARGS is the wider
-# sweep. Add --programs bringup or --programs vector to run just one.
+# sweep. Add --programs attention (or bringup, vector, layer) to run just one.
 BRINGUP_TINY ?= --sweep --shapes 2 --widths 16 --seed 0 --tokens 2
 BRINGUP_ARGS ?= --sweep --shapes 5 --widths 64,128 --seed 0 --tokens 2
 

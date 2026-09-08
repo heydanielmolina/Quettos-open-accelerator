@@ -145,9 +145,12 @@ jobs:
 
   # qcore_top against sw/quettos/isa_sim.py on the tiny configuration (WB=16,
   # B_MAX=2, VL=2, VSRAM_WORDS=2048): the four-descriptor bring-up program of
-  # docs/ISA.md and its directed vector program over random tiny models, every
-  # VSRAM element, SREG word, dumped logit, CSR and PERF counter compared, at
-  # LAT 1 / 32 / 200 and --bw-div 2.
+  # docs/ISA.md, its directed vector program, the attention step of the
+  # compiled decode.prog and the whole decoder layer, the last two at six
+  # positions on one machine so each position reads the KV cache the one before
+  # it wrote. Over random tiny models, every VSRAM element, SREG word, dumped
+  # logit, KV byte, CSR and PERF counter compared, at LAT 1 / 32 / 200 and
+  # --bw-div 2.
   # docs/PERFORMANCE.md holds the local wall clock of this target from a cold
   # Verilator build.
   bringup-tiny:

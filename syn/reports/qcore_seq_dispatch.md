@@ -33,36 +33,36 @@ Parameters: `WB = 64`, `B_MAX = 1`.
 | `BUFG` | 1 |
 | `CARRY4` | 55 |
 | `DSP48E1` | 1 |
-| `FDRE` | 514 |
+| `FDRE` | 515 |
 | `IBUF` | 398 |
 | `INV` | 15 |
 | `LUT1` | 12 |
-| `LUT2` | 132 |
-| `LUT3` | 122 |
-| `LUT4` | 84 |
-| `LUT5` | 40 |
-| `LUT6` | 107 |
-| `MUXF7` | 36 |
+| `LUT2` | 141 |
+| `LUT3` | 123 |
+| `LUT4` | 79 |
+| `LUT5` | 42 |
+| `LUT6` | 113 |
+| `MUXF7` | 33 |
 | `MUXF8` | 7 |
 | `OBUF` | 616 |
 
-2140 cells in total: 497 LUTs, 514 flops, 55 `CARRY4`, 1014 I/O pads. Yosys estimates 353
+2151 cells in total: 510 LUTs, 515 flops, 55 `CARRY4`, 1014 I/O pads. Yosys estimates 357
 LCs.
 
 | Hard block | Count | Inferred from |
 |---|---|---|
-| `DSP48E1` | 1 | `$mul` at `rtl/qcore_seq_dispatch.sv:285` |
+| `DSP48E1` | 1 | `$mul` at `rtl/qcore_seq_dispatch.sv:299` |
 
 `memory_libmap` mapped no memory: the block holds its state in flops.
 
 Longest topological path through the LUT fabric: 43 cells.
 
 ```
- 0  $techmap9744$abc$8284$auto$blifparse.cc:557:parse_blif$8766.A
+ 0  $techmap10152$abc$8657$auto$blifparse.cc:557:parse_blif$9156.A
 10  pos_p1 [32]
-12  rtl/qcore_seq_dispatch.sv:228
+12  rtl/qcore_seq_dispatch.sv:242
 22  n_ru [24]
-26  rtl/qcore_seq_dispatch.sv:232
+26  rtl/qcore_seq_dispatch.sv:246
 36  n_pad [24]
 43  wt_c [37]
 ```
@@ -76,39 +76,39 @@ Parameters: `WB = 16`, `B_MAX = 2`.
 | `BUFG` | 1 |
 | `CARRY4` | 80 |
 | `DSP48E1` | 1 |
-| `FDRE` | 575 |
+| `FDRE` | 576 |
 | `IBUF` | 399 |
-| `INV` | 15 |
-| `LUT1` | 13 |
-| `LUT2` | 204 |
-| `LUT3` | 152 |
-| `LUT4` | 131 |
-| `LUT5` | 61 |
-| `LUT6` | 114 |
-| `MUXF7` | 35 |
+| `INV` | 14 |
+| `LUT1` | 12 |
+| `LUT2` | 203 |
+| `LUT3` | 177 |
+| `LUT4` | 145 |
+| `LUT5` | 52 |
+| `LUT6` | 98 |
+| `MUXF7` | 34 |
 | `MUXF8` | 5 |
 | `OBUF` | 673 |
 
-2459 cells in total: 675 LUTs, 575 flops, 80 `CARRY4`, 1072 I/O pads. Yosys estimates 458
+2470 cells in total: 687 LUTs, 576 flops, 80 `CARRY4`, 1072 I/O pads. Yosys estimates 472
 LCs.
 
 | Hard block | Count | Inferred from |
 |---|---|---|
-| `DSP48E1` | 1 | `$mul` at `rtl/qcore_seq_dispatch.sv:285` |
+| `DSP48E1` | 1 | `$mul` at `rtl/qcore_seq_dispatch.sv:299` |
 
 `memory_libmap` mapped no memory: the block holds its state in flops.
 
-Longest topological path through the LUT fabric: 43 cells.
+Longest topological path through the LUT fabric: 46 cells.
 
 ```
- 0  $techmap20761$abc$18884$auto$blifparse.cc:557:parse_blif$19546.A
+ 0  $techmap21557$abc$19656$auto$blifparse.cc:557:parse_blif$20328.A
 10  pos_p1 [32]
-12  rtl/qcore_seq_dispatch.sv:229
-13  rtl/qcore_seq_dispatch.sv:228
+12  rtl/qcore_seq_dispatch.sv:243
+13  rtl/qcore_seq_dispatch.sv:242
 22  n_ru [24]
-25  rtl/qcore_seq_dispatch.sv:232
-34  n_pad [24]
-43  wt_c [36]
+27  rtl/qcore_seq_dispatch.sv:246
+37  n_pad [24]
+46  wt_c [36]
 ```
 
 ## Notes (hand-written)

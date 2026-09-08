@@ -425,10 +425,12 @@ CASES: tuple[Case, ...] = (
         ),
     ),
     # The whole vector unit on the tiny configuration, with the lanes, the
-    # scalar unit and the sigmoid tables it contains. ROM_FILE_* comes first for
-    # the reason the ROM cases give, and the shape keeps the descriptors short
-    # and mostly executable so a case reaches its passes, its SREG write and its
-    # event strobes inside the window. v_req_tag is TAG_VPU by construction.
+    # scalar unit and the two curve tables it contains. ROM_FILE_* comes first
+    # for the reason the ROM cases give, and the shape keeps the descriptors
+    # short and mostly executable so a case reaches its passes, its SREG write
+    # and its event strobes inside the window: a VROPE gets a whole number of
+    # heads, a VSOFTMAX a length inside its n and the FRAC_S window docs/ISA.md
+    # gives it. v_req_tag is TAG_VPU by construction.
     Case(
         name="vpu_top_tiny",
         top="qcore_vpu_top",
@@ -442,6 +444,7 @@ CASES: tuple[Case, ...] = (
         ),
         params={
             "ROM_FILE_SIGMOID": rom_image("sigmoid"),
+            "ROM_FILE_EXP2": rom_image("exp2"),
             "ROM_FILE_RSQRT": rom_image("rsqrt"),
             "ROM_FILE_RECIP": rom_image("recip"),
             "WB": 16,
@@ -458,23 +461,35 @@ CASES: tuple[Case, ...] = (
             " cmd_vs_aux = 16'd2048; cmd_rows = 2'b11; cmd_sh0 = 8'd16; cmd_sh1 = 8'd16;"
             " cmd_sreg_dst = 8'd3; v_req_ready = 1'b1; cmd_valid_vpu = 1'b1;",
             "cmd_valid_vpu = 1'b0; vsa_rdata = {8{32'h0001_3579}}; vsb_rdata = {8{32'hfffe_0021}};",
+            "cmd_op = 8'h22; cmd_n = 24'd64; cmd_pos = 32'd3; cmd_valid_vpu = 1'b1;",
+            "cmd_valid_vpu = 1'b0;",
+            "cmd_op = 8'h24; cmd_n = 24'd12; cmd_len = 24'd6; cmd_sh0 = 8'd20;"
+            " cmd_valid_vpu = 1'b1;",
+            "cmd_valid_vpu = 1'b0;",
         ),
         shape=(
             "rv = $random(seed);\n"
-            "case (rv % 8)\n"
+            "case (rv % 12)\n"
             "  0, 1: cmd_op = 8'h20;   // VRMSNORM\n"
             "  2, 3: cmd_op = 8'h21;   // VQUANT\n"
-            "  4, 5: cmd_op = 8'h23;   // VSILUMUL\n"
-            "  6:    cmd_op = 8'h25;   // VSUBC\n"
+            "  4, 5: cmd_op = 8'h22;   // VROPE\n"
+            "  6, 7: cmd_op = 8'h23;   // VSILUMUL\n"
+            "  8, 9: cmd_op = 8'h24;   // VSOFTMAX\n"
+            "  10:   cmd_op = 8'h25;   // VSUBC\n"
             "  default: cmd_op = rv[7:0];\n"
             "endcase\n"
             "rv = $random(seed); cmd_valid_vpu = (rv % 24) == 0;\n"
             "rv = $random(seed); cmd_n    = (rv % 4) ? (rv % 20) : 24'd0;\n"
+            "if (cmd_op == 8'h22) cmd_n = 24'd64 * (1 + (rv % 2));\n"
+            "rv = $random(seed); cmd_len = 24'd1 + (rv % 20);\n"
+            "if (cmd_len > cmd_n) cmd_len = (cmd_n == 24'd0) ? 24'd1 : cmd_n;\n"
+            "rv = $random(seed); cmd_pos = (rv % 4) ? (rv % 96) : rv;\n"
             "rv = $random(seed); cmd_vs_src = (rv % 8) ? (rv % 64) : rv[15:0];\n"
             "rv = $random(seed); cmd_vs_dst = (rv % 8) ? (16'd1024 + rv % 64) : rv[15:0];\n"
             "rv = $random(seed); cmd_vs_aux = (rv % 8) ? (16'd2048 + rv % 64) : rv[15:0];\n"
             "rv = $random(seed); cmd_rows = rv % 4;\n"
             "rv = $random(seed); cmd_sh0  = 8'd13 + (rv % 18);\n"
+            "if (cmd_op == 8'h24) cmd_sh0 = 8'd16 + (rv % 15);\n"
             "rv = $random(seed); cmd_sh1  = rv % 96;\n"
             "rv = $random(seed); cmd_sreg_dst = rv % 40;\n"
             "rv = $random(seed); v_req_ready = (rv % 4) != 0;\n"

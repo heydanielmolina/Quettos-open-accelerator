@@ -10,7 +10,7 @@ import random
 import cocotb
 import qc_stream
 from cocotb.clock import Clock
-from cocotb.triggers import FallingEdge
+from cocotb.triggers import FallingEdge, Timer
 from quettos import isa
 
 WB = int(os.environ["QC_WB"])
@@ -299,3 +299,68 @@ async def test_buckets_are_exclusive(dut):
     assert sum(got[IDX[n]] for n in BUCKETS) == total, "the buckets do not sum to the busy cycles"
     assert got[IDX["BUSY"]] == total and got[IDX["CYCLES"]] == total
     assert qc_stream.value(dut.bucket_sum) == total, "the module's own sum disagrees"
+
+
+async def _delta(dut, model: Model, **ev: int) -> dict[str, int]:
+    """The counters one cycle of ``ev`` adds, as ``{name: increment}`` over the empty cycle."""
+    await tick(dut, model, snapshot=1)
+    before = snapshot_of(dut)
+    await tick(dut, model, snapshot=1, **ev)
+    after = snapshot_of(dut)
+    return {n: after[i] - before[i] for n, i in IDX.items() if after[i] != before[i]}
+
+
+@cocotb.test()
+async def test_every_counter_has_exactly_one_source(dut):
+    """Each event port moves the counters the source table of docs/RTL.md 3.18 names for it.
+
+    A cycle is driven with one port set on top of a legal busy cycle and the whole
+    snapshot is differenced, so a counter wired to a second strobe, or a strobe
+    reaching a counter it does not own, shows up as an extra key.
+    """
+    model, _ = await _setup(dut, 0x9E0A)
+    for i, name in enumerate(BUCKETS):
+        got = await _delta(dut, model, ev_cycle=1, ev_busy=1, ev_bucket=1 << i)
+        assert got == {"CYCLES": 1, "BUSY": 1, name: 1}, f"bucket {name}: {got}"
+    live = {"CYCLES": 1, "BUSY": 1, "MAC_ACTIVE": 1}
+    cases: list[tuple[dict[str, int], dict[str, int]]] = [
+        ({"ev_rd_beat": 1}, {"RD_BEATS": 1, "RD_BYTES": WB}),
+        ({"ev_wr_beat": 1, "ev_wr_bytes": 5}, {"WR_BEATS": 1, "WR_BYTES": 5}),
+        ({"ev_wr_bytes": 7}, {"WR_BYTES": 7}),  # the arbiter drives 0 without a beat
+        ({"ev_wt_valid": 1, "ev_wt_bytes": 1 << 33}, {"WT_BYTES": 1 << 33}),
+        ({"ev_wt_bytes": 1 << 33}, {}),  # a bulk value without its valid adds nothing
+        ({"ev_macs_valid": 1, "ev_macs": 1 << 35}, {"MACS": 1 << 35}),
+        ({"ev_macs": 1 << 35}, {}),
+        ({"ev_desc": 1}, {"DESCRIPTORS": 1}),
+        ({"ev_fetch_beat": 1}, {"FETCH_BEATS": 1}),
+    ]
+    for ev, want in cases:
+        got = await _delta(dut, model, ev_cycle=1, ev_busy=1, ev_bucket=1, **ev)
+        assert got == {**live, **want}, f"{ev}: moved {got}, expected {live | want}"
+    check(dut, model, "one source per counter")
+
+
+@cocotb.test()
+async def test_the_one_hot_detector_counts_every_claim(dut):
+    """``bucket_ones`` is the population count the module's own check compares against one.
+
+    A bucket mask is presented and withdrawn between two rising edges, so the
+    registered check never samples an illegal one: what is proved here is that a
+    second claim is counted as a second claim rather than folded into the first.
+    A mask that really reached a rising edge stops the simulation through the
+    module's ``$error``, and the test that produced it fails with it.
+    """
+    model, _ = await _setup(dut, 0x9E0B)
+    masks = ((0, 0), (0b1, 1), (0b100000, 1), (0b11, 2), (0b010010, 2), (0b111111, 6))
+    for mask, ones in masks:
+        await FallingEdge(dut.clk)
+        dut.ev_bucket.value = mask
+        await Timer(1, "ns")
+        got = qc_stream.value(dut.bucket_ones)
+        dut.ev_bucket.value = 0
+        await Timer(1, "ns")
+        assert got == ones, f"mask {mask:#08b}: bucket_ones {got}, expected {ones}"
+        assert qc_stream.value(dut.bucket_ones) == 0, "the mask outlived its half cycle"
+    await tick(dut, model, snapshot=1)
+    check(dut, model, "detector")
+    assert snapshot_of(dut) == [0] * NC, "an idle cycle counted"

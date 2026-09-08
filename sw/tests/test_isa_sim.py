@@ -6,6 +6,7 @@ step records against ``dump_plan.json``, the CSR, status, shift and bounds rules
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -409,6 +410,51 @@ def test_unknown_opcode_stops_with_err(built) -> None:
         isa_sim.run_program(b.machine(), b.programs.decode[:5])  # no HALT
     with pytest.raises(ValueError):
         isa_sim.run_program(b.machine(), isa.assemble(b.programs.decode[:5]))
+
+
+def test_softmax_class_outside_the_window_stops_with_err(built) -> None:
+    """A VSOFTMAX class outside ``[16, 30]`` faults at decode, the way an unknown opcode does."""
+    b = built(0)
+    base = next(d for d in b.programs.decode if d.opcode == Opcode.VSOFTMAX)
+    lo, hi = isa.CLASS_WINDOW[Opcode.VSOFTMAX]
+    for frac_s in (lo - 1, hi + 1):
+        m = b.machine()
+        pc0 = m.csr["PC"]
+        prog = [
+            Descriptor(opcode=Opcode.NOP),
+            dataclasses.replace(base, sh0=frac_s),
+            Descriptor(opcode=Opcode.HALT),
+        ]
+        assert isa_sim.run_program(m, prog) == 1, f"frac_s {frac_s} executed past the fault"
+        assert m.fault_state() == (isa.Fault.CLASS, int(Opcode.VSOFTMAX))
+        assert m.status("ERR") and m.status("DONE")
+        assert m.perf_value("DESCRIPTORS") == 1 and not np.any(m.vsram)
+        assert m.csr["PC"] == pc0 + isa.DESC_BYTES, "PC left the descriptor that faulted"
+        # a stepped descriptor faults the same way and executes nothing
+        m2 = b.machine()
+        m2.start()
+        isa_sim.step(m2, dataclasses.replace(base, sh0=frac_s))
+        assert m2.fault_state() == (isa.Fault.CLASS, int(Opcode.VSOFTMAX))
+        assert m2.status("ERR") and not m2.status("STEP_HALTED")
+        assert m2.perf_value("DESCRIPTORS") == 0 and not np.any(m2.vsram)
+        # the fault describes the descriptor and not its work
+        for bad in (
+            dataclasses.replace(base, sh0=frac_s, row_mask=0),
+            dataclasses.replace(base, sh0=frac_s, n=0),
+        ):
+            m3 = b.machine()
+            assert isa_sim.run_program(m3, [bad, Descriptor(opcode=Opcode.HALT)]) == 0
+            assert m3.fault_state() == (isa.Fault.CLASS, int(Opcode.VSOFTMAX))
+    # both edges of the window and one class between them run the whole token
+    for frac_s in (lo, (lo + hi) // 2, hi):
+        m = b.machine()
+        prog = [
+            dataclasses.replace(d, sh0=frac_s) if d.opcode == Opcode.VSOFTMAX else d
+            for d in b.programs.decode
+        ]
+        assert isa_sim.run_token(m, prog, b.ids[0], 0) is not None
+        assert m.fault_state() == (isa.Fault.NONE, 0) and not m.status("ERR")
+        assert m.status("DONE") and np.any(m.vsram)
 
 
 def test_step_mode_status_bits(built) -> None:

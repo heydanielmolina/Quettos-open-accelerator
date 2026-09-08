@@ -42,7 +42,8 @@ choice.
   with the measured utilization-vs-B curve; batched prefill; cross-op weight
   prefetch and per-row VPU slices; LOOP/JUMP descriptors; nextpnr-ecp5 fmax and
   a real tok/s line; quality scored over a wider set than the calibration corpus
-  (WikiText-2, at least 32k tokens), which the nightly `quality-regen` job runs;
+  (WikiText-2, at least 32k tokens), the run the nightly `quality-regen` job is
+  held for;
   WASM build of the same Verilator model for an in-browser demo.
 - **v1.2**: paged KV with block tables (prefix sharing in hardware addressing),
   flash-style online softmax, wider attention weights for long contexts, on-chip

@@ -100,15 +100,16 @@ Block labels inside the box are the `qcore_*` modules with the prefix dropped
 for width (`vpu_top` = `qcore_vpu_top`, `mem_arb` = `qcore_mem_arb`, `requant`
 = `qcore_requant`, `lane_group` = `qcore_mac_lane_group`, and so on).
 `qcore_top` wires the GEMV, EMBED, KVWRITE and vector units; `qcore_vpu_top`
-executes VRMSNORM, VQUANT, VSILUMUL and VSUBC, and a VROPE or VSOFTMAX
-descriptor stops the program with `STATUS.ERR`, `FAULT = OPCODE`,
-`FAULT_OP` = the opcode byte and `PC` on the descriptor. The tables follow their
-passes: the unit holds sigmoid, rsqrt and recip, and exp2 arrives with
-VSOFTMAX, the one pass that reads it.
+executes all six V opcodes -- VRMSNORM, VQUANT, VROPE, VSILUMUL, VSOFTMAX and
+VSUBC -- so every opcode the ISA defines issues to a unit and a descriptor whose
+opcode byte is none of the twelve is what stops the program with `STATUS.ERR`,
+`FAULT = OPCODE`, `FAULT_OP` = the byte and `PC` on the descriptor. The tables
+follow their passes: the unit holds sigmoid, rsqrt, recip and the exp2 image the
+VSOFTMAX exponential reads.
 
-Module list and responsibilities. The package and its seventeen modules are the
-eighteen files under `rtl/`, each linted as its own top by `make lint`, to the
-interface `docs/RTL.md` section 3 specifies:
+Module list and responsibilities. The package and its seventeen modules are
+the eighteen `rtl/*.sv` files, each linted as its own top by `make lint`, to
+the interface `docs/RTL.md` section 3 specifies:
 
 | Module | Purpose |
 |---|---|
@@ -123,7 +124,7 @@ interface `docs/RTL.md` section 3 specifies:
 | `qcore_mac_lane_group` | 8 lanes of 8w x 16a -> 24-bit product into one 40-bit accumulator per lane (`acc <= prod + (tile_start ? load : acc)`, a DSP48E1 with the P feedback and the C override for the EMBED load) plus a hold set for the finished tile |
 | `qcore_requant` | two-stage sfloat requant, S clamp + ERR, m==0 rule, bias, RMW, sat counters, absmax, argmax, dump, partial-tile drain |
 | `qcore_vsram` | true-dual-port 256-bit RAM wrapper, `verilator public_flat_rd` for zero-cycle dumps |
-| `qcore_vpu_top` / `_lane` / `_scalar` | VRMSNORM, VQUANT, VSILUMUL and VSUBC over `VL` lanes, with the LOD / sfloat / LUT scalar path and the two-trip lane schedule the two-product passes use |
+| `qcore_vpu_top` / `_lane` / `_scalar` | VRMSNORM, VQUANT, VROPE, VSILUMUL, VSOFTMAX and VSUBC over `VL` lanes, with the LOD / sfloat / LUT scalar path and the two-trip lane schedule the two-product passes use |
 | `qcore_lut_rom` / `qcore_lut_interp` | (v, dv) ROMs from `rtl/gen/*.hex` via `ROM_FILE`, linear interpolation |
 | `qcore_kv_writer` | K^T byte scatter / V tile row / meta writes, issued-write tracking |
 | `qcore_perf` | 16 x 64-bit counters with exclusive stall buckets |
@@ -173,11 +174,11 @@ prefill program omits the final norm and LM head, which saves 27.6% of the
 bytes per prompt token on Qwen (LM head share of linear MACs; see
 `MEMORY_MAP.md`).
 
-Prefix reuse (v1, `make demo-toolcall`): the **harness** copies the KV region
-byte for byte at its image layout, so a saved file belongs to the model and the
-port width that produced it, and the host restores `POS` alongside it. This is a
-harness save and restore of the RTL's KV state, not a prefix-caching system in
-hardware.
+Prefix reuse: the **harness** copies the KV region byte for byte at its image
+layout (`--kv-save`, `--kv-load`; `make regen-prefix` writes one), so a saved
+file belongs to the model and the port width that produced it, and the host
+restores `POS` alongside it. This is a harness save and restore of the RTL's KV
+state, not a prefix-caching system in hardware.
 
 ## Host / RTL boundary
 
@@ -212,6 +213,6 @@ write VSRAM mid-token is a design change, not a fix.
   lengths.
 - **v1 runs a single sequence with heads sequential.** Every headline number
   runs the full vocabulary with the LM head on the accelerator. The row
-  dimension (`B_MAX`), KV save/restore across requests and the tool-call demo
-  are the foundations for batched decode, a paged KV cache and constrained
-  decoding, which follow in v1.1 and later.
+  dimension (`B_MAX`) and KV save/restore across requests are the foundations
+  for batched decode and a paged KV cache; those, constrained decoding and the
+  tool-call demo that shows it off are on the roadmap (`docs/ROADMAP.md`).

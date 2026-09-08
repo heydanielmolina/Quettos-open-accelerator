@@ -230,7 +230,7 @@ each GEMV does.
 | Counter | Source pulses (summed in `qcore_top` into the `qcore_csr` increment) |
 |---|---|
 | `SAT_REQ` | `requant.sat_inc[2:0]`: a per-cycle count, `0..4`, one per saturating `sat40` / `sat32` stage of the element leaving the pipeline (stage-1, stage-2, bias add, accumulate add) |
-| `SAT_VPU` | `vpu_top.sat_inc[7:0]`: a per-cycle count, `0..VL`, one per element of a writing pass whose `sat32` saturated. A two-product pass reports both of its `sat32`, the intermediate as well as the result -- VRMSNORM's `xhat` and its `y`, VSILUMUL's `silu` and its `h` -- so an intermediate that leaves int32 raises the counter instead of quietly changing the result. The intermediate's flag travels with the chunk and is ORed with the result's before the count, so such an element is one event whether one of the two trips saturated or both. VSUBC contributes its `y`, and VROPE its two outputs with that pass. VQUANT contributes nothing: its clip is the defined result and is counted as a clip (3.12) |
+| `SAT_VPU` | `vpu_top.sat_inc[7:0]`: a per-cycle count, one per element of a writing pass whose `sat32` saturated. `0..VL` on every pass but VROPE, where a chunk carries two results per element and the count is `0..2 VL`; `VL <= 4`, so the port holds either. A pass whose second trip consumes the first's result reports both of its `sat32`, the intermediate as well as the result -- VRMSNORM's `xhat` and its `y`, VSILUMUL's `silu` and its `h`, VSOFTMAX's `p` and its `w` -- so an intermediate that leaves int32 raises the counter instead of quietly changing the result. The intermediate's flag travels with the chunk and is ORed with the result's before the count, so such an element is one event whether one of the two trips saturated or both. VSUBC contributes its `y`, and VROPE its two outputs separately, since neither is the other's intermediate. VQUANT contributes nothing: its clip is the defined result and is counted as a clip (3.12), and so is the VSOFTMAX weight clip |
 | `ERR_SHIFT` | `requant.err_shift_inc[1:0]`: a per-cycle count, `0..2`, per element `sh0 > 63` (every element) and stage-2 `S` outside `[0, 63]` (elements with both scales non-zero); `vpu_top.err_shift_inc[7:0]`: a per-cycle count, `0..2 VL`, one per element per clamped shift -- VRMSNORM `S1` outside `[0, 63]` and its `G` outside `[0, 63]` can both count for one element, VSILUMUL `sh_h` outside `[0, 63]` counts once (`sh1` is i8: negative values clamp to 0) |
 | `ERR_BOUNDS` | `seq_dispatch.err_bounds_inc[3:0]`: `n_from_pos` / `k_from_pos` above capacity and VSOFTMAX `len` outside `[1, n]`, each once per participating row, counted when the descriptor commits (3.5); `kv_writer.err_bounds_inc[1:0]`: `POS >= k` and a `vs_src` range past the end, once each per row; `requant.err_bounds_inc[1:0]` and `vpu_top.err_bounds_inc[3:0]`: the VSRAM ranges each leaves, once per row per range; the `err_bounds` pulse of each row and the `sreg_err` pulse of each bank |
 
@@ -246,14 +246,36 @@ returned beat and `WR_BEATS` / `WR_BYTES` per accepted write (registered, one
 cycle after the beat; `ev_wr_bytes` is 0 in cycles without `ev_wr_beat`);
 `qcore_seq_fetch` raises `FETCH_BEATS` per returned `TAG_FETCH` beat.
 
+### 2.9 Attention on the GEMV path
+
+The scores and PV GEMVs of `sw/quettos/compiler.py` ask four things of the
+matrix-vector path, and each of the four is a mechanism the path already
+carries:
+
+| What the attention step needs | The mechanism | Where it is |
+|---|---|---|
+| the length and the depth from the position | `n_from_pos` gives the scores GEMV `N = min(roundup(POS + 1, WB), n)` and `k_from_pos` gives the PV GEMV `K = min(POS + 1, k)`; both are derived once at the decode and handed over as `cmd_n` / `cmd_k` | `qcore_seq_dispatch` (`n_pos`, `k_pos`; 3.5 and the POS table of 2.2), against `isa_sim.gemv_dims` |
+| the per-token scale record stream | the meta side-stream of 2.5 with the tokens as the channels: one 8-beat burst per tile at `addr_m + t*WB*8`, `WB` records, one consumed per drained channel. The record address advances by `WB*8` per tile whatever the tile stride is, which is exactly the 8 B per token in token order that the K meta region holds | `qcore_stream_ctrl` (`r_maddr`; 3.7), `docs/MEMORY_MAP.md` KV layout |
+| the unit-scale form | `unit_meta` gives the requant `Sw = {2^15, -15}` and `bias_q = 0` for every channel and suppresses the meta bursts, so the PV GEMV carries the whole scale in `Sx`, the softmax output scale | `qcore_requant` stage 0 (3.10), `qcore_stream_ctrl` (`d_meta`; 3.7) |
+| the transposed K region against the row-major V region | one address generator, `addr_a + (t*k_stride + k)*WB`, with the `k` field as the tile stride: `k_stride = 64` walks the `WB`-token K^T tiles with the tokens as output channels, `k_stride = MAX_CTX` walks the V tiles with the 64 dimensions as output channels and the tokens as `K` | `qcore_stream_ctrl` (`d_stride`; 3.7), the two sub-region layouts of `docs/MEMORY_MAP.md` |
+
+An attention step therefore adds no mode to the matrix-vector path: it is the
+tile stride, the two POS-derived extents and the unit-scale bit, and
+`sim/cocotb/tb_gemv_wrap.py` (a tile stride wider than `K`, `unit_meta`) and
+`sim/cocotb/tb_seq_dispatch.py` (`test_pos_derived_fields` over `POS` 0, 1, 63,
+64 and 2047) drive all four at block level. What an attention step adds is in
+the vector unit: the rotation that precedes the KV write and the softmax that
+turns the scores into the PV activations, both specified in 3.12.
+
 ## 3. Modules
 
 Port tables list name, direction (from the module), width and meaning.
 Parameters are named as in section 1. Sections 3.1 to 3.18 specify `qcore_pkg`
 and the seventeen modules `rtl/` holds, and `make cocotb`, `make gatesim` and
-`make bringup-sweep` exercise them. Within 3.12, the VROPE and VSOFTMAX passes,
-the two bundle fields they read and the exp2 table image arrive with those two
-opcodes (`docs/ROADMAP.md`); the rest of the section is built.
+`make bringup-sweep` exercise them. `qcore_vpu_top` (3.12) carries a pass for
+every V opcode of the ISA, so every opcode `docs/ISA.md` defines issues to a
+unit from `qcore_top` and the `OPCODE` fault has one meaning: an opcode byte
+that is none of the twelve (3.2, 3.5).
 
 ### 3.1 `qcore_pkg`
 
@@ -273,10 +295,10 @@ in use so a module that calls it stays clean under `-Wall`.
 
 Parameters: `WB`, `B_MAX`, `VSRAM_WORDS`, `FIFO_BEATS`, `ACC_W`,
 `META_FIFO_BEATS`, `MAX_BURST`, `DQ_DEPTH`, `VL`, `VPU_FIFO_BEATS` and the
-`ROM_FILE_SIGMOID`, `ROM_FILE_RSQRT` and `ROM_FILE_RECIP` image paths (each
-`parameter ROM_FILE_<TABLE> = ""`, forwarded to `qcore_vpu_top`) -- what the
-modules it contains take. `ROM_FILE_EXP2` arrives with VSOFTMAX, the one
-opcode that reads that table.
+`ROM_FILE_SIGMOID`, `ROM_FILE_EXP2`, `ROM_FILE_RSQRT` and `ROM_FILE_RECIP`
+image paths (each `parameter ROM_FILE_<TABLE> = ""`, forwarded to
+`qcore_vpu_top`) -- what the modules it contains take. `ROM_FILE_EXP2` is the
+image the VSOFTMAX exponential pass reads.
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
@@ -320,24 +342,22 @@ and the SREG banks into the four `*_inc` inputs of `qcore_csr` (section 2.8). `S
 units' own `busy` outputs go to the dispatcher, which folds them into the
 retire conditions of section 2.2.
 
-Opcodes with no unit: `qcore_vpu_top` executes VRMSNORM, VQUANT, VSILUMUL and
-VSUBC, and VROPE and VSOFTMAX name passes it does not carry. `qcore_top` refuses
-a descriptor with either of those two opcodes at the queue head: it holds the
-`dq_valid` / `dq_ready` handshake so the descriptor is never popped, raises the
-dispatcher's `abort_run`, and drives `qcore_csr`'s `err_set` with
-`FAULT = OPCODE` and `FAULT_OP` = the opcode byte in the cycle the dispatcher
-ends the run. The descriptor in flight retires first, then the run ends on the
-write fence of 3.5: the fetch queue is flushed, the PERF counters are
+The descriptor queue: every opcode the ISA defines has a unit at this level, so
+the fetch queue's head goes straight to the dispatcher (`dq_valid = fq_valid`,
+`fq_ready = dq_ready`) and the fault path is the dispatcher's alone. An opcode
+byte that is none of the twelve faults in `S_DEC` with `FAULT = OPCODE` and that
+byte in `FAULT_OP` -- as do the `ROW` and `CLASS` faults of the same state
+(3.5) -- and the run ends on the write fence of 3.5: the descriptor
+in flight retires, the fetch queue is flushed, the PERF counters are
 snapshotted, `DONE` and `ERR` are set together, `busy` drops and `PC` names the
-refused descriptor. Nothing is issued and nothing is counted for it. This is the
-`OPCODE` fault of `docs/ISA.md` in its second form -- a defined opcode whose
-pass the build does not carry.
+descriptor that faulted. Nothing is issued and nothing is counted for it.
+`qcore_top` passes `err_set`, `fault_code` and `fault_op` through to
+`qcore_csr` unchanged.
 
-Simulation checks (`` `ifndef SYNTHESIS ``): no VROPE or VSOFTMAX reaches an
-issue pulse (the message carries `cmd_len` and `cmd_pos`, the bundle fields
-those two read), at most one of the requant, the KV writer and the vector unit
-claims port B in a cycle, and no VSRAM word is read on port A and written on
-port B in one cycle (2.6).
+Simulation checks (`` `ifndef SYNTHESIS ``): a V opcode's `vs_dst` is either
+exactly its source range or disjoint from it within one bank (2.6), at most one
+of the requant, the KV writer and the vector unit claims port B in a cycle, and
+no VSRAM word is read on port A and written on port B in one cycle (2.6).
 
 ### 3.3 `qcore_csr`
 
@@ -479,13 +499,16 @@ step ends on `DONE` too.
 | `FAULT` | Name | Raised when | `FAULT_OP` |
 |---|---|---|---|
 | 0 | `NONE` | no fault | 0 |
-| 1 | `OPCODE` | the opcode byte is none of the twelve, or it names a pass the build does not carry (3.2, opcodes with no unit) | that byte |
+| 1 | `OPCODE` | the opcode byte is none of the twelve; every defined opcode issues to a unit (3.2) | that byte |
 | 2 | `ROW` | a participating row's `src_row + r` or `dst_row + r` is at or above `B_MAX` | the opcode |
 | 3 | `PC_ALIGN` | `start` or `step` with `PC` not a multiple of 32 | 0 |
+| 4 | `CLASS` | the descriptor's class field is outside the window its opcode is defined over: `isa.CLASS_WINDOW`, which holds VSOFTMAX `sh0` in `[16, 30]` | the opcode |
 
 `PC_ALIGN` is checked in the cycle after the pulse, before the first fetch
-request; `OPCODE` and `ROW` in the decode cycle, before the auto-fence and the
-SREG reads. The compiler cannot emit a `ROW` descriptor (`docs/ISA.md`, rows)
+request; `OPCODE`, `ROW` and `CLASS` in the decode cycle, before the auto-fence
+and the SREG reads, and in that order, so a descriptor that breaks two of them
+reports the first. `CLASS` is a property of the descriptor rather than of its
+rows, like the opcode byte, so it is raised whatever `ROW_EN` holds. The compiler cannot emit a `ROW` descriptor (`docs/ISA.md`, rows)
 and `sw/quettos/isa_sim.py` rejects one; the fault is what the hardware does
 when it meets one anyway.
 
@@ -753,57 +776,172 @@ default to 32 RAMB36E1 (the 2048-word tiny configuration to 16).
 Parameters: `WB`, `B_MAX`, `VL`, `VSRAM_WORDS`, `VPU_FIFO_BEATS`, `MAX_BURST`,
 and the three image paths of the tables its passes read: `ROM_FILE_SIGMOID`,
 `ROM_FILE_RSQRT` and `ROM_FILE_RECIP` (the last two forwarded to
-`qcore_vpu_scalar`). `ROM_FILE_EXP2` joins them with VSOFTMAX, the one pass that
-reads that table.
+`qcore_vpu_scalar`). `ROM_FILE_EXP2` is the fourth, `rtl/gen/exp2.hex`, read by
+the VSOFTMAX exponential pass alone.
 
 | Port | Dir | Width | Meaning |
 |---|---|---|---|
 | `cmd_valid_vpu`, `cmd_op`, `cmd_vq_w8`, `cmd_vq_use_tracked`, `cmd_vq_group`, `cmd_vq_scale_mul`, `cmd_track_absmax`, `cmd_addr_a`, `cmd_n`, `cmd_vs_src`, `cmd_vs_dst`, `cmd_vs_aux`, `cmd_sreg_dst`, `cmd_sh0`, `cmd_sh1`, `cmd_imm32`, `cmd_sqrt_m`, `cmd_sqrt_e`, `cmd_rows`, `cmd_sreg_u32` | i | | section 2.2 |
-| `cmd_len`, `cmd_pos`, `ROM_FILE_EXP2` | | | the VSOFTMAX length, the VROPE table row and the softmax table: they arrive with those two opcodes. An input a module does not read is an UNUSEDSIGNAL error and an unused parameter an UNUSEDPARAM error (section 5), so they join the port list with the passes that read them |
+| `cmd_len`, `cmd_pos` | i | 24, 32 | section 2.2: the executed VSOFTMAX length and the `POS` the VROPE table row is addressed from. With `ROM_FILE_EXP2` they belong to those two passes alone, and an input a module does not read is an UNUSEDSIGNAL error and an unused parameter an UNUSEDPARAM error (section 5), so they join the port list with the passes that read them |
 | `v_req_*` | | | read requests to `qcore_mem_arb`, `tag = TAG_VPU` |
 | `rdv_valid`, `rd_data`, `rd_data_last` | i | 1, `DW`, 1 | routed beats |
 | `cur_row` | o | `RW` | physical row offset `r` being processed |
 | `vsa_en`, `vsa_addr`, `vsa_rdata` | o, o, i | 1, `AW`, 256 | port A of bank `src_row + r` (reads) |
-| `vsb_sel_dst`, `vsb_en`, `vsb_we`, `vsb_addr`, `vsb_wdata`, `vsb_rdata` | o, o, o, o, o, i | 1, 1, 8, `AW`, 256, 256 | port B of bank `src_row + r` (`vsb_sel_dst = 0`, reads) or `dst_row + r` (`vsb_sel_dst = 1`, writes) |
+| `vsb_sel_dst`, `vsb_en`, `vsb_we`, `vsb_addr`, `vsb_wdata`, `vsb_rdata` | o, o, o, o, o, i | 1, 1, 8, `AW`, 256, 256 | port B of bank `src_row + r` (`vsb_sel_dst = 0`) or `dst_row + r` (`vsb_sel_dst = 1`); reads and writes both follow the select, and one address serves both |
 | `sreg_wr_en`, `sreg_wr_row`, `sreg_wr_idx`, `sreg_wr_data` | o | 1, `RW`, 8, 32 | to bank `dst_row + sreg_wr_row` (VROPE writes no SREG) |
 | `sat_inc`, `err_shift_inc`, `err_bounds_inc` | o | 8, 8, 4 | section 2.8 |
 | `done`, `busy` | o | 1 | `done` after the last write of the last row |
 
 Rows execute ascending and to completion (SREG writes included) before the
-next row starts. Operand fetch presents `VL` consecutive elements from any
-element offset (two-word window), reads on port A (first operand) and port B
-(second operand, `vsb_sel_dst = 0`), writes on port B with element strobes
-(`vsb_sel_dst = 1`; VROPE writes bank `src_row + r`). QMEM operands stream
-through a `VPU_FIFO_BEATS`-deep FIFO in bursts of at most
-`min(MAX_BURST, VPU_FIFO_BEATS)`, re-read for every row: gamma `2n` bytes at
-`addr_a` (int16), the RoPE row 128 bytes at `addr_a + POS*128`, the centering
-row `4n` bytes at `addr_a` (int32), the V-scale meta `8*len` bytes at `addr_a`
-(records; only `m`, `e` are used). Throughput per pass is `VL` elements per
-cycle for the passes that need one product per element, and `VL` elements every
-two cycles for the two that need two -- VRMSNORM pass 3 and VSILUMUL -- since
+next row starts. A pass walks its elements in chunks of `VC` consecutive
+elements from any element offset (a two-word window per operand), reads on port
+A (first operand) and port B (second operand), and writes on port B with element
+strobes. `VC` is `VL`, except on a pass that streams 8-byte records, where it is
+`min(VL, WB/8)` so that a chunk's records lie inside one beat, as a chunk's
+gamma or centering elements always do.
+
+`vsb_sel_dst` names the bank the 2.6 crossbar gives port B, `dst_row + r` when
+set and `src_row + r` when clear, for a read as much as for a write. It is set
+on the writes of every op but VROPE, which rewrites its own source, and it is
+set for the whole VSOFTMAX weight pass, whose reads and writes are both the
+destination. The bank select follows it combinationally, so the unit never
+presents a write in the cycle after a port-B read -- the analogue of the
+requant's `vsb_row` rule in 3.10 -- and one address serves the port, so a
+port-B read and a port-B write never share a cycle.
+
+QMEM operands stream through a `VPU_FIFO_BEATS`-deep FIFO in bursts of at most
+`min(MAX_BURST, VPU_FIFO_BEATS)`. A run of bursts restarts for every row, and
+for every pass of a row that streams, so an op whose passes each need the
+operand reads it once per pass:
+
+| Operand | Address and extent | Element form |
+|---|---|---|
+| gamma (VRMSNORM pass 3) | `2n` B at `addr_a` | int16, `WB/2` per beat |
+| centering row (VSUBC) | `4n` B at `addr_a` | int32, `WB/4` per beat |
+| V-scale records (VSOFTMAX passes 1 and 3) | `8*len` B at `addr_a` | the 8-byte meta record of `docs/ISA.md`; record `i` of a beat is at bits `[64i +: 64]` and the pass reads `{e[7:0], m[15:0]}` from `[64i + 32 +: 24]`, dropping `bias_q` and the pad byte. `WB/8` per beat |
+| RoPE row (VROPE) | 128 B at `addr_a + POS*128` | 32 int16 Q1.14 cosines then 32 sines. The row is latched whole into a 64 x 16 b register before the row's first chunk, because a pair needs `cos_i` from byte `2i` and `sin_i` from byte `64 + 2i` of it and the two lie in different beats at every `WB` below 128 |
+
+Throughput per pass is `VC` elements per cycle for a pass that needs one product
+per element and `VC` elements every two cycles for one that needs two --
+VRMSNORM pass 3, VSILUMUL, VROPE and the VSOFTMAX weight pass -- since
 `qcore_vpu_lane` performs one operation per cycle (3.13) and a chunk makes two
 trips through it. The lane pipeline is 2 cycles, a table lookup 2 cycles (ROM 1,
-interpolation 1), `qcore_vpu_scalar` a fixed 5 (3.14).
+interpolation 1), `qcore_vpu_scalar` a fixed 5 (3.14). A two-trip pass holds its
+first operand to the trip-B stage as well as its second: VRMSNORM, VSILUMUL and
+VSOFTMAX give trip B the result of trip A, VROPE gives both trips the pass's own
+two operands.
 
-Port B carries both the second operand and the output writes, and the port-B
-bank the 2.6 crossbar selects follows `vsb_sel_dst` combinationally, so the unit
-never presents a write in the cycle after a port-B read -- the analogue of the
-requant's `vsb_row` rule in 3.10.
+`sh`, `c` and `c2` are per-lane inputs of `qcore_vpu_lane` (3.13), so a pass may
+give each lane its own shift and its own coefficients. One pass does: the
+VSOFTMAX weight trip, whose shift and mantissa both come from the record of the
+element in that lane.
 
-| Op | Passes (each `n/VL` cycles plus pipeline fill) | Result placement |
+| Op | Passes (each `n/VC` chunks plus pipeline fill) | Result placement |
 |---|---|---|
 | VRMSNORM | 1: absmax; 2: `sum((x >> sh)^2)` with `sh = max(0, bitlen(amax) - 15)`, accumulated in 56 bits; scalar `RMS_SCALE`; 3: `xhat = sat32(round_shift49(x * Rc_m, S1))`, `y = sat32(round_shift49(xhat * gamma, G))` | `vs_dst`; absmax to `SREG[sreg_dst]` |
 | VQUANT | 1: absmax (skipped with `USE_TRACKED`: `cmd_sreg_u32` of the row); scalar `QUANT_SCALE`; 2: `q = clip(round_shift49(x * inv, shift))`; with `GROUP` the three steps repeat per `vs_aux`-element group (`USE_TRACKED` ignored) | int8 / int16 values sign-extended to int32 at `vs_dst`; scale(s) to `SREG[sreg_dst + g]` |
-| VROPE | 1 per 64-element head: `a' = sat32(round_shift49(a*cos - b*sin, 14))`, `b' = sat32(round_shift49(b*cos + a*sin, 14))` on pairs `(i, i+32)`; table row from QMEM | in place at `vs_src` of bank `src_row + r` |
+| VROPE | one two-trip pass per 64-element head, `n >> 6` heads ascending, 32 pairs each: `a = x[64h + i]` on port A, `b = x[64h + 32 + i]` on port B, `a' = sat32(round_shift49(a*cos_i - b*sin_i, 14))` (`L_ROPE_A`) and `b' = sat32(round_shift49(b*cos_i + a*sin_i, 14))` (`L_ROPE_B`), both trips on the pair the pass read | in place at `vs_src` of bank `src_row + r`, `a'` over `a` and `b'` over `b`; no SREG write |
 | VSILUMUL | 1: `sig = sigmoid table`, `silu = round_shift49(g * sig, 15)`, `h = sat32(round_shift64(silu * u, sh_h))` | `vs_dst`; absmax to `SREG[sreg_dst]` |
-| VSOFTMAX | 1: `m = max s[0..len)`; 2: `e_t` (exp2 table, Q1.23) written as int32 into `vs_dst[0..len)`, `sum`; scalar `SOFTMAX_NORM`; 3: `p_t`, `w_t` from the stored `e_t` and the streamed V scales, `e_max` over non-zero scales, weights clipped at 32767, rewritten over `vs_dst[0..len)`, zeros written to `vs_dst[len..n)` | `vs_dst`; `SREG[sreg_dst] = {2^15, e_max - 14}` or 0 |
+| VSOFTMAX | four passes and one scalar request, below | `vs_dst[0..n)`; `SREG[sreg_dst] = {2^15, e_max - 14}` or the zero word |
 | VSUBC | 1: `sat32(x - c)` with the streamed row | `vs_dst` |
 
+VSOFTMAX passes. The weight of a token needs `e_max`, the largest V-scale
+exponent of the whole row, and needs it before the first weight is formed, so
+the maximum and the weights cannot share a pass: a pass that reduced `e_max`
+while it wrote weights would give the weights of a prefix the maximum of that
+prefix. `numerics.softmax` reduces over the whole array before it writes
+anything and has no ordering to expose. The unit reduces `e_max` in the pass
+that already reduces the score maximum and streams the records a second time
+for the weights. The alternative is to hold the row's records on chip, which is
+6 KB of state at `MAX_CTX = 2048` carried for one opcode; the second stream
+instead costs `8*len` bytes, an **estimate** of 5.3% of the bytes an attention
+step reads at `MAX_CTX` and 0.9% of the bytes a Qwen token reads at that
+position, from `traffic` in `layout.json` and the KV layout of
+`docs/MEMORY_MAP.md` at `WB = 64`.
+
+| # | Pass | Reads | Writes | Holds |
+|---|---|---|---|---|
+| 1 | maximum | `vs_src[0..len)` on port A and the `len` records at `addr_a`, `VC` of each per cycle | nothing | `m`, the signed maximum of the scores, in a 32-bit register initialised to `-2^31`; `e_max`, the largest `e` over the records whose `m` is non-zero, in an i8 register with a seen bit that starts clear |
+| 2 | exponential | `vs_src[0..len)` on port A, `VL` per cycle | `e_t` as int32 over `vs_dst[0..len)` on port B | `total`, the sum of `e_t`, in the 56-bit accumulator |
+| -- | scalar | `SOFTMAX_NORM` with `req_x = total`, requested when pass 2's pipeline is empty, answered 5 cycles later | | `inv = rsp_m` and `sh_p = rsp_shift = 7 + e_s` in the registers the other two scalar ops use |
+| 3 | weight | `vs_dst[0..len)` on port B with `vsb_sel_dst` set, and the `len` records at `addr_a` again, `VC` of each every two cycles | `w_t` as int32 over `vs_dst[0..len)` on port B | -- |
+| 4 | fill | nothing | zeros over `vs_dst[len..n)` on port B, `VL` per cycle | -- |
+
+Pass 2 per element: `d = clamp(m - s, 0, 25 << FRAC_S)` from a 33-bit signed
+subtraction, `nn = (d + 2^FRAC_S - 1) >> FRAC_S` (at most 25), `g = (nn <<
+FRAC_S) - d`, `f16 = g >> (FRAC_S - 16)`, the exp2 table at index `f16[15:8]`
+with `frac8 = f16[7:0]`, then `e_t = round_shift49(v * 256, nn)` through
+`L_MUL16` with the lane's shift set per element, which is `numerics.softmax`'s
+`round_shift(exp2_q15(f16) << 8, n)` (`nn` is that reference's `n`; the
+descriptor field of that name is the destination count).
+
+`FRAC_S` is the descriptor's `sh0` and lies in `[16, 30]`
+(`isa.CLASS_WINDOW`, from `numerics.SOFTMAX_FRAC_MIN` / `SOFTMAX_FRAC_MAX`
+through the generated `QCORE_SOFTMAX_FRAC_MIN` / `_MAX`), the range over which
+that one shift is the reference's `f16`: 30 is all a signed int32 class carries
+and below 16 the argument would have to be widened rather than narrowed. The
+unit is never handed one outside it, because the dispatcher faults the
+descriptor at its decode with `FAULT = CLASS` (3.5).
+
+`e_t` is Q1.23 and the token at the maximum contributes exactly `2^23`, so
+`total` is never zero for a `len` of at least 1, `rsp_zero` never fires and
+`7 + e_s` stays inside the `[0, 63]` the scalar clamps to.
+
+Pass 3 per element, two trips on one chunk: trip A `p_t = round_shift49(e_t *
+inv, sh_p)` (`L_MUL16`, the shift a pass constant), trip B `w_t =
+round_shift49(p_t * m_rec, clamp(24 + e_max - e_rec, 0, 40))` (`L_MUL16` with
+the record's mantissa as the coefficient and the lane's own shift), then the
+int16 clip of `qcore_pkg::clip16_from49`, a clip and not a saturation (2.8). A
+record with a zero mantissa needs no case of its own: the coefficient is zero,
+so the product and the weight are zero, which is the weight
+`numerics.softmax` gives it. Neither product can saturate -- `e_t * inv` and
+`p_t * m_rec` are both under `2^39` -- and the shift clamp is inert for every
+record with a non-zero mantissa, whose shift lies in `[24, 40]`, so pass 3
+raises no `ERR_SHIFT`.
+
+A row whose records all carry a zero mantissa has no `e_max`. The unit then
+skips passes 2 and 3 and the scalar request and runs pass 4 over the whole of
+`vs_dst[0..n)`, which is the zero vector and the zero scale
+`numerics.softmax` returns from its early exit.
+
+`SREG[sreg_dst]` takes `sreg_pack(2^15, 1 + e_max - 15)` at the end of the row,
+or the word 0, the canonical zero scale, when no record had a non-zero
+mantissa. VSOFTMAX writes it whether or not `track_absmax` is set: it is the
+descriptor's output scale, not a tracked absmax. `e_max - 14` is formed in the
+i8 the SREG word carries and wraps like every other exponent (3.1), so the
+scale has an encoding only while the row's largest live V-scale exponent lies
+in `[-114, 141]` -- nothing below `2^-113`. The V scales a compiled program
+writes are the int8 VQUANT's, whose exponents are in `[-37, -6]` at
+`FRAC_in = 16`, and `numerics.softmax_sreg` raises on an `e_max` outside the
+window rather than wrapping it (`docs/NUMERICS.md`, Softmax).
+
+Pass 4 reads nothing and stalls on nothing, so a short row inside a `MAX_CTX`
+destination pays `(n - len)/VL` cycles for zeros that the PV GEMV's
+`k_from_pos` does not read back. They are written because the descriptor's
+result is the whole of `vs_dst[0..n)`: that is the range
+`isa_sim.written_ranges` names for a VSOFTMAX and the range a per-descriptor
+comparison checks.
+
+VROPE detail. The two halves of a head lie 32 elements apart, so the pass reads
+the `a` half through the port-A window and the `b` half through the port-B
+window, and both halves keep the same offset within a word. Each trip produces
+one of the two results, so the pass carries two write-staging words, the `a`
+half's and the `b` half's, each emitted with element strobes when it fills or
+at the end of the head; a chunk every two cycles leaves port B one read and two
+writes per four cycles at `VL = 4`. The rotation is exact in place because the
+reads of a pair precede its writes by the depth of the pass and no later pair
+reads an earlier pair's elements. `n` is a multiple of 64 (`isa.vrope` rejects
+anything else); the unit executes `n >> 6` heads and leaves a remainder
+untouched. VROPE writes no SREG and ignores `track_absmax`, and its shift is
+the constant 14, so it raises no `ERR_SHIFT`.
+
 `ERR_BOUNDS`: one pulse per row per operand range past `VSRAM_WORDS*8`
-(VRMSNORM, VQUANT, VSUBC, VROPE: read and write; VSILUMUL: `src`, `aux`,
-write; VSOFTMAX: the `len` read and the `n` write); SREG indices through the
-banks' `sreg_err`. `ERR_SHIFT` and `SAT_VPU` as in section 2.8; VQUANT and
-softmax clips are not events.
+(VRMSNORM, VQUANT, VSUBC: read and write; VSILUMUL: `src`, `aux`, write;
+VSOFTMAX: the `vs_src + len` read with the executed `cmd_len` and the
+`vs_dst + n` write; VROPE reads and writes one range, `vs_src + n`, and counts
+it twice, once as the read and once as the write, as `isa_sim` counts it);
+SREG indices through the banks' `sreg_err`. `ERR_SHIFT` and `SAT_VPU` as in
+section 2.8; VQUANT and VSOFTMAX clips are not events.
 
 Destination and source: a pass streams its operands ahead of its writes, so it
 reproduces `sw/quettos/isa_sim.py` -- which takes the whole source before it
@@ -816,6 +954,12 @@ Either source may be the one written in place, so a VSILUMUL may write over
 source range is written before the rest of that source is read; far enough into
 it, the same word is read on port A and written on port B in one cycle, the
 design error of section 2.6.
+
+The VSOFTMAX weight pass is that in-place form applied to the destination
+itself: it reads the `e_t` pass 2 parked at `vs_dst + i` and rewrites the weight
+there, on the same port and in the same bank, and the read of a word precedes
+its write by the depth of the pass, so no element's `e_t` is overwritten before
+it is read.
 
 The rule binds within one bank. A pass reads bank `src_row + r` and writes bank
 `dst_row + r`, so a descriptor with `dst_row != src_row` addresses a different
@@ -853,11 +997,14 @@ VRMSNORM it drives.
 
 Ops: `L_MUL32` `y = sat32(round_shift64(a * b, sh))`; `L_MUL16` `y =
 sat32(round_shift49(a * c, sh))`; `L_ROPE_A` `y = sat32(round_shift49(a*c -
-b*c2, sh))`; `L_ROPE_B` `y = sat32(round_shift49(a*c + b*c2, sh))`; `L_SUB`
+b*c2, sh))`; `L_ROPE_B` `y = sat32(round_shift49(b*c + a*c2, sh))`; `L_SUB`
 `y = sat32(a - b)`; `L_PASS` `y = a`. Coefficients are handled as 17-bit
 signed: `L_MUL16` widens `c` as u16, which is what VRMSNORM's `Rc_m`, VQUANT's
 `inv` and VSILUMUL's sigmoid need, and `L_ROPE_A` / `L_ROPE_B` widen `c` and
-`c2` as int16, which is what `numerics.rope`'s Q1.14 row needs. A signed
+`c2` as int16, which is what `numerics.rope`'s Q1.14 row needs. The two
+rotation ops take the same operand pair and the same `(c, c2) = (cos, sin)`:
+`L_ROPE_A` multiplies `a` by `c`, `L_ROPE_B` multiplies `b` by it, so one
+issue of each over `(a, b)` gives `numerics.rope`'s pair. A signed
 coefficient outside a rotation reaches the same product through `L_ROPE_A` with
 `b = 0`. Clips, maxima and absmax are computed in `qcore_vpu_top` from `y`.
 One element per cycle; the encodings are `L_MUL32` 0 through `L_PASS` 5, the
@@ -901,9 +1048,9 @@ string`). Ports:
 `{v[15:0], dv[15:0]}`; outputs are registered (valid the cycle after the
 enable). The `initial $readmemh(ROM_FILE, mem)` that loads it is the one
 initial block in the synthesizable RTL. `qcore_vpu_top` instantiates
-`ceil(VL/2)` sigmoid ROMs -- two ports each, one per lane -- and
-`qcore_vpu_scalar` one rsqrt and one recip ROM; the exp2 ROMs join them with
-VSOFTMAX.
+`ceil(VL/2)` sigmoid ROMs (`ENTRIES = 512`) and `ceil(VL/2)` exp2 ROMs
+(`ENTRIES = 256`) -- two ports each, one per lane -- and `qcore_vpu_scalar` one
+rsqrt and one recip ROM.
 
 ### 3.16 `qcore_lut_interp`
 
@@ -912,7 +1059,10 @@ Ports: `clk`, `rst`, `in_valid`, `v[15:0]`, `dv[15:0]`, `frac8[7:0]`,
 forward difference, which is what `numerics.Lut` requires: exp2's entries run to
 65359, so a signed `v` would be negative over most of that table.
 `y = v + ((dv * frac8 + 128) >>> 8)` in 25-bit signed arithmetic; the result
-lies in `[0, 65535]` by table construction. One cycle.
+lies in `[0, 65535]` by table construction. One cycle. `qcore_vpu_top`
+instantiates one per lane and feeds it the sigmoid ROM's pair on a VSILUMUL and
+the exp2 ROM's on a VSOFTMAX exponential pass, since no descriptor reads both
+tables.
 
 ### 3.17 `qcore_kv_writer`
 
@@ -952,19 +1102,50 @@ Sixteen 64-bit live counters, wrapping, and sixteen snapshot registers behind
 them. `clear` zeroes both sets, `snapshot` copies live into snapshot, and
 `perf_snap` presents the snapshot; the dispatcher pulses them as section 3.5
 says, so the halves the host reads are stable while it works between a HALT or
-a step and the next `START`. `ev_cycle` is `busy` from the dispatcher, so
-`CYCLES == BUSY` in v1.
+a step and the next `START`. Every counter takes one add per cycle from the
+port below and from nothing else:
 
-`ev_bucket` is one-hot while `ev_busy` is high and zero otherwise (3.5);
-bit `i` increments counter `2 + i`, so `BUSY` equals the sum of indices 2 to 7.
+| `i` | Counter | Source | Add |
+|---|---|---|---|
+| 0 | `CYCLES` | `ev_cycle`, the dispatcher's `busy` | 1 per cycle the level is high |
+| 1 | `BUSY` | `ev_busy`, the same level, so `CYCLES == BUSY` in v1 | 1 per cycle the level is high |
+| 2 | `MAC_ACTIVE` | `ev_bucket[0]`: a GEMV in flight and `gemv_beat`, the OR of the rows' `ev_beat` | 1 |
+| 3 | `STALL_MEM` | `ev_bucket[1]`: a GEMV or EMBED in flight with no beat and no drain | 1 |
+| 4 | `STALL_VPU` | `ev_bucket[2]`: a V op in flight, all six V opcodes | 1 |
+| 5 | `STALL_KV` | `ev_bucket[3]`: a KVWRITE in flight, or the dispatcher in its fence states | 1 |
+| 6 | `STALL_SEQ` | `ev_bucket[4]`: every other busy cycle | 1 |
+| 7 | `STALL_DRAIN` | `ev_bucket[5]`: a GEMV or EMBED in flight after `stream_done`, outside its issue cycle | 1 |
+| 8 | `RD_BEATS` | `qcore_mem_arb.ev_rd_beat`, one per returned beat of any tag -- weights, meta, descriptors and the vector unit's operand bursts alike; registered, one cycle behind the beat | 1 |
+| 9 | `RD_BYTES` | the same strobe | `WB` |
+| 10 | `WT_BYTES` | `qcore_seq_dispatch.ev_wt_valid` / `ev_wt_bytes` at the issue of an EMBED or of a GEMV with neither POS-derived extent | `ev_wt_bytes`, a bulk add, per participating row |
+| 11 | `WR_BEATS` | `qcore_mem_arb.ev_wr_beat`, one per accepted write transfer, registered the same way | 1 |
+| 12 | `WR_BYTES` | `qcore_mem_arb.ev_wr_bytes`, the strobed bytes of that transfer, 0 in a cycle without `ev_wr_beat` | `ev_wr_bytes` |
+| 13 | `MACS` | `qcore_seq_dispatch.ev_macs_valid` / `ev_macs` at the issue of a GEMV, the attention GEMVs included | `ev_macs`, a bulk add, per participating row |
+| 14 | `DESCRIPTORS` | `qcore_seq_dispatch.ev_desc` at a retire, a descriptor that does no work included | 1 |
+| 15 | `FETCH_BEATS` | `qcore_seq_fetch.ev_fetch_beat`, one per returned `TAG_FETCH` beat | 1 |
+
+One owner per busy cycle. `ev_bucket` is one-hot exactly while `ev_busy` is
+high and zero otherwise, and bit `i` increments counter `2 + i`, so
+`BUSY = MAC_ACTIVE + STALL_MEM + STALL_VPU + STALL_KV + STALL_SEQ +
+STALL_DRAIN` holds cycle by cycle and therefore at every snapshot. The
+dispatcher assigns the owner, because it is the only module that knows which
+descriptor is in flight, and it assigns exactly one by the first-match priority
+of 3.5: the rows, the requant draining, the stream controller waiting, the
+vector unit, the KV writer with the arbiter, and the dispatcher itself for
+everything left. VROPE and VSOFTMAX divide the same way as the other four V
+opcodes: their pass cycles are `STALL_VPU`, their operand bursts are counted in
+`RD_BEATS` and `RD_BYTES` like any other read, and the auto-fence they take
+before issue is `STALL_KV`, since nothing has been issued in those cycles. A
+`` `ifndef SYNTHESIS `` check asserts the one-hot rule every cycle and the sum
+at every `snapshot`, `qcore_seq_dispatch` asserts the same one-hot rule at its
+own output, and the harness checks the sum again from the CSR window
+(`docs/PERFORMANCE.md`).
+
 `ev_wt_bytes` and `ev_macs` are bulk adds at the issue of a GEMV or EMBED and
 count **per participating row**, exactly as `sw/quettos/isa_sim.py` counts
-`WT_BYTES` and `MACS`. `ev_wr_bytes` is a count of strobed bytes and is 0 in a
-cycle without `ev_wr_beat`; `sat_*_inc`, `err_*_inc` and the requant's event
-ports are per-cycle counts too, added arithmetically rather than OR-ed
-(section 2.8). The `SAT_*` and `ERR_*` counters themselves live in `qcore_csr`,
-not here. A `` `ifndef SYNTHESIS `` check asserts the one-hot rule and that
-the six bucket counters sum to `BUSY` at every `snapshot`.
+`WT_BYTES` and `MACS`. `sat_*_inc`, `err_*_inc` and the requant's event ports
+are per-cycle counts too, added arithmetically rather than OR-ed (section 2.8).
+The `SAT_*` and `ERR_*` counters themselves live in `qcore_csr`, not here.
 
 ## 4. Resolved decisions
 
@@ -988,20 +1169,26 @@ the six bucket counters sum to `BUSY` at every `snapshot`.
 | Descriptors in flight | one; the next descriptor is popped only after the current one retires |
 | GEMV / EMBED retire | `done_gemv` **and** `qcore_stream_ctrl.busy` low; the cycles between them are `STALL_DRAIN` |
 | Zero work | an empty participating set, a GEMV / EMBED with `N == 0` or `K == 0`, and a V op with `n == 0` retire without an issue pulse |
-| Fault stop | `STATUS.ERR` with `FAULT` and `FAULT_OP`, `PC` left on the descriptor that faulted; codes `OPCODE`, `ROW`, `PC_ALIGN` (3.5) |
+| Fault stop | `STATUS.ERR` with `FAULT` and `FAULT_OP`, `PC` left on the descriptor that faulted; codes `OPCODE`, `ROW`, `PC_ALIGN`, `CLASS` (3.5) |
 | `PERF` snapshot | on a HALT retire, and the cycle a STEP, an ABORT or a fault closes its write fence; `perf_clear` only on `start` |
 | Step-mode counters | `STEP` clears no counter; a descriptor's contribution is the difference between two consecutive steps |
 | `STATUS` clearing | `start`, `step`, or writing a one to the bit; a set pulse in the same cycle wins |
 | Returned beat payload | `qcore_mem_arb` presents it as `rdd_data` / `rdd_last`; `qcore_top` fans both out to the sinks' `rd_data` / `rd_data_last` |
 | Exponents | i8 everywhere; `S` is formed in 10 bits and clamped |
 | SREG absmax | a u32 (`2^31` for an output of `-2^31`) |
-| VSOFTMAX intermediate | `e_t` parked in `vs_dst[0..len)` between pass 2 and pass 3 |
+| VSOFTMAX intermediate | `e_t` parked in `vs_dst[0..len)` between pass 2 and pass 3, read back on port B with `vsb_sel_dst` set, so the pass reads and writes the one bank it owns and the 2.6 crossbar is unchanged; the weight pass makes two trips per chunk, so that port carries one read and one write per word with cycles to spare |
+| VSOFTMAX `e_max` | reduced in the pass that reduces the score maximum, and the V-scale records are streamed a second time for the weights. The maximum is over the whole row, so a pass that both reduced it and wrote weights would give a prefix's weights that prefix's maximum; holding the row's records instead is 6 KB of state at `MAX_CTX = 2048`, against a second stream the traffic **estimate** of 3.12 puts at 5.3% of an attention step's read bytes |
+| VSOFTMAX weight shift | per lane, `clamp(24 + e_max - e_rec, 0, 40)` from the record of the element in that lane; `qcore_vpu_lane` already takes `sh`, `c` and `c2` per instance. It is not a descriptor field, so it raises no `ERR_SHIFT`, and a record with a zero mantissa needs no case of its own: a zero coefficient gives a zero weight |
+| VSOFTMAX zeros beyond `len` | a fourth pass with no operand, `VL` per cycle, over `vs_dst[len..n)`; the descriptor's result is the whole of `vs_dst[0..n)` |
+| A record-stream chunk | `VC = min(VL, WB/8)` elements, so a chunk's 8-byte records lie inside one beat |
+| VROPE writes | two write-staging words per head, the `a` half's and the `b` half's, both in place in bank `src_row + r`; both trips read the pair the pass fetched, so the pass holds its first operand to the trip-B stage |
+| The RoPE row | latched whole into a 64 x 16 b register once per participating row: a pair needs a cosine and a sine 64 bytes apart, which are different beats at every `WB` below 128 |
 | `USE_TRACKED` with `GROUP` | `USE_TRACKED` ignored |
-| Two products per element | VRMSNORM pass 3 and VSILUMUL send each chunk through the lane twice, so those passes run `VL` elements every two cycles; the one-product passes run `VL` per cycle |
+| Two products per element | VRMSNORM pass 3, VSILUMUL, VROPE and the VSOFTMAX weight pass send each chunk through the lane twice, so those passes run `VC` elements every two cycles; the one-product passes run `VC` per cycle |
 | VSRAM port B during a V op | the vector unit never presents a write in the cycle after a port-B read, so the bank the crossbar selects holds while the read returns |
 | A V op's destination | per source range the opcode reads (`vs_src`, plus `vs_aux` on VSILUMUL), `vs_dst` starts at that source or at least `n` elements away from it; with `dst_row != src_row` the two lie in different banks and the rule does not bind. The passes read ahead of their writes (3.12). The simulation check in `qcore_top` is qualified on the opcodes whose `vs_dst` names a destination (`compiler.VECTOR_SOURCES`: VRMSNORM, VQUANT, VSILUMUL, VSOFTMAX, VSUBC); VROPE rewrites `vs_src` in place and its `vs_dst` field is not a range |
 | GROUP scale index | `sreg_dst + g` with `g` saturating at 256, so a group form with more groups than the 32-register file holds addresses an index at or above the file: dropped and counted in `ERR_BOUNDS` like any other out-of-range SREG access, never wrapped onto a register the same descriptor already wrote |
-| Opcodes with no unit | VROPE and VSOFTMAX are refused at the queue head with `FAULT = OPCODE` (3.2); the other four V opcodes issue to `qcore_vpu_top` |
+| An opcode the hardware cannot execute | an opcode byte that is none of the twelve, faulted in the dispatcher's `S_DEC` with `FAULT = OPCODE` and that byte in `FAULT_OP` (3.2, 3.5). All six V opcodes issue to `qcore_vpu_top` |
 | SREG bank location | inside `qcore_row`, one read port and one write port |
 | CSR read latency | one cycle |
 | rw CSRs while BUSY | `PC`, `ROW_EN`, `TOK` and `POS` ignore host writes while `BUSY`; `PC` is the hardware's, the other three are written before START |

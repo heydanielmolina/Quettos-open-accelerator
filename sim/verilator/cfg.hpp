@@ -80,14 +80,15 @@ const char* const USAGE =
     "  --dump-ops         with --step, write per-descriptor state from dump_plan.json\n"
     "  --allow-sat        report the saturation and error counters instead of failing\n"
     "  --trace FILE       write a VCD (the model must be built with TRACE=1)\n"
-    "  --traffic          rewrite the VROPE and VSOFTMAX descriptors of the program\n"
-    "                     regions to NOP before the run: a traffic and cycle\n"
-    "                     measurement over the real image, no value check\n"
     "  --program FILE     run this raw descriptor blob instead of the token loop\n"
     "  --program-addr N   where --program is loaded and PC starts (required with it)\n"
     "  --sreg B:I=WORD    load SREG[B][I] with WORD before the run (repeatable)\n"
     "  --tok N            TOK for a --program run (0)\n"
     "  --pos N            POS for a --program run (0)\n"
+    "  --at TOK:POS       one more pass of --program at this TOK and POS; the\n"
+    "                     passes run in order on one machine, so the KV cache and\n"
+    "                     the VSRAM carry from each to the next (repeatable, and\n"
+    "                     it replaces --tok / --pos)\n"
     "  --row-en N         ROW_EN for a --program run (1)\n"
     "  --dump-vsram B:S:C record VSRAM[B][S .. S+C-1] per descriptor (repeatable)\n"
     "  --dump-mem A:S     record the S bytes at A as int32 after the run (repeatable)\n"
@@ -102,6 +103,12 @@ const char* const USAGE =
     "  --kv-load FILE     load the KV region from FILE before the run\n"
     "  --max-cycles N     stop and fail after N cycles (0: no limit)\n"
     "  --quiet            counters and the final line only\n";
+
+// One pass of a --program run: the TOK and POS the host writes before START.
+struct Pass {
+  uint32_t tok = 0;
+  uint32_t pos = 0;
+};
 
 // One SREG word the host loads before a run, and one VSRAM range it records.
 struct SregLoad {
@@ -129,6 +136,7 @@ struct Options {
   std::vector<SregLoad> sreg_loads;
   std::vector<VsramRange> dump_vsram;
   std::vector<MemRange> dump_mem;
+  std::vector<Pass> passes;
   uint64_t program_addr = 0;
   uint32_t tok = 0;
   uint32_t pos = 0;
@@ -149,7 +157,6 @@ struct Options {
   bool dump_ops = false;
   bool allow_sat = false;
   bool trace = false;
-  bool traffic = false;
   bool quiet = false;
 };
 
@@ -201,6 +208,16 @@ inline VsramRange parse_range(const std::string& spec) {
   return r;
 }
 
+// "tok:pos", both accepting 0x.
+inline Pass parse_pass(const std::string& spec) {
+  Pass p;
+  size_t colon = spec.find(':');
+  if (colon == std::string::npos) throw std::runtime_error("--at wants TOK:POS, got " + spec);
+  p.tok = static_cast<uint32_t>(strtoul(spec.substr(0, colon).c_str(), nullptr, 0));
+  p.pos = static_cast<uint32_t>(strtoul(spec.substr(colon + 1).c_str(), nullptr, 0));
+  return p;
+}
+
 // "addr:size" in bytes; the region is read back as int32 words.
 inline MemRange parse_mem(const std::string& spec) {
   MemRange r;
@@ -235,7 +252,6 @@ inline bool parse_args(int argc, char** argv, Options* o) {
     else if (a == "--dump-ops") { o->dump_ops = true; o->step = true; }
     else if (a == "--allow-sat") o->allow_sat = true;
     else if (a == "--trace") { o->trace = true; o->trace_file = next(i, "--trace"); }
-    else if (a == "--traffic") o->traffic = true;
     else if (a == "--quiet") o->quiet = true;
     else if (a == "--prompt") o->prompt = next(i, "--prompt");
     else if (a == "--prompt-ids") o->prompt_ids = parse_ids(next(i, "--prompt-ids"));
@@ -250,6 +266,7 @@ inline bool parse_args(int argc, char** argv, Options* o) {
     else if (a == "--sreg") o->sreg_loads.push_back(parse_sreg(next(i, "--sreg")));
     else if (a == "--dump-vsram") o->dump_vsram.push_back(parse_range(next(i, "--dump-vsram")));
     else if (a == "--dump-mem") o->dump_mem.push_back(parse_mem(next(i, "--dump-mem")));
+    else if (a == "--at") o->passes.push_back(parse_pass(next(i, "--at")));
     else if (a == "--tok") o->tok = static_cast<uint32_t>(strtoul(next(i, "--tok").c_str(), nullptr, 0));
     else if (a == "--pos") o->pos = static_cast<uint32_t>(strtoul(next(i, "--pos").c_str(), nullptr, 0));
     else if (a == "--row-en") o->row_en = static_cast<uint32_t>(strtoul(next(i, "--row-en").c_str(), nullptr, 0));
@@ -267,10 +284,11 @@ inline bool parse_args(int argc, char** argv, Options* o) {
   if (!o->program.empty() && o->program_addr == 0) {
     throw std::runtime_error("--program needs --program-addr");
   }
-  if (o->program.empty() &&
-      (!o->sreg_loads.empty() || !o->dump_vsram.empty() || !o->dump_mem.empty())) {
-    throw std::runtime_error("--sreg, --dump-vsram and --dump-mem belong to a --program run");
+  if (o->program.empty() && (!o->sreg_loads.empty() || !o->dump_vsram.empty() ||
+                             !o->dump_mem.empty() || !o->passes.empty())) {
+    throw std::runtime_error("--sreg, --dump-vsram, --dump-mem and --at belong to a --program run");
   }
+  if (o->passes.empty()) o->passes.push_back(Pass{o->tok, o->pos});
   if (o->prompt.empty() && o->prompt_ids.empty()) o->prompt = o->image + "/prompt.tokens";
   return true;
 }

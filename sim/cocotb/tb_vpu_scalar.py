@@ -320,7 +320,12 @@ async def test_random_rms(dut):
 @cocotb.test()
 async def test_random_quant_softmax(dut):
     """QUANT_SCALE and SOFTMAX_NORM over random magnitudes, both output widths and
-    scale_mul on and off."""
+    scale_mul on and off.
+
+    ``a_eff`` is 33 bits; the softmax total is the sum of at most ``2**24``
+    exponentials of at most ``2**23`` each, so 47 bits is the widest value the
+    vector unit's accumulator presents on ``req_x``.
+    """
     import random
 
     await setup(dut)
@@ -336,7 +341,7 @@ async def test_random_quant_softmax(dut):
             reqs.append(
                 Req(
                     op,
-                    rand_x(rng, 33 if op == OP_QUANT else 37),
+                    rand_x(rng, 33 if op == OP_QUANT else 47),
                     sh0=rng.randint(0, 30),
                     w8=bool(rng.getrandbits(1)),
                     mul_en=mul,

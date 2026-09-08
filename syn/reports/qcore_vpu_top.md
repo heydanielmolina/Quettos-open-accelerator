@@ -31,34 +31,35 @@ Parameters: `WB = 64`, `B_MAX = 1`, `VL = 4`, `VSRAM_WORDS = 4096`, `VPU_FIFO_BE
 
 | Cell | Count |
 |---|---|
-| `$scopeinfo` | 15 |
+| `$scopeinfo` | 17 |
 | `BUFG` | 1 |
-| `CARRY4` | 710 |
-| `DSP48E1` | 32 |
-| `FDRE` | 5457 |
-| `FDSE` | 11 |
-| `IBUF` | 1260 |
-| `INV` | 172 |
-| `LUT1` | 49 |
-| `LUT2` | 3120 |
-| `LUT3` | 4289 |
-| `LUT4` | 1185 |
-| `LUT5` | 2348 |
-| `LUT6` | 3831 |
-| `MUXF7` | 690 |
-| `MUXF8` | 98 |
+| `CARRY4` | 999 |
+| `DSP48E1` | 40 |
+| `FDRE` | 8305 |
+| `FDSE` | 62 |
+| `IBUF` | 1316 |
+| `INV` | 444 |
+| `LUT1` | 44 |
+| `LUT2` | 4140 |
+| `LUT3` | 5611 |
+| `LUT4` | 1777 |
+| `LUT5` | 3244 |
+| `LUT6` | 6973 |
+| `MUXF7` | 823 |
+| `MUXF8` | 167 |
 | `OBUF` | 407 |
 | `RAM32M` | 86 |
-| `SRL16E` | 392 |
+| `SRL16E` | 354 |
 
-24153 cells in total (15 of them `$scopeinfo` hierarchy markers, which map to nothing):
-14822 LUTs, 5468 flops, 710 `CARRY4`, 1667 I/O pads. Yosys estimates 11653 LCs.
+34810 cells in total (17 of them `$scopeinfo` hierarchy markers, which map to nothing):
+21789 LUTs, 8367 flops, 999 `CARRY4`, 1723 I/O pads. Yosys estimates 17605 LCs.
 
 | Hard block | Count | Inferred from |
 |---|---|---|
 | `DSP48E1` | 16 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:70` |
 | `DSP48E1` | 8 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:68` |
-| `DSP48E1` | 4 | `g_sig_interp[*].u_interp`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
+| `DSP48E1` | 8 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:69` |
+| `DSP48E1` | 4 | `g_interp[*].u_interp`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
 | `DSP48E1` | 2 | `u_scalar`, `$mul` at `rtl/qcore_pkg.sv:151` |
 | `DSP48E1` | 1 | `u_scalar.u_rcp_i`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
 | `DSP48E1` | 1 | `u_scalar.u_rsq_i`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
@@ -68,14 +69,12 @@ Memories, as `memory_libmap` mapped them:
 
 - `qcore_vpu_top.fmem` via `$__XILINX_LUTRAM_SDP_`
 
-Longest topological path through the LUT fabric: 32 cells.
+Longest topological path through the LUT fabric: 37 cells.
 
 ```
- 0  p_ord [2]
- 3  rtl/qcore_vpu_top.sv:317
- 7  issue_mask [0]
- 8  smask [16]
-32  $auto$alumacc.cc:512:replace_alu$12686.CO [52]
+ 0  wa0 [227]
+12  rtl/qcore_vpu_top.sv:834
+37  $\g_rom[0].u_exp.mem$rdreg[1]$d [17]
 ```
 
 ## Tiny configuration
@@ -85,34 +84,35 @@ Parameters: `WB = 16`, `B_MAX = 2`, `VL = 2`, `VSRAM_WORDS = 2048`, `VPU_FIFO_BE
 
 | Cell | Count |
 |---|---|
-| `$scopeinfo` | 10 |
+| `$scopeinfo` | 11 |
 | `BUFG` | 1 |
-| `CARRY4` | 489 |
-| `DSP48E1` | 18 |
-| `FDRE` | 4312 |
-| `FDSE` | 9 |
-| `IBUF` | 909 |
-| `INV` | 137 |
-| `LUT1` | 37 |
-| `LUT2` | 1812 |
-| `LUT3` | 2605 |
-| `LUT4` | 569 |
-| `LUT5` | 1343 |
-| `LUT6` | 2850 |
-| `MUXF7` | 762 |
-| `MUXF8` | 96 |
+| `CARRY4` | 666 |
+| `DSP48E1` | 22 |
+| `FDRE` | 6705 |
+| `FDSE` | 56 |
+| `IBUF` | 965 |
+| `INV` | 293 |
+| `LUT1` | 14 |
+| `LUT2` | 2347 |
+| `LUT3` | 3358 |
+| `LUT4` | 1031 |
+| `LUT5` | 1375 |
+| `LUT6` | 4725 |
+| `MUXF7` | 501 |
+| `MUXF8` | 129 |
 | `OBUF` | 405 |
 | `RAM32M` | 22 |
-| `SRL16E` | 196 |
+| `SRL16E` | 182 |
 
-16582 cells in total (10 of them `$scopeinfo` hierarchy markers, which map to nothing): 9216
-LUTs, 4321 flops, 489 `CARRY4`, 1314 I/O pads. Yosys estimates 7367 LCs.
+22808 cells in total (11 of them `$scopeinfo` hierarchy markers, which map to nothing):
+12850 LUTs, 6761 flops, 666 `CARRY4`, 1370 I/O pads. Yosys estimates 10489 LCs.
 
 | Hard block | Count | Inferred from |
 |---|---|---|
 | `DSP48E1` | 8 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:70` |
 | `DSP48E1` | 4 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:68` |
-| `DSP48E1` | 2 | `g_sig_interp[*].u_interp`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
+| `DSP48E1` | 4 | `g_lane[*].u_lane`, `$mul` at `rtl/qcore_vpu_lane.sv:69` |
+| `DSP48E1` | 2 | `g_interp[*].u_interp`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
 | `DSP48E1` | 2 | `u_scalar`, `$mul` at `rtl/qcore_pkg.sv:151` |
 | `DSP48E1` | 1 | `u_scalar.u_rcp_i`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
 | `DSP48E1` | 1 | `u_scalar.u_rsq_i`, `$mul` at `rtl/qcore_lut_interp.sv:25` |
@@ -122,33 +122,38 @@ Memories, as `memory_libmap` mapped them:
 
 - `qcore_vpu_top.fmem` via `$__XILINX_LUTRAM_SDP_`
 
-Longest topological path through the LUT fabric: 33 cells.
+Longest topological path through the LUT fabric: 35 cells.
 
 ```
- 0  g_lane[1].u_lane.op1 [2]
-25  g_lane[1].u_lane.rs64 [60]
-33  g_lane[1].u_lane.y_n [0]
+ 0  wa1 [3]
+11  sm_sub [28]
+12  rtl/qcore_vpu_top.sv:834
+26  sm_f16 [12]
+35  $auto$xilinx_dffopt.cc:347:execute$447609
 ```
 
 ## Notes (hand-written)
 
-The multipliers are the hard blocks: six `DSP48E1` per `qcore_vpu_lane` at both widths --
-four for the 32 x 32 product of `L_MUL32` and two for one of its two 32 x 17 products, where
-the lane synthesized on its own takes eight and puts the second 32 x 17 product in a DSP as
-well (`syn/reports/qcore_vpu_lane.md`) -- one per sigmoid interpolator for `dv * frac8`, and
-four in the scalar unit, one in each of its two interpolators and two for its `sfloat_mul`
-products: 32 at `VL = 4` and 18 at `VL = 2`. The QMEM operand FIFO is the only memory:
-`memory_libmap` puts its `VPU_FIFO_BEATS x WB*8` bits in distributed RAM (`RAM32M`), and the
-`SRL16E` are the same FIFO's read-side pipelining, so no block RAM is inferred anywhere and
-the three lookup tables -- sigmoid in `ceil(VL/2)` instances here, rsqrt and recip inside the
-scalar unit -- stay in the LUT fabric exactly as `syn/reports/qcore_lut_rom.md` records.
+The multipliers are the hard blocks: eight `DSP48E1` per `qcore_vpu_lane` at both widths --
+four for the 32 x 32 product of `L_MUL32` and two for each of its two 32 x 17 products, the
+eight `syn/reports/qcore_vpu_lane.md` measures on the lane alone, since the rotation gives the
+second 32 x 17 product a coefficient of its own -- one per table interpolator for
+`dv * frac8`, and four in the scalar unit, one in each of its two interpolators and two for
+its `sfloat_mul` products: 40 at `VL = 4` and 22 at `VL = 2`. The QMEM operand FIFO is the
+only memory: `memory_libmap` puts its `VPU_FIFO_BEATS x WB*8` bits in distributed RAM
+(`RAM32M`), and the `SRL16E` are the same FIFO's read-side pipelining, so no block RAM is
+inferred anywhere and the four lookup tables -- sigmoid and exp2 in `ceil(VL/2)` instances
+each here, rsqrt and recip inside the scalar unit -- stay in the LUT fabric exactly as
+`syn/reports/qcore_lut_rom.md` records.
 
-The flops are the nine-stage chunk pipeline: the operands travel with the chunk (`sopa`
-three stages, `sopb` six, the trip-A result three), the two 256-bit window registers of each
-operand stream and the 512-bit write staging register account for most of the rest, and they
-scale with `VL` and with `WB` through the FIFO alone. The longest path at both widths is
-inside a lane: from a stage-1 register (`op1`, the held opcode) through `rs64`, the 64-bit
-round-shift, to `y_n`, the saturating result select -- `qcore_vpu_lane`'s own second stage,
-which `syn/reports/qcore_vpu_lane.md` measures at 30 cells on the block alone. The 33 cells
-at `VL = 4` and 31 at `VL = 2` are that same stage as the flattened design packs it, so
-nothing this module wraps around the lanes is deeper than the block it already contains.
+The flops are the nine-stage chunk pipeline: the operands travel with the chunk (`sopa` and
+`sopb` six stages each, the per-element shift and the rotation's pair index six, the trip-A
+result three), and the two 256-bit window registers of the operand streams, the two 512-bit
+write staging registers a rotated head fills at once and the 1024-bit RoPE table row account
+for most of the rest; they scale with `VL`, and with `WB` through the FIFO alone. The longest
+path at both widths is the softmax exponential at the issue: an operand word out of the
+port-A window, the 33-bit distance below the row's score maximum, its clamp, and the 16-bit
+fraction that addresses the exp2 table, whose index register the sigmoid ROM shares. The two
+tables above give its depth in each configuration; it is a few cells deeper than the lane's
+own second stage (`syn/reports/qcore_vpu_lane.md`, 30 cells), and the one place where this
+module is deeper than a block it contains.

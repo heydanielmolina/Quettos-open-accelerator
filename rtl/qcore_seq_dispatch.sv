@@ -1,18 +1,19 @@
 // Quettos Core descriptor dispatcher: the sequencer's control loop. It pops one
 // descriptor at a time from qcore_seq_fetch, decodes it, stops the program with
-// a fault code on an opcode or a row the hardware cannot execute, waits for the
-// auto-fence on every QMEM-reading opcode, reads one SREG scale per
-// participating row, derives the POS-dependent extents, pulses the issue of the
-// GEMV group, the VPU or the KV writer, and retires on the unit's done (a GEMV
-// or EMBED also on the weight stream falling idle). One descriptor is in flight
-// at a time and the next is popped only after the current one retires, so the
-// issue pulse follows a pop by at least three cycles. Every program end waits
-// for the write fence before it declares DONE or STEP_HALTED, so a fault, an
-// ABORT and a step carry the same guarantee a HALT retire does: the host that
-// reads memory between descriptors sees every write the descriptor made. Every
-// busy cycle is classified into exactly one PERF bucket, MACS, WT_BYTES and
-// DESCRIPTORS are counted per participating row as sw/quettos/isa_sim.py counts
-// them, and ERR_BOUNDS is counted only for a descriptor the core commits to.
+// a fault code on an opcode, a row or a class field the hardware cannot
+// execute, waits for the auto-fence on every QMEM-reading opcode, reads one
+// SREG scale per participating row, derives the POS-dependent extents, pulses
+// the issue of the GEMV group, the VPU or the KV writer, and retires on the
+// unit's done (a GEMV or EMBED also on the weight stream falling idle). One
+// descriptor is in flight at a time and the next is popped only after the
+// current one retires, so the issue pulse follows a pop by at least three
+// cycles. Every program end waits for the write fence before it declares DONE
+// or STEP_HALTED, so a fault, an ABORT and a step carry the same guarantee a
+// HALT retire does: the host that reads memory between descriptors sees every
+// write the descriptor made. Every busy cycle is classified into exactly one
+// PERF bucket, MACS, WT_BYTES and DESCRIPTORS are counted per participating row
+// as sw/quettos/isa_sim.py counts them, and ERR_BOUNDS is counted only for a
+// descriptor the core commits to.
 `include "qcore_csr_defs.svh"
 module qcore_seq_dispatch #(
   parameter int WB    = 64,
@@ -131,6 +132,12 @@ module qcore_seq_dispatch #(
   localparam logic [3:0] FAULT_OPCODE   = 4'(`QCORE_FAULT_OPCODE);
   localparam logic [3:0] FAULT_ROW      = 4'(`QCORE_FAULT_ROW);
   localparam logic [3:0] FAULT_PC_ALIGN = 4'(`QCORE_FAULT_PC_ALIGN);
+  localparam logic [3:0] FAULT_CLASS    = 4'(`QCORE_FAULT_CLASS);
+
+  // the VSOFTMAX score class window of sw/quettos/numerics.py, carried into the
+  // descriptor by isa.CLASS_WINDOW
+  localparam logic [7:0] SM_FRAC_MIN = 8'(`QCORE_SOFTMAX_FRAC_MIN);
+  localparam logic [7:0] SM_FRAC_MAX = 8'(`QCORE_SOFTMAX_FRAC_MAX);
 
   localparam logic [3:0] S_IDLE  = 4'd0;  // no program running
   localparam logic [3:0] S_CHK   = 4'd1;  // PC alignment, the cycle after start / step
@@ -186,6 +193,7 @@ module qcore_seq_dispatch #(
   logic op_kv;
   logic op_fence;
   logic op_known;
+  logic class_bad;
   logic uses_rows;
   logic needs_fence;
   logic needs_sreg;
@@ -201,6 +209,12 @@ module qcore_seq_dispatch #(
   assign op_vpu      = (op == OP_VRMSNORM) || op_vquant || (op == OP_VROPE) ||
                        (op == OP_VSILUMUL) || op_vsoftmax || (op == OP_VSUBC);
   assign op_known    = op_nop || op_halt || op_gemv || op_embed || op_vpu || op_kv || op_fence;
+  // isa.class_fault: a class field outside the window its opcode is defined
+  // over. It describes the descriptor rather than its work, so an empty
+  // participating set and a zero-work shape do not excuse it, exactly as they
+  // do not excuse an opcode byte the core cannot decode.
+  assign class_bad   = op_vsoftmax && ((qcore_pkg::desc_sh0(d) < SM_FRAC_MIN) ||
+                                       (qcore_pkg::desc_sh0(d) > SM_FRAC_MAX));
   assign uses_rows   = !(op_nop || op_halt || op_fence);
   assign needs_fence = op_gemv || op_embed || op_fence || op_halt ||
                        (op == OP_VRMSNORM) || (op == OP_VROPE) || op_vsoftmax || (op == OP_VSUBC);
@@ -378,6 +392,10 @@ module qcore_seq_dispatch #(
         end else if (uses_rows && row_fault) begin
           a_fault = 1'b1;
           a_fcode = FAULT_ROW;
+          a_fop   = op;
+        end else if (class_bad) begin
+          a_fault = 1'b1;
+          a_fcode = FAULT_CLASS;
           a_fop   = op;
         end else if (op_nop || zero_work) begin
           a_retire = 1'b1;

@@ -713,7 +713,9 @@ def run_program(
     ``None`` for the image at ``PC`` (``pc`` sets the CSR first).  ``start``
     clears the counters and status bits.  An unknown opcode stops the program
     with ``STATUS.ERR``, ``DONE``, ``FAULT = OPCODE`` and the undecodable byte
-    in ``FAULT_OP``, leaving ``PC`` on the descriptor that faulted.
+    in ``FAULT_OP``, leaving ``PC`` on the descriptor that faulted; a class
+    field outside :data:`isa.CLASS_WINDOW` stops it the same way with
+    ``FAULT = CLASS`` and its own opcode byte.
     ``on_retire(index, d)`` runs after every retired descriptor, HALT included.
     """
     if start:
@@ -724,6 +726,10 @@ def run_program(
     for index, d, op in _descriptors(m, source):
         if d is None:
             m.fault(Fault.OPCODE, op)
+            m.snapshot_perf()
+            return retired
+        if isa.class_fault(d):
+            m.fault(Fault.CLASS, op)
             m.snapshot_perf()
             return retired
         execute(m, d)
@@ -740,9 +746,17 @@ def run_program(
 
 
 def step(m: Machine, d: Descriptor) -> None:
-    """``CTRL.STEP``: execute ``d`` at ``PC`` and set ``STEP_HALTED`` (``DONE`` for HALT)."""
+    """``CTRL.STEP``: execute ``d`` at ``PC`` and set ``STEP_HALTED`` (``DONE`` for HALT).
+
+    A class field outside :data:`isa.CLASS_WINDOW` faults instead, as it does
+    inside a run: nothing executes and ``PC`` stays on the descriptor.
+    """
     m._set_status(False, "DONE", "STEP_HALTED", "ERR")
     m._clear_fault()
+    if isa.class_fault(d):
+        m.fault(Fault.CLASS, int(d.opcode))
+        m.snapshot_perf()
+        return
     execute(m, d)
     _retire(m, d)
     if d.opcode == Opcode.HALT:

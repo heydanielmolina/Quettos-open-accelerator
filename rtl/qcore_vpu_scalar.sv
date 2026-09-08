@@ -17,7 +17,10 @@
 //     Sx = {a_hi, e_a - (w-1) - FRAC_in}, multiplied by scale_mul on req_mul_en
 //   SOFTMAX_NORM (req_op 2, req_x = total)  numerics.softmax
 //     e_s = bitlen(total) - 16, sum_hi = the top 16 bits,
-//     rsp_m = inv = recip_q15(sum_hi), rsp_shift = 7 + e_s
+//     rsp_m = inv = recip_q15(sum_hi), rsp_shift = 7 + e_s. total arrives on the
+//     whole width from the vector unit's 56-bit accumulator: at most 2^24
+//     exponentials of at most 2^23 each, so 47 bits, which bitlen64 and the
+//     normalisation cover as they do the 49 bits of ss'
 //
 // req_x carries the magnitude as an unsigned integer and is zero exactly on the
 // zero cases numerics takes early (ss' == 0, a == 0, an empty sum), which
@@ -37,7 +40,7 @@ module qcore_vpu_scalar #(
   input  logic               rst,
   input  logic               req_valid,
   input  logic [1:0]         req_op,
-  input  logic [63:0]        req_x,      // ss' (49 bits) / a_eff (33) / total (37)
+  input  logic [63:0]        req_x,      // ss' (49 bits) / a_eff (33) / total (47)
   input  logic [7:0]         req_sh0,    // FRAC_X / FRAC_in
   input  logic [5:0]         req_sh,     // VRMSNORM sh
   input  logic               req_w8,     // VQUANT output width: 1 = int8

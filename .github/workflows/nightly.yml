@@ -1,9 +1,14 @@
 # Quettos Core nightly: the checks that are too long for a pull request
-# (docs/VERIFICATION.md layer 8). Each job is held by `if: false` until the
-# piece it runs on is in the tree; the gate names that condition and the job's
-# own step repeats it, so a manual run reports what the job is waiting for.
+# (docs/VERIFICATION.md layer 8). The two end-to-end jobs build a compiled
+# image from the checkpoint and run the whole oracle chain on it; the three
+# jobs that are still held say on the gate what they are waiting for, and their
+# step repeats it so a manual run reports it.
 # The whole-core xc7 synthesis is not here: `make synth` runs it on every pull
 # request and rewrites syn/reports/qcore_top.md from the run.
+#
+# Action versions were checked against the upstream repos on 2026-09-02:
+#   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10.0.1 (exact tag; it publishes no floating v10),
+#   YosysHQ/setup-oss-cad-suite v4 (v4.1.0), oss-cad-suite release 2026-09-01.
 name: nightly
 
 on:
@@ -15,42 +20,102 @@ env:
   OSS_CAD_SUITE_VERSION: "2026-09-01"
 
 jobs:
+  # The whole oracle chain on a complete model: quantize and compile the
+  # checkpoint, run the image's own prompt and the decode steps after it on
+  # qcore_top and on the ISA simulator and compare the ids, then run every
+  # descriptor of the same programs against the integer golden model. The two
+  # commands together are RTL == isa_sim == golden (docs/VERIFICATION.md,
+  # layers 4 and 5). Qwen is the long one and SmolLM2 the one that generates
+  # four tokens; both run the compiled program's six vector opcodes on
+  # qcore_vpu_top.
+  e2e-qwen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/oss-cad-suite
+          key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: ${{ env.OSS_CAD_SUITE_VERSION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-qwen2.5-0.5b-instruct-${{ hashFiles('sw/quettos/model.py') }}
+      - run: uv sync --frozen
+      - name: Download the checkpoint (ungated, no token)
+        run: uv run quettos download qwen
+      - name: Quantize and compile the whole model
+        run: |
+          uv run quettos quantize qwen
+          uv run quettos compile qwen
+      - name: qcore_top against the ISA simulator, generated ids
+        run: uv run quettos compare --image build/images/qwen2.5-0.5b-instruct --wb 64 --generate 1
+      # One prompt: the other expected-tokens prompt is 180 tokens on Qwen, and
+      # both machines walk every descriptor of every position.
+      - name: The ISA simulator against the integer golden model, every descriptor
+        run: uv run quettos isa-sim qwen --compare --max-new 1 --prompt prompts/chat_short.json
+
+  e2e-smollm2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/oss-cad-suite
+          key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: ${{ env.OSS_CAD_SUITE_VERSION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-smollm2-135m-instruct-${{ hashFiles('sw/quettos/model.py') }}
+      - run: uv sync --frozen
+      - name: Download the checkpoint (ungated, no token)
+        run: uv run quettos download smollm2
+      - name: Quantize and compile the whole model
+        run: |
+          uv run quettos quantize smollm2
+          uv run quettos compile smollm2
+      - name: qcore_top against the ISA simulator, generated ids
+        run: uv run quettos compare --image build/images/smollm2-135m-instruct --wb 64 --generate 4
+      - name: The ISA simulator against the integer golden model, every descriptor
+        run: uv run quettos isa-sim smollm2 --compare --max-new 4
+
   synth-ecp5:
-    if: false   # runs with the ECP5 target: synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)
+    if: false   # held: syn/ carries no ECP5 script. The job runs with the ECP5 target -- synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
-      - run: echo "synth-ecp5 runs with the ECP5 target -- synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)"
-
-  e2e-qwen-4plus1:
-    if: false   # Qwen2.5-0.5B-Instruct 4 prompt + 1 generated token, RTL == isa_sim == golden; the compiled program's six vector opcodes run on qcore_vpu_top
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v7
-      - run: echo "e2e-qwen-4plus1 runs Qwen 4+1 end to end; the compiled program's six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
-
-  e2e-smollm2-8plus4:
-    if: false   # SmolLM2 8+4 on WB=64, here rather than in the PR matrix when that job would exceed 15 minutes; its six vector opcodes run on qcore_vpu_top
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v7
-      - run: echo "e2e-smollm2-8plus4 runs SmolLM2 8+4 on WB=64; the compiled program's six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
+      - run: echo "synth-ecp5 is held until syn/ carries an ECP5 script -- synth_ecp5 stat and a yowasp-nextpnr-ecp5 fmax (docs/ROADMAP.md, v1.1)"
 
   x-initial-unique:
-    if: false   # determinism of a whole program under Verilator --x-initial unique; that program's six vector opcodes run on qcore_vpu_top
+    if: false   # held: the harness builds with a fixed `--x-initial fast` (VFLAGS in sim/verilator/Makefile). The job replays a whole program under `--x-initial unique` and needs the X-initialization mode as a build variable first
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: echo "x-initial-unique replays a whole program under --x-initial unique; its six vector opcodes run on qcore_vpu_top (docs/ROADMAP.md)"
+      - run: echo "x-initial-unique is held until sim/verilator/Makefile takes the X-initialization mode as a build variable; it builds --x-initial fast today"
 
   quality-regen:
-    if: false   # golden vs HF fp32 over >= 32k WikiText-2 tokens (installs the optional 'ref' group); runs when `uv run quettos check` scores a set wider than the calibration corpus (docs/ROADMAP.md, v1.1)
+    if: false   # held: `uv run quettos check` scores the calibration corpus. The job scores golden vs HF fp32 over >= 32k WikiText-2 tokens (installs the optional 'ref' group) and runs when that command takes the wider set (docs/ROADMAP.md, v1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - run: echo "quality-regen scores >= 32k WikiText-2 tokens against HF fp32; uv run quettos check takes the wider set with the v1.1 quality work (docs/ROADMAP.md)"
+      - run: echo "quality-regen is held until uv run quettos check scores a set wider than the calibration corpus -- at least 32k WikiText-2 tokens against HF fp32 (docs/ROADMAP.md, v1.1)"
