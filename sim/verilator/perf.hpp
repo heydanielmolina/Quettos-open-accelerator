@@ -32,6 +32,15 @@ struct PerfSnapshot {
     return t;
   }
 
+  // What happened between two reads. START clears the counters and STEP clears
+  // none of them (docs/ISA.md, CTRL), so a stepped program's own cost is the
+  // difference from the base taken before its first STEP.
+  PerfSnapshot minus(const PerfSnapshot& base) const {
+    PerfSnapshot t;
+    for (uint32_t i = 0; i < PERF_COUNT; i++) t.v[i] = v[i] - base.v[i];
+    return t;
+  }
+
   uint64_t bucket_sum() const {
     uint64_t s = 0;
     for (uint32_t i = PERF_MAC_ACTIVE; i <= PERF_STALL_DRAIN; i++) s += v[i];
@@ -49,12 +58,14 @@ struct PerfSnapshot {
   }
 };
 
-// What one token cost, printed per token and kept for perf.json.
+// What one token cost, printed per token and kept for perf.json. ``decode``
+// names the program the token ran, which a faulted token has no id to say.
 struct TokenRecord {
   int index = 0;
   uint32_t pos = 0;
   uint32_t in_id = 0;
   int64_t out_id = -1;
+  bool decode = false;
   PerfSnapshot delta;
 };
 

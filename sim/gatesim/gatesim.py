@@ -8,6 +8,11 @@ non-zero. The netlist is simulated against Yosys's own cell models
 (``$(yosys-config --datdir)/xilinx/cells_sim.v``), so the source side is read by
 Icarus and the netlist side by Yosys: a construct the two front ends read
 differently shows up as a mismatch instead of surviving to the bitstream.
+
+The coverage table of ``sim/gatesim/README.md`` is written from the run: every
+case, the parameters it is elaborated with and the cell count Yosys reported for
+it. A full run checks that table and fails when it no longer matches;
+``--write-table`` rewrites it.
 """
 
 from __future__ import annotations
@@ -26,6 +31,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+README = Path(__file__).resolve().parent / "README.md"
+
+# The coverage table of README.md is generated: the run writes the rows between
+# these two markers, so a cell count on the page is one Yosys just reported.
+TABLE_BEGIN = "<!-- gatesim:cases -->"
+TABLE_END = "<!-- /gatesim:cases -->"
 
 # Cycles the bench holds reset before the directed vectors start, and the extra
 # settling cycles before the first comparison.
@@ -759,6 +770,43 @@ RESULT_RE = re.compile(
 PORT_RE = re.compile(r"^gatesim:   port (\S+) toggled (\d+)/(\d+)$", re.M)
 
 
+def config_text(case: Case) -> str:
+    """The Configuration cell of one row: the parameters the case is elaborated with."""
+    widths = ", ".join(f"{k}={v}" for k, v in case.params.items() if isinstance(v, int))
+    roms = [
+        Path(v.strip('"')).relative_to(REPO).as_posix()
+        for v in case.params.values()
+        if isinstance(v, str)
+    ]
+    cells = ([f"`{widths}`"] if widths else []) + [f"`{r}`" for r in roms]
+    return ", ".join(cells) if cells else "defaults"
+
+
+def case_table(cells: dict[str, int]) -> str:
+    """The coverage table of README.md, with the cell count of each case from this run."""
+    rows = ["| Case | Block | Configuration | Cells |", "|---|---|---|---|"]
+    for case in CASES:
+        rows.append(f"| `{case.name}` | `{case.top}` | {config_text(case)} | {cells[case.name]} |")
+    return "\n".join(rows)
+
+
+def sync_table(path: Path, table: str, write: bool) -> str | None:
+    """Put `table` between the markers in `path`; the failure to report, or None."""
+    text = path.read_text()
+    head, sep, rest = text.partition(TABLE_BEGIN)
+    _, end, tail = rest.partition(TABLE_END)
+    if not sep or not end:
+        return f"{path} carries no {TABLE_BEGIN} ... {TABLE_END} block for the table"
+    fresh = f"{head}{TABLE_BEGIN}\n\n{table}\n\n{TABLE_END}{tail}"
+    if fresh == text:
+        return None
+    if not write:
+        rel = path.relative_to(REPO).as_posix()
+        return f"{rel} does not carry this run's table; rewrite it with --write-table"
+    path.write_text(fresh)
+    return None
+
+
 def run_case(
     case: Case, work: Path, rtl_dir: Path, cells_sim: Path, modelled: set[str], keep: bool
 ) -> Result:
@@ -853,6 +901,11 @@ def main() -> int:
         "--jobs", type=int, default=min(8, os.cpu_count() or 2), help="cases run in parallel"
     )
     ap.add_argument("--keep", action="store_true", help="keep the compiled benches")
+    ap.add_argument(
+        "--write-table",
+        action="store_true",
+        help="rewrite the coverage table of sim/gatesim/README.md from this run",
+    )
     args = ap.parse_args()
 
     if args.list:
@@ -908,6 +961,16 @@ def main() -> int:
     if bad:
         print("gatesim: FAILED")
         return 1
+    # The whole set was run, so its cell counts are the coverage table: hold the
+    # page to them, and rewrite it on request.
+    if args.only is None:
+        stale = sync_table(README, case_table({r.name: r.cells for r in results}), args.write_table)
+        if stale is not None:
+            print(f"gatesim: {stale}")
+            print("gatesim: FAILED")
+            return 1
+        if args.write_table:
+            print(f"gatesim: wrote the coverage table into {README.relative_to(REPO).as_posix()}")
     print("gatesim: OK")
     return 0
 

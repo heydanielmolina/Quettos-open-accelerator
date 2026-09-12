@@ -15,10 +15,12 @@ Verilator is not on ``PATH``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import shutil
+from pathlib import Path
 
 import pytest
-from quettos import cli, compare, isa, isa_sim, synthetic
+from quettos import cli, compare, golden, isa, isa_sim, synthetic
 from quettos.isa import Opcode, OutMode, VquantFlag
 
 TINY = compare.CONFIGS[16]
@@ -373,6 +375,119 @@ def test_the_generated_ids_match_the_simulator(tiny_image, demo_image, wb) -> No
     g = compare.generate(image, cfg, max_new=4, prompt=[1, 2, 3])
     assert g.rtl == g.reference, f"first difference at generated id {g.first_difference}"
     assert len(g.rtl) == 4 and len(set(g.rtl)) > 1, f"{g.rtl} is not a generation"
+    assert g.expected is None, "a synthetic model has no recorded golden continuation"
+
+
+# ------------------------------------------------- the recorded golden continuation
+
+
+def record(tmp_path: Path, image: Path, key: str, ids: list[int]) -> Path:
+    """A copy of ``image`` whose ``layout.json`` names a continuation file of these ids."""
+    out = tmp_path / "image"
+    shutil.copytree(image, out)
+    path = tmp_path / "expected_tokens.json"
+    path.write_text(
+        json.dumps({"prompts": {key: {"generated_ids": ids}}}, indent=1) + "\n", encoding="utf-8"
+    )
+    layout = compare.compiler.load_layout(out)
+    layout["expected_tokens"] = {
+        "file": str(path),
+        "prompts": {key: {"count": len(ids), "sha256": golden.ids_sha256(ids)}},
+    }
+    (out / "layout.json").write_text(json.dumps(layout), encoding="utf-8")
+    return out
+
+
+def test_an_image_without_a_record_carries_no_continuation(demo_image) -> None:
+    """A synthetic model has no ``expected_tokens.json``, so there is nothing to check against."""
+    assert compare.recorded_continuation(demo_image, "prompts/chat_short.json") is None
+    assert compare.prompt_source(compare.compiler.load_layout(demo_image)) is None
+
+
+def test_the_recorded_continuation_is_the_one_the_image_was_compiled_against(
+    tmp_path, demo_image
+) -> None:
+    """The ids come back for the prompt that has them, and for no other."""
+    key = "prompts/chat_short.json"
+    out = record(tmp_path, demo_image, key, [5, 8, 13])
+    assert compare.recorded_continuation(out, key) == [5, 8, 13]
+    assert compare.recorded_continuation(out, "prompts/tool_call_weather.json") is None
+    assert compare.recorded_continuation(out, None) is None
+
+
+def test_a_rewritten_continuation_is_a_failure(tmp_path, demo_image) -> None:
+    """Editing the file after the compile does not weaken the check; it fails the run."""
+    key = "prompts/chat_short.json"
+    out = record(tmp_path, demo_image, key, [5, 8, 13])
+    path = compare.compiler.load_layout(out)["expected_tokens"]["file"]
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    report["prompts"][key]["generated_ids"] = [5, 8, 21]
+    Path(path).write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="no longer holds"):
+        compare.recorded_continuation(out, key)
+
+
+def test_the_generated_ids_are_held_to_the_record(tmp_path, demo_image) -> None:
+    """With a continuation recorded for the prompt, the run reports it beside the two machines."""
+    needs_verilator()
+    key = "prompts/chat_short.json"
+    g = compare.generate(demo_image, DEMO, max_new=3, prompt=[1, 2, 3])
+    out = record(tmp_path, demo_image, key, g.rtl)
+    same = compare.generate(out, DEMO, max_new=3, prompt=[1, 2, 3], source=key)
+    assert same.rtl == same.reference == same.expected and same.expected_ok
+    assert same.first_expected_difference is None
+    wrong = compare.generate(
+        record(tmp_path / "off", demo_image, key, [g.rtl[0], g.rtl[1] ^ 1, g.rtl[2]]),
+        DEMO,
+        max_new=3,
+        prompt=[1, 2, 3],
+        source=key,
+    )
+    assert not wrong.expected_ok and wrong.first_expected_difference == 1
+
+
+def generated(rtl: list[int], expected: list[int] | None) -> compare.Generated:
+    return compare.Generated(Path("i"), DEMO, [1], rtl, rtl, 0, 0.0, "p", expected)
+
+
+def test_a_run_longer_than_the_record_is_held_to_the_record() -> None:
+    """The record ends at an end-of-sequence id a generation run is told to ignore."""
+    assert generated([5, 8, 13, 21], [5, 8, 13]).expected_ok
+    assert generated([5, 8, 13, 21], [5, 8, 13]).first_expected_difference is None
+    assert not generated([5, 8, 21, 13], [5, 8, 13]).expected_ok
+    assert generated([5, 8, 21, 13], [5, 8, 13]).first_expected_difference == 2
+    assert not generated([5, 8], [5, 8, 13]).expected_ok, "a short run is not a match"
+    assert generated([5, 8], None).first_expected_difference is None
+
+
+def test_the_generate_options_name_one_prompt(tiny_image) -> None:
+    """``--prompt`` and ``--prompt-ids`` each replace the image's prompt, and not both at once."""
+    parsed = cli.build_parser().parse_args(
+        ["compare", "--image", str(tiny_image), "--generate", "2", "--prompt-ids", "1,2,3"]
+    )
+    assert parsed.generate == 2 and parsed.prompt_ids == "1,2,3" and parsed.prompt is None
+    with pytest.raises(SystemExit, match="not both"):
+        compare.run(
+            cli.build_parser().parse_args(
+                [
+                    "compare",
+                    "--image",
+                    str(tiny_image),
+                    "--generate",
+                    "2",
+                    "--prompt",
+                    "prompts/chat_short.json",
+                    "--prompt-ids",
+                    "1,2,3",
+                ]
+            )
+        )
+    with pytest.raises(SystemExit, match="--generate run"):
+        compare.run(
+            cli.build_parser().parse_args(
+                ["compare", "--image", str(tiny_image), "--prompt-ids", "1,2,3"]
+            )
+        )
 
 
 def cross_row_program(image, cfg, tok: int):

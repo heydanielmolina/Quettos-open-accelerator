@@ -244,22 +244,28 @@ module qcore_row #(
 
 `ifndef SYNTHESIS
   // Simulation-only checks: the stream's k sequence must match the ring's
-  // word sequence, and a descriptor is never issued to a streaming row.
+  // word sequence, and a descriptor is never issued to a streaming row. The
+  // block is held in reset like every register above it, so what it reads is
+  // state the reset has defined and the checks hold from any start value.
   logic [WW-1:0] hword;
   logic [16:0]   e_cur;
   assign e_cur = {1'b0, vs_src_q} + {1'b0, ws_k};
   always @(posedge clk) begin
-    if (cmd_valid_gemv) begin
-      hword <= {1'b0, cmd_vs_src[15:3]};
-      if (active) $error("qcore_row: issue while streaming");
-    end else if (pop) begin
-      hword <= (hword == wlast) ? w0 : hword + {{(WW-1){1'b0}}, 1'b1};
-    end
-    if (en && !ws_embed) begin
-      if (!head_valid) $error("qcore_row: beat accepted without its activation word");
-      if (WW'(e_cur >> 3) != hword)
-        $error("qcore_row: beat k=%0d needs word %0d, ring head is word %0d",
-               ws_k, WW'(e_cur >> 3), hword);
+    if (rst) begin
+      hword <= {WW{1'b0}};
+    end else begin
+      if (cmd_valid_gemv) begin
+        hword <= {1'b0, cmd_vs_src[15:3]};
+        if (active) $error("qcore_row: issue while streaming");
+      end else if (pop) begin
+        hword <= (hword == wlast) ? w0 : hword + {{(WW-1){1'b0}}, 1'b1};
+      end
+      if (en && !ws_embed) begin
+        if (!head_valid) $error("qcore_row: beat accepted without its activation word");
+        if (WW'(e_cur >> 3) != hword)
+          $error("qcore_row: beat k=%0d needs word %0d, ring head is word %0d",
+                 ws_k, WW'(e_cur >> 3), hword);
+      end
     end
   end
 `endif

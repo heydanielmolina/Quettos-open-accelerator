@@ -135,27 +135,40 @@ class Machine : public CsrAccess {
     dut_->eval();
     qmem_.sample();
 #ifdef QCORE_TRACE
-    if (trace_ != nullptr) trace_->dump(2 * cycle_ - 1);
+    if (trace_ != nullptr) {
+      trace_->dump(2 * cycle_ - 1);
+      // The trace is bounded in cycles, so a run of any length writes a file of
+      // a known size: the window closes here and the run carries on.
+      if (trace_limit_ != 0 && cycle_ >= trace_limit_) close_trace();
+    }
 #endif
   }
 
 #ifdef QCORE_TRACE
-  void open_trace(const std::string& path, VerilatedContext* ctx) {
+  // ``limit`` cycles of VCD, then the file is closed and the run goes on; 0 is
+  // the whole run.
+  void open_trace(const std::string& path, VerilatedContext* ctx, uint64_t limit) {
     ctx->traceEverOn(true);
     trace_ = new VerilatedVcdC();
     dut_->trace(trace_, 8);
     trace_->open(path.c_str());
+    trace_limit_ = limit;
+    traced_ = 0;
   }
   void close_trace() {
     if (trace_ != nullptr) {
       trace_->close();
       delete trace_;
       trace_ = nullptr;
+      traced_ = cycle_;
     }
   }
 #else
   void close_trace() {}
 #endif
+
+  // How many cycles the VCD carries: the whole run, or the bound it stopped at.
+  uint64_t traced_cycles() const { return traced_; }
 
   // Polls STATUS until the core halts, as a host does; false on a stop.
   bool run_until_halt() {
@@ -186,9 +199,11 @@ class Machine : public CsrAccess {
   Qmem<Dut, WB> qmem_;
   CsrBus<Dut> bus_;
   uint64_t cycle_ = 0;
+  uint64_t traced_ = 0;
   std::string stop_reason_;
 #ifdef QCORE_TRACE
   VerilatedVcdC* trace_ = nullptr;
+  uint64_t trace_limit_ = 0;
 #endif
 };
 

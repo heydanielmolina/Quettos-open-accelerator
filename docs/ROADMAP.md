@@ -23,8 +23,10 @@
   with the exact command and tool version; ECP5 and a nextpnr fmax
   follow in a later release.
 - **Results.** Performance tables produced only by `make perf` from RTL
-  counters, the quality table of `uv run quettos check`, the tool-call demo
-  with prefix-KV reuse, README, docs, architecture diagram and a recorded GIF.
+  counters, the quality table of `uv run quettos check`, the README and
+  `docs/` with the block diagram of `docs/ARCHITECTURE.md` in it, and the run
+  `make demo` prints: every token as it leaves `qcore_top`, and under it the
+  summary `quettos demo-report` holds that run to.
 
 ### Demo configuration
 
@@ -49,7 +51,8 @@ choice.
   flash-style online softmax, wider attention weights for long contexts, on-chip
   K^T tile assembly buffer.
 - **v1.3**: speculative-decode verify rows, grammar-mask port on the sampler,
-  deterministic integer sampling in the bit-exact contract.
+  deterministic integer sampling in the bit-exact contract; the tool-call demo
+  the mask makes deterministic, over the prefix-KV reuse of v1.2.
 - **v1.4**: W4 with block-32 sub-scales (if 0.5B quality holds), SmoothQuant if
   measured to help, DRAM timing model.
 - **v2**: multi-core weight sharding, on-chip weight residency, SmolLM2-360M /

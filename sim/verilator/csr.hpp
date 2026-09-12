@@ -47,6 +47,54 @@ inline const char* fault_name(uint32_t code) {
   }
 }
 
+// The named registers of the CSR window, in word order (docs/RTL.md 3.3). The
+// PERF halves are reached by index instead, through CsrAccess::perf.
+struct CsrName {
+  const char* name;
+  uint32_t word;
+};
+
+inline const CsrName* csr_names(size_t* count) {
+  static const CsrName kNames[] = {
+      {"CTRL", CSR_CTRL},           {"STATUS", CSR_STATUS},
+      {"PC", CSR_PC},               {"ROW_EN", CSR_ROW_EN},
+      {"TOK", CSR_TOK},             {"POS", CSR_POS},
+      {"ARGMAX_TOK", CSR_ARGMAX_TOK}, {"ARGMAX_VAL", CSR_ARGMAX_VAL},
+      {"SAT_REQ", CSR_SAT_REQ},     {"SAT_VPU", CSR_SAT_VPU},
+      {"ERR_SHIFT", CSR_ERR_SHIFT}, {"ERR_BOUNDS", CSR_ERR_BOUNDS},
+      {"ISA_VERSION", CSR_ISA_VERSION}};
+  *count = sizeof(kNames) / sizeof(kNames[0]);
+  return kNames;
+}
+
+// The word a name addresses, or false when it is none of them. A caller that
+// takes a register name from a file uses this and fails on false: a name the
+// table does not carry is a file the harness cannot honour, not a register to
+// guess at.
+inline bool csr_word_of(const std::string& name, uint32_t* word) {
+  size_t count = 0;
+  const CsrName* names = csr_names(&count);
+  for (size_t i = 0; i < count; i++) {
+    if (name == names[i].name) {
+      *word = names[i].word;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Every name the table carries, for an error message that says what is allowed.
+inline std::string csr_name_list() {
+  size_t count = 0;
+  const CsrName* names = csr_names(&count);
+  std::string out;
+  for (size_t i = 0; i < count; i++) {
+    if (i != 0) out += ", ";
+    out += names[i].name;
+  }
+  return out;
+}
+
 inline const char* csr_name(uint32_t word) {
   switch (word) {
     case CSR_CTRL: return "CTRL";
@@ -156,6 +204,11 @@ class CsrAccess {
 struct Events {
   uint32_t sat_req = 0, sat_vpu = 0, err_shift = 0, err_bounds = 0;
   uint32_t total() const { return sat_req + sat_vpu + err_shift + err_bounds; }
+
+  Events plus(const Events& other) const {
+    return Events{sat_req + other.sat_req, sat_vpu + other.sat_vpu,
+                  err_shift + other.err_shift, err_bounds + other.err_bounds};
+  }
 };
 
 inline Events read_events(CsrAccess& m) {

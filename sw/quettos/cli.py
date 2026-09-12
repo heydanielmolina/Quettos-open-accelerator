@@ -2,7 +2,7 @@
 
 Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
 ``quantize``, ``compile``, ``golden``, ``isa-sim``, ``compare``, ``check``,
-``csr-defs``.
+``csr-defs``, ``demo-report``.
 Each command is a thin wrapper over the module of the same name; the file
 formats they read and write are described in ``docs/``.  ``quantize`` and
 ``check`` take ``--no-qk-smoothing``, which builds and scores the
@@ -12,9 +12,13 @@ K-centering-only variant of the model into the ``-nosmooth`` quality rows.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import struct
 import sys
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 from quettos.model import load_spec
 from quettos.tokenizer_io import prompt_tokens, render_prompt, write_tokens_bin
@@ -400,6 +404,452 @@ def _cmd_export_tokens_bin(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- the demo
+
+
+#: The counters a clean run leaves at zero (``docs/ISA.md``, the PERF table).
+DEMO_ZERO_COUNTERS = ("SAT_REQ", "SAT_VPU", "ERR_SHIFT", "ERR_BOUNDS")
+
+#: The six exclusive busy buckets, which sum to ``BUSY``.
+DEMO_BUCKETS = ("MAC_ACTIVE", "STALL_MEM", "STALL_VPU", "STALL_KV", "STALL_SEQ", "STALL_DRAIN")
+
+
+class DemoInput(Exception):
+    """A file the report reads is not there, or is not what it has to be.
+
+    The report's job is a verdict, so a file that cannot be read ends it the way
+    a failed check does -- named, with the reason -- rather than in a traceback.
+    """
+
+
+def _demo_read_json(path: Path | str, what: str) -> Any:
+    """One of the report's input files, parsed; :class:`DemoInput` on anything else."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise DemoInput(f"{path}, {what}, cannot be read: {exc.strerror}") from exc
+    except ValueError as exc:
+        raise DemoInput(f"{path}, {what}, is not JSON: {exc}") from exc
+
+
+def _demo_stages(path: str | None) -> list[tuple[str, float, str]]:
+    """The stage timings ``scripts/demo.sh`` appends, one JSON object per line."""
+    if path is None or not Path(path).is_file():
+        return []
+    rows: list[tuple[str, float, str]] = []
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+            rows.append((str(d["name"]), float(d["seconds"]), str(d.get("note", ""))))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DemoInput(f"{path} line {n} is not a stage timing: {exc}") from exc
+    return rows
+
+
+def _demo_sum(tokens: list[dict[str, Any]]) -> dict[str, int]:
+    """Cycles, MAC-active cycles, read bytes and descriptors over a set of token records."""
+    keys = ("cycles", "mac_active", "rd_bytes", "descriptors")
+    return {k: sum(int(t[k]) for t in tokens) for k in keys}
+
+
+def _demo_decode(token: dict[str, Any]) -> bool:
+    """Whether a token record ran ``decode.prog``, as the harness recorded it.
+
+    The record names its own program (``sim/verilator/main.cpp``), which is what
+    a token that faulted has no generated id to say: its ``out`` is -1 like a
+    prefill token's, and it is a decode token all the same.
+    """
+    return str(token["pass"]) == "decode"
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a file, read a megabyte at a time."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+#: The layout entries whose recorded SHA-256 is over what the file says rather
+#: than over its bytes: ``prompt.tokens`` is one id per line and the compiler
+#: hashes the ids it carries (``golden.ids_sha256``).
+DEMO_ID_FILES = ("prompt",)
+
+
+def _layout_hashed(layout: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every entry of ``layout.json`` that names a file and a SHA-256 of it.
+
+    The compiler records one for the image, both descriptor programs, the dump
+    plan, the token table, the prompt, the rope table, the lookup tables and the
+    golden model's recorded continuation (``sw/quettos/compiler.py``), each as an
+    object carrying ``file`` and ``sha256``.  Walking for that pair is what keeps
+    this list and the compiler's from drifting apart: an entry the compiler adds
+    is hashed here without a change.
+    """
+    out: list[tuple[str, dict[str, Any]]] = []
+
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if isinstance(node.get("file"), str) and isinstance(node.get("sha256"), str):
+            out.append((path, node))
+            return
+        for key, value in node.items():
+            walk(value, f"{path}.{key}" if path else key)
+
+    walk(layout, "")
+    return out
+
+
+def _layout_file(image: Path, name: str) -> Path:
+    """Where a file ``layout.json`` names lives.
+
+    A bare name is beside ``layout.json`` in the compiled directory; a name with
+    a directory in it is a repository path, which is how the compiler records
+    the tables and the golden model's continuation.
+    """
+    from quettos.model import REPO_ROOT
+
+    return REPO_ROOT / name if "/" in name else image / name
+
+
+def _demo_digest(name: str, path: Path) -> str:
+    """The digest the compiler took of this file, taken again from the file."""
+    if name in DEMO_ID_FILES:
+        from quettos.golden import ids_sha256
+
+        try:
+            ids = [int(v) for v in path.read_text(encoding="utf-8").split()]
+        except (OSError, ValueError) as exc:
+            raise DemoInput(f"{path} is not one token id per line: {exc}") from exc
+        return ids_sha256(ids)
+    return _sha256_file(path)
+
+
+def _demo_files(
+    image: Path, layout: dict[str, Any], run: dict[str, Any]
+) -> tuple[str, int, int, list[str]]:
+    """Every file ``layout.json`` carries a hash for, hashed and held to it.
+
+    The token table is as load-bearing as the weights -- it is what turns the
+    ids the hardware produced into the sentence the summary prints -- and the
+    programs, the dump plan, the prompt, the tables and the recorded
+    continuation are all read by something that reports on the run, so each of
+    them is hashed here rather than the image alone.  Returns the image's own
+    SHA-256 and size, how many files matched, and the list of the things that do
+    not: a file the layout names and is not there, one whose bytes have moved,
+    the image's size, and the file the run says it mapped with the bytes it
+    mapped of it.  The whole set is 0.19 s on the 513,950,464 B Qwen image, paid
+    once at the end of a demo; the harness checks the image size at the start of
+    every run, which costs nothing.
+    """
+    entries = _layout_hashed(layout)
+    bad: list[str] = []
+    digest, size, matched = "", 0, 0
+    for name, entry in entries:
+        path = _layout_file(image, str(entry["file"]))
+        if not path.is_file():
+            bad.append(f"{path}, the {name} of layout.json, is not there")
+            continue
+        got = _demo_digest(name, path)
+        if name == "image":
+            digest, size = got, path.stat().st_size
+            if size != int(entry["size"]):
+                bad.append(f"{path} is {size:,} B; layout.json describes {int(entry['size']):,}")
+        if got != str(entry["sha256"]):
+            bad.append(f"{path} hashes to {got}; layout.json describes {entry['sha256']}")
+        else:
+            matched += 1
+    if not size:
+        return digest, size, matched, bad
+    ran, ran_bytes = run.get("image"), run.get("image_bytes")
+    path = _layout_file(image, str(layout["image"]["file"]))
+    if ran is None or ran_bytes is None:
+        bad.append("the run record does not name the image the hardware executed")
+    elif Path(str(ran)).resolve() != path.resolve():
+        bad.append(f"the hardware executed {ran}, not {path}")
+    elif int(ran_bytes) != size:
+        bad.append(f"the hardware mapped {int(ran_bytes):,} B of {path}, which is {size:,} B")
+    return digest, size, matched, bad
+
+
+def _demo_prompt(
+    perf: dict[str, Any], layout: dict[str, Any]
+) -> tuple[list[int], str | None, list[str]]:
+    """The ids the run was given, the prompt file they are, and what does not match.
+
+    ``layout.json`` names the prompt the image was compiled with and the run
+    records the ids it actually prefilled.  The source comes back only when the
+    two are the same ids, so a run is neither labelled with nor held to the
+    record of a prompt it was not given.
+    """
+    from quettos.golden import ids_sha256
+
+    given = perf["run"].get("prompt")
+    entry = layout.get("prompt")
+    if given is None or "ids" not in given:
+        return [], None, ["the run record does not carry the prompt the hardware was given"]
+    ids = [int(i) for i in given["ids"]]
+    bad: list[str] = []
+    prefilled = sum(1 for t in perf["tokens"] if not _demo_decode(t)) + 1
+    if prefilled != len(ids):
+        bad.append(f"the run prefilled {prefilled} ids of its {len(ids)}-id prompt")
+    if entry is None:
+        return ids, None, bad
+    if len(ids) != int(entry["count"]) or ids_sha256(ids) != str(entry["sha256"]):
+        bad.append(
+            f"the run was given {len(ids)} ids from {given.get('from', 'its own record')}, not the "
+            f"{int(entry['count'])} of {entry['file']}, the ids of {entry['source']}"
+        )
+        return ids, None, bad
+    return ids, str(entry["source"]), bad
+
+
+def _demo_checks(perf: dict[str, Any], layout: dict[str, Any]) -> list[str]:
+    """What has to hold of a finished run's counters, as the list of the things that do not.
+
+    Everything here is read back out of the file the harness wrote: the counters
+    against each other, against the memory model's own counts and against the
+    compiled program, and the four counters a clean run leaves at zero.  The
+    image and the prompt the same file records are :func:`_demo_image` and
+    :func:`_demo_prompt`.
+    """
+    bad: list[str] = []
+    c = perf["counters"]
+    buckets = sum(int(c[k]) for k in DEMO_BUCKETS)
+    if buckets != int(c["BUSY"]):
+        bad.append(f"BUSY {int(c['BUSY']):,} is not the sum of the six buckets ({buckets:,})")
+    wb = int(perf["build"]["wb"])
+    if int(c["RD_BYTES"]) != int(c["RD_BEATS"]) * wb:
+        bad.append(f"RD_BYTES {int(c['RD_BYTES']):,} is not RD_BEATS * {wb}")
+    mem = perf["memory"]
+    if int(c["WR_BEATS"]) != int(mem["wr_beats"]) or int(c["WR_BYTES"]) != int(mem["wr_bytes"]):
+        bad.append(
+            f"the core counted {int(c['WR_BEATS']):,} write beats / {int(c['WR_BYTES']):,} bytes, "
+            f"the memory model {int(mem['wr_beats']):,}/{int(mem['wr_bytes']):,}"
+        )
+    tokens = perf["tokens"]
+    per_token = sum(int(t["cycles"]) for t in tokens)
+    if per_token != int(c["CYCLES"]):
+        bad.append(
+            f"CYCLES {int(c['CYCLES']):,} is not the sum of the tokens' own counts ({per_token:,})"
+        )
+    want = {
+        False: int(layout["programs"]["prefill"]["descriptors"]),
+        True: int(layout["programs"]["decode"]["descriptors"]),
+    }
+    for t in tokens:
+        n = want[_demo_decode(t)]
+        if int(t["descriptors"]) != n:
+            bad.append(
+                f"the token at position {int(t['pos'])} retired {int(t['descriptors']):,} "
+                f"descriptors, not the program's {n:,}"
+            )
+            break
+    run = perf["run"]
+    if run.get("status") != "ok":
+        bad.append(f"the run stopped: {run.get('stop_reason', run.get('status'))}")
+    for name in DEMO_ZERO_COUNTERS:
+        if int(perf["events"][name]) != 0:
+            bad.append(f"{name} is {int(perf['events'][name]):,}, not zero")
+    return bad
+
+
+def _demo_pass_table(perf: dict[str, Any]) -> list[str]:
+    """The cycle and utilization table: prefill, decode and the whole run."""
+    tokens = perf["tokens"]
+    groups = [
+        ("prefill", [t for t in tokens if not _demo_decode(t)]),
+        ("decode", [t for t in tokens if _demo_decode(t)]),
+    ]
+    head = f"  {'pass':<9}{'tokens':>7}{'cycles':>16}{'cycles/token':>15}"
+    head += f"{'MAC_ACTIVE':>13}{'read B/cycle':>14}"
+    lines = [head]
+    for name, group in groups:
+        if not group:
+            continue
+        s = _demo_sum(group)
+        per = s["cycles"] // len(group)
+        mac = 100.0 * s["mac_active"] / s["cycles"] if s["cycles"] else 0.0
+        bpc = s["rd_bytes"] / s["cycles"] if s["cycles"] else 0.0
+        lines.append(
+            f"  {name:<9}{len(group):>7}{s['cycles']:>16,}{per:>15,}{mac:>12.1f}%{bpc:>14.2f}"
+        )
+    c = perf["counters"]
+    cycles, busy = int(c["CYCLES"]), int(c["BUSY"])
+    mac = 100.0 * int(c["MAC_ACTIVE"]) / busy if busy else 0.0
+    bpc = int(c["RD_BYTES"]) / cycles if cycles else 0.0
+    lines.append(f"  {'run':<9}{len(tokens):>7}{cycles:>16,}{'':>15}{mac:>12.1f}%{bpc:>14.2f}")
+    return lines
+
+
+def _demo_bucket_lines(perf: dict[str, Any]) -> list[str]:
+    """Where the run's cycles went, as a share of ``BUSY``, three buckets to a line."""
+    c = perf["counters"]
+    busy = int(c["BUSY"]) or 1
+    cells = [f"{k} {100.0 * int(c[k]) / busy:.2f}%" for k in DEMO_BUCKETS]
+    return ["  ".join(f"{cell:<22}" for cell in cells[i : i + 3]).rstrip() for i in (0, 3)]
+
+
+def _demo_report(args: argparse.Namespace) -> int:
+    """Print the summary of a demo run; returns 1 on anything that is not right.
+
+    Reads the ``perf.json`` the harness wrote, the compiled ``layout.json`` and
+    the golden model's recorded continuation, and computes no model value of its
+    own: the ids are the ones ``qcore_top`` produced and the reference is the
+    checked-in ``models/<name>/expected_tokens.json``.  Every file
+    ``layout.json`` carries a hash for is held to it, the prompt the run was
+    given to the ids the image was compiled with, and a run that generated
+    nothing fails rather than matching an empty record.
+    """
+    from quettos import compare, compiler
+    from quettos.tokenizer_io import detokenize, read_tokens_bin
+
+    image = Path(args.image)
+    layout = _demo_read_json(image / compiler.FILES["layout"], "the compiled layout")
+    perf = _demo_read_json(args.perf, "the record of the run")
+    build, run, counters = perf["build"], perf["run"], perf["counters"]
+    model = layout["model"]
+    ids = [int(t["out"]) for t in perf["tokens"] if int(t["out"]) >= 0]
+    digest, size, matched, failures = _demo_files(image, layout, run)
+    hashed = len(_layout_hashed(layout))
+    given, source, prompt_bad = _demo_prompt(perf, layout)
+    failures.extend(prompt_bad)
+
+    print("\n" + "=" * 78)
+    print(f"demo summary: {model['name']} on {build['top']}")
+    print("=" * 78)
+    print(
+        f"  model      {model['repo_id']}, {model['layers']} layers, "
+        f"hidden {model['hidden']}, vocab {model['vocab']:,}"
+    )
+    stamp = f"{size:,} B, sha256 {digest[:16]}" if digest else "not found"
+    print(f"  image      {image}/{layout['image']['file']}, {stamp}, max_ctx {layout['max_ctx']}")
+    print(f"  files      {matched} of the {hashed} files layout.json records a SHA-256 for match")
+    print(
+        f"  core       {build['top']} WB={build['wb']} B_MAX={build['b_max']} VL={build['vl']} "
+        f"VSRAM_WORDS={build['vsram_words']} ACC_W={build['acc_w']}, "
+        f"Verilator --threads {build['threads']}"
+    )
+    print(
+        f"  memory     read latency {run['lat']} cycles, one returned beat every "
+        f"{run['bw_div']} cycle(s)"
+    )
+    print(
+        f"  programs   decode {int(layout['programs']['decode']['descriptors']):,} descriptors, "
+        f"prefill {int(layout['programs']['prefill']['descriptors']):,}"
+    )
+    where = "" if source is None else f" from {source}"
+    print(f"  prompt     {len(given)} ids the run was given{where}")
+
+    # --- the ids the hardware produced, against the record the golden model wrote
+    print(f"\n  {len(ids)} ids generated on {build['top']}, one decode program each")
+    print(f"    ids   {ids}")
+    table_path = image / "tokens.bin"
+    if table_path.is_file():
+        try:
+            print(f"    text  {detokenize(read_tokens_bin(table_path), ids)!r}")
+        except (ValueError, struct.error) as exc:
+            raise DemoInput(f"{table_path} is not a token table this reads: {exc}") from exc
+    reference: list[str] = []
+    try:
+        recorded = compare.recorded_continuation(image, source)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        recorded = None
+        reference.append(str(exc))
+    expected = None if recorded is None else recorded[: int(run["max_new"])]
+    entry = layout.get("expected_tokens")
+    if not ids:
+        failures.append(f"{build['top']} generated no ids: there is nothing to hold to a record")
+    if expected is None:
+        print(f"    reference  none recorded for {source}")
+        if not args.no_reference and not reference:
+            reference.append(f"no recorded continuation of {source} to hold the ids to")
+    elif not ids:
+        print(f"    reference  nothing generated to hold to {entry['file']}")
+    elif ids == expected:
+        print(f"    reference  {len(ids)}/{len(expected)} identical to {entry['file']},")
+        print(f"               the integer golden model's own continuation of {source}")
+    else:
+        i = next(
+            (k for k, (a, b) in enumerate(zip(expected, ids, strict=False)) if a != b),
+            min(len(expected), len(ids)),
+        )
+        reference.append(
+            f"generated id {i} is {ids[i] if i < len(ids) else 'missing'}, "
+            f"{entry['file']} records {expected[i] if i < len(expected) else 'nothing'}"
+        )
+        print(f"    reference  MISMATCH against {entry['file']} at generated id {i}")
+        print(f"               recorded {expected}")
+
+    # --- the counters, and everything the run has to add up to
+    print("\n  counters that a clean run leaves at zero")
+    print("    " + "  ".join(f"{k} {int(perf['events'][k]):,}" for k in DEMO_ZERO_COUNTERS))
+    failures.extend(reference)
+    failures.extend(_demo_checks(perf, layout))
+
+    print("\n  cycles and utilization, from the core's own PERF counters")
+    for line in _demo_pass_table(perf):
+        print(line)
+    head, tail = _demo_bucket_lines(perf)
+    print(f"\n  where the cycles go   {head}")
+    print(f"                        {tail}")
+    print(
+        f"  traffic               WT_BYTES {int(counters['WT_BYTES']):,}, "
+        f"MACS {int(counters['MACS']):,}, DESCRIPTORS {int(counters['DESCRIPTORS']):,}, "
+        f"WR_BYTES {int(counters['WR_BYTES']):,}"
+    )
+
+    # --- the wall clock: every stage of the run, as it was measured
+    stages = _demo_stages(args.stages)
+    clock = (
+        f"the harness clock loop is {float(run['wall_seconds']):.2f} s, "
+        f"{float(run['mcycles_per_s']):.3f} Mcycles/s over "
+        f"{int(run['clock_cycles']):,} clock cycles"
+    )
+    print("\n  wall clock")
+    for name, secs, note in stages:
+        print(f"    {name:<12}{secs:>9.2f} s   {note}")
+    if stages:
+        print("    " + "-" * 23)
+        total = sum(s for _, s, _ in stages)
+        print(f"    {'end to end':<12}{total:>9.2f} s   of which {clock}")
+    else:
+        print(f"    {'RTL run':<12}{float(run['wall_seconds']):>9.2f} s   {clock}")
+
+    if failures:
+        print("\ndemo: FAILED")
+        for f in failures:
+            print(f"  {f}")
+        return 1
+    held = "" if expected is None else f"{len(ids)} ids matching the recorded reference, "
+    print(
+        f"\ndemo: OK -- {model['name']} on {build['top']}, "
+        f"{int(counters['CYCLES']):,} cycles, "
+        f"{100.0 * int(counters['MAC_ACTIVE']) / (int(counters['BUSY']) or 1):.1f}% MAC-active, "
+        f"{held}no saturation or range events"
+    )
+    return 0
+
+
+def _cmd_demo_report(args: argparse.Namespace) -> int:
+    """:func:`_demo_report`, with a file it cannot read reported as a verdict."""
+    try:
+        return _demo_report(args)
+    except DemoInput as exc:
+        print(f"\ndemo: FAILED\n  {exc}")
+        return 1
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        print(
+            f"\ndemo: FAILED\n  {args.perf} and {args.image}/layout.json are not the record the "
+            f"harness writes and the layout the compiler writes: {exc!r}"
+        )
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Argument parser for the ``quettos`` CLI."""
     parser = argparse.ArgumentParser(prog="quettos", description="Quettos Core host tooling")
@@ -511,6 +961,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", default=None, help="output path (default models/<name>/quality.json)")
     p.set_defaults(func=_cmd_check)
+
+    p = sub.add_parser("demo-report", help="the summary of a demo run (scripts/demo.sh)")
+    p.add_argument("--image", required=True, help="the compiled model directory the run used")
+    p.add_argument("--perf", required=True, help="the perf.json the harness wrote")
+    p.add_argument("--stages", default=None, help="stage timings from scripts/demo.sh")
+    p.add_argument(
+        "--no-reference",
+        action="store_true",
+        help="accept an image whose prompt has no recorded golden continuation",
+    )
+    p.set_defaults(func=_cmd_demo_report)
 
     p = sub.add_parser("csr-defs", help="write the ISA/CSR headers for the RTL and the harness")
     p.add_argument(

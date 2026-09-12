@@ -6,6 +6,7 @@
 #   make -C sim/verilator build                  build the default configuration
 #   make -C sim/verilator run IMAGE=<dir>        run it on a compiled model
 #   make -C sim/verilator run ARGS="--max-new 4"   pass harness flags
+#   make -C sim/verilator build XINIT=unique     start from undefined values
 #   make -C sim/verilator csr-check              CSR driver against rtl/qcore_csr.sv
 #   make -C sim/verilator clean
 
@@ -22,6 +23,11 @@ MAX_BURST       ?= 64
 DQ_DEPTH        ?= 8
 THREADS         ?= 1
 TRACE           ?= 0
+# Verilator's initial value for a variable no reset reaches: `fast` (zeros) is
+# what every measured run builds with, `unique` starts the model from the value
+# +verilator+rand+reset+<0|1|2> names, which is how sw/quettos/determinism.py
+# shows the design does not depend on unreset state.
+XINIT           ?= fast
 IMAGE           ?= build/images/qwen2.5-0.5b-instruct-l2
 ARGS            ?=
 
@@ -64,12 +70,12 @@ THREADFLAGS := --threads $(THREADS)
 endif
 
 # Flags from docs/PERFORMANCE.md: the same set the speed probe was measured with.
-VFLAGS := --cc --exe --build -j 0 -O3 --x-assign fast --x-initial fast --no-assert \
+VFLAGS := --cc --exe --build -j 0 -O3 --x-assign fast --x-initial $(XINIT) --no-assert \
           --no-timing -Wall --output-split 20000 $(TRACEFLAGS) $(THREADFLAGS) \
           -CFLAGS "-O2 -I$(HERE) $(DEFS)" -I$(RTL) $(PARAMS) --top-module $(TOP)
 
 CONFIG := $(TOP) $(WB) $(B_MAX) $(VL) $(VSRAM_WORDS) $(VPU_FIFO_BEATS) $(FIFO_BEATS) \
-          $(META_FIFO_BEATS) $(ACC_W) $(MAX_BURST) $(DQ_DEPTH) $(THREADS) $(TRACE)
+          $(META_FIFO_BEATS) $(ACC_W) $(MAX_BURST) $(DQ_DEPTH) $(THREADS) $(TRACE) $(XINIT)
 HASH := $(shell { echo "$(CONFIG)"; cat $(SV) $(SVH) $(HEX) $(SRCS); } | shasum -a 256 | cut -c1-12)
 OBJ  := $(REPO)/build/verilator/$(TOP)-$(HASH)
 BIN  := $(OBJ)/qcore_sim

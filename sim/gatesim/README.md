@@ -61,8 +61,13 @@ design.
 
 Nineteen configurations of fifteen blocks. `rtl/` holds eighteen files: the
 package `qcore_pkg.sv` and seventeen modules, fifteen of which are in the table
-below. `uv run python sim/gatesim/gatesim.py --list` prints the cases with the
-parameters each is elaborated with.
+below. The run writes that table: every cell count on it is one Yosys reported
+for the case beside it, and a full run fails when the page no longer carries the
+counts the run just produced. `gatesim.py --write-table` rewrites it, and
+`gatesim.py --list` prints the cases with the parameters each is elaborated
+with, without synthesizing anything.
+
+<!-- gatesim:cases -->
 
 | Case | Block | Configuration | Cells |
 |---|---|---|---|
@@ -71,8 +76,8 @@ parameters each is elaborated with.
 | `mem_arb_wb16` | `qcore_mem_arb` | `WB=16, MAX_BURST=8` | 1659 |
 | `seq_fetch_wb64` | `qcore_seq_fetch` | `WB=64, DQ_DEPTH=8` | 1902 |
 | `seq_fetch_wb16` | `qcore_seq_fetch` | `WB=16, DQ_DEPTH=8` | 1106 |
-| `seq_dispatch_wb64` | `qcore_seq_dispatch` | `WB=64, B_MAX=1` | 2140 |
-| `seq_dispatch_wb16` | `qcore_seq_dispatch` | `WB=16, B_MAX=2` | 2440 |
+| `seq_dispatch_wb64` | `qcore_seq_dispatch` | `WB=64, B_MAX=1` | 2151 |
+| `seq_dispatch_wb16` | `qcore_seq_dispatch` | `WB=16, B_MAX=2` | 2445 |
 | `requant_tiny` | `qcore_requant` | `WB=16, B_MAX=2, ACC_W=40, VSRAM_WORDS=2048` | 10046 |
 | `csr` | `qcore_csr` | defaults | 2507 |
 | `perf` | `qcore_perf` | `WB=64` | 3604 |
@@ -84,7 +89,9 @@ parameters each is elaborated with.
 | `lut_interp` | `qcore_lut_interp` | defaults | 99 |
 | `vpu_lane` | `qcore_vpu_lane` | defaults | 1734 |
 | `vpu_scalar` | `qcore_vpu_scalar` | `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 2765 |
-| `vpu_top_tiny` | `qcore_vpu_top` | `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048, VPU_FIFO_BEATS=16, MAX_BURST=64` | 18405 |
+| `vpu_top_tiny` | `qcore_vpu_top` | `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048, VPU_FIFO_BEATS=16, MAX_BURST=64`, `rtl/gen/sigmoid.hex`, `rtl/gen/exp2.hex`, `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 24867 |
+
+<!-- /gatesim:cases -->
 
 A lookup table reaches the netlist as constants, so the image is part of the
 configuration and each of the four is compared: `exp2` through `lut_rom_exp2`,
@@ -122,6 +129,7 @@ silently: the case fails and names the cell.
 make gatesim                                   # every case
 make gatesim GATESIM_ARGS="--only seq_fetch_wb64"
 uv run python sim/gatesim/gatesim.py --list
+uv run python sim/gatesim/gatesim.py --write-table   # rewrite the table above from the run
 uv run python sim/gatesim/gatesim.py --rtl-dir /path/to/other/rtl
 ```
 
@@ -134,12 +142,12 @@ beside its cell and cycle counts, so the eighteen others finish inside it.
 
 `--rtl-dir` points the run at another copy of `rtl/`, which is how the check is
 verified to have teeth. Two lines carry the parenthesised form,
-`rtl/qcore_seq_dispatch.sv:231` and `:284`; write them back as
+`rtl/qcore_seq_dispatch.sv:245` and `:298`; write them back as
 `& ~25'(WB - 1)` in a scratch copy and `seq_dispatch_wb64` fails from the first
 compared cycle with
 
 ```
-gatesim: [seq_dispatch_wb64] FAILED: 6980 mismatching cycle(s)
+gatesim: [seq_dispatch_wb64] FAILED: 6901 mismatching cycle(s)
 gatesim: MISMATCH cycle 17
 gatesim:   cmd_sx_m src=0000 gate=0030
 gatesim:   cmd_sreg_u32 src=00000000 gate=00000030

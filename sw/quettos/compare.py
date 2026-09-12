@@ -32,6 +32,13 @@ Verilator harness in ``sim/verilator``, and every VSRAM element, SREG word,
 memory region, dumped logit, CSR and PERF counter the two produce is compared;
 the first difference is reported with the position, the descriptor, the field
 and the element it is in.
+
+``--generate N`` runs the whole model instead: the prefill/decode loop of a
+compiled image on both machines over the image's own prompt, ``--prompt`` file
+or ``--prompt-ids``, comparing the ids they emit.  When the prompt is one the
+golden model's continuation is recorded for, the ids are held to that record as
+well, so one command closes the chain from the top -- RTL, ISA simulator and
+``models/<name>/expected_tokens.json``.
 """
 
 from __future__ import annotations
@@ -571,7 +578,14 @@ def run_rtl(
 
 @dataclass
 class Generated:
-    """The ids a compiled program produced on each model, and how long the RTL took."""
+    """The ids a compiled program produced on each model, and how long the RTL took.
+
+    ``expected`` is the golden model's recorded continuation of the same prompt,
+    cut to the length the run generated, and ``None`` when the image carries no
+    record of this prompt.  A run longer than the record is held to the record as
+    far as it goes: the record ends at an end-of-sequence id the generation run
+    is told to ignore.
+    """
 
     image: Path
     config: Config
@@ -580,6 +594,8 @@ class Generated:
     rtl: list[int]
     cycles: int
     seconds: float
+    source: str | None = None
+    expected: list[int] | None = None
 
     @property
     def ok(self) -> bool:
@@ -589,11 +605,60 @@ class Generated:
     def first_difference(self) -> int | None:
         return _first_difference(self.reference, self.rtl)
 
+    @property
+    def expected_ok(self) -> bool:
+        return self.expected is not None and self.rtl[: len(self.expected)] == self.expected
+
+    @property
+    def first_expected_difference(self) -> int | None:
+        if self.expected is None:
+            return None
+        return _first_difference(self.expected, self.rtl[: len(self.expected)])
+
 
 def prompt_ids(image_dir: Path) -> list[int]:
     """The image's own prompt token ids, or ``[0]`` when it carries none."""
     path = Path(image_dir) / compiler.FILES["prompt"]
     return [int(v) for v in path.read_text().split()] if path.is_file() else [0]
+
+
+def prompt_source(layout: dict[str, Any]) -> str | None:
+    """The prompt file the image's own ``prompt.tokens`` was rendered from."""
+    prompt = layout.get("prompt")
+    return None if prompt is None else str(prompt["source"])
+
+
+def tokenize(layout: dict[str, Any], prompt_file: Path | str) -> list[int]:
+    """A ``prompts/*.json`` file through the compiled model's chat template."""
+    from quettos.model import load_spec
+    from quettos.tokenizer_io import prompt_tokens as render
+
+    return render(load_spec(layout["model"]["repo_id"]), prompt_file)
+
+
+def recorded_continuation(image_dir: Path | str, source: str | None) -> list[int] | None:
+    """The golden model's recorded continuation of ``source``, or ``None`` if there is none.
+
+    ``layout.json`` names ``models/<name>/expected_tokens.json`` only when that
+    file belongs to the compiled model -- the same layers, the same calibration
+    and the same activation width -- so a truncated build carries no record.
+    The ids are held to the per-prompt hash the image was compiled against, so a
+    file rewritten since is a failure rather than a weaker check.
+    """
+    from quettos.golden import ids_sha256
+
+    entry = compiler.load_layout(Path(image_dir)).get("expected_tokens")
+    if entry is None or source is None or source not in entry["prompts"]:
+        return None
+    report = json.loads((REPO / entry["file"]).read_text(encoding="utf-8"))
+    ids = [int(v) for v in report["prompts"][source]["generated_ids"]]
+    want = entry["prompts"][source]
+    if len(ids) != want["count"] or ids_sha256(ids) != want["sha256"]:
+        raise ValueError(
+            f"{entry['file']} no longer holds the {source} continuation "
+            f"{image_dir} was compiled against ({want['count']} ids, {want['sha256']})"
+        )
+    return ids
 
 
 def generate(
@@ -602,6 +667,7 @@ def generate(
     *,
     max_new: int,
     prompt: Sequence[int] | None = None,
+    source: str | None = None,
     lat: int = 32,
     bw_div: int = 1,
     quiet: bool = True,
@@ -612,12 +678,19 @@ def generate(
     each side: ``prefill.prog`` for every prompt token but the last, then
     ``decode.prog`` once per generated token with ``TOK`` and ``POS`` advancing.
     End-of-sequence is disabled on both, so the loop runs its full length.
+
+    ``prompt`` replaces the image's own prompt ids and ``source`` the prompt file
+    they came from; the recorded continuation of that file, when the image has
+    one, is the third machine the ids are held to.
     """
     image_dir = Path(image_dir)
     layout = compiler.load_layout(image_dir)
     if layout["wb"] != cfg.wb:
         raise ValueError(f"{image_dir} was compiled for WB={layout['wb']}, not {cfg.wb}")
     ids = list(prompt_ids(image_dir) if prompt is None else prompt)
+    if prompt is None and source is None:
+        source = prompt_source(layout)
+    recorded = recorded_continuation(image_dir, source)
 
     binary = harness_binary(cfg, quiet=quiet)
     out_dir = BUILD / "compare"
@@ -661,6 +734,8 @@ def generate(
         rtl=rtl,
         cycles=int(run["run"]["clock_cycles"]),
         seconds=float(run["run"]["wall_seconds"]),
+        source=source,
+        expected=None if recorded is None else recorded[:max_new],
     )
 
 
@@ -956,6 +1031,17 @@ def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="instead of the programs, generate N tokens from --image on both machines "
         "and compare the ids",
     )
+    p.add_argument(
+        "--prompt",
+        default=None,
+        help="with --generate, a prompts/*.json file through the model's chat template, "
+        "instead of the image's own prompt",
+    )
+    p.add_argument(
+        "--prompt-ids",
+        default=None,
+        help="with --generate, comma-separated prompt ids, instead of --prompt",
+    )
     return p
 
 
@@ -965,27 +1051,54 @@ def run(a: argparse.Namespace) -> int:
     for name in programs:
         if name not in PROGRAMS:
             raise SystemExit(f"unknown program {name!r}; give one of {', '.join(PROGRAMS)}")
+    if not a.generate and (a.prompt is not None or a.prompt_ids is not None):
+        raise SystemExit("--prompt and --prompt-ids are the prompt of a --generate run")
     if a.generate:
         if a.image is None:
             raise SystemExit("--generate needs --image")
+        if a.prompt is not None and a.prompt_ids is not None:
+            raise SystemExit("give --prompt or --prompt-ids, not both")
+        layout = compiler.load_layout(Path(a.image))
+        prompt, source = None, None
+        if a.prompt is not None:
+            from quettos.golden import prompt_key
+
+            prompt, source = tokenize(layout, a.prompt), prompt_key(a.prompt)
+        elif a.prompt_ids is not None:
+            prompt = [int(v) for v in a.prompt_ids.split(",") if v.strip()]
         g = generate(
             a.image,
             CONFIGS[a.wb],
             max_new=a.generate,
+            prompt=prompt,
+            source=source,
             lat=a.lat,
             bw_div=a.bw_div,
             quiet=not a.verbose,
         )
-        print(f"{g.image.name} {g.config}: {len(g.prompt)} prompt tokens + {a.generate} generated")
+        where = "" if g.source is None else f" from {g.source}"
+        print(
+            f"{g.image.name} {g.config}: {len(g.prompt)} prompt tokens{where} "
+            f"+ {a.generate} generated"
+        )
         print(f"  isa_sim {g.reference}")
         print(f"  RTL     {g.rtl}")
+        if g.expected is not None:
+            print(f"  golden  {g.expected}")
         print(f"  {g.cycles} clock cycles in {g.seconds:.3f} s")
-        if g.ok:
-            print(f"\n{len(g.rtl)}/{len(g.reference)} generated ids match sw/quettos/isa_sim.py")
+        if not g.ok:
+            print(f"\nMISMATCH at generated id {g.first_difference}")
+            return 1
+        print(f"\n{len(g.rtl)}/{len(g.reference)} generated ids match sw/quettos/isa_sim.py")
+        if g.expected is None:
             return 0
-        i = g.first_difference
-        print(f"\nMISMATCH at generated id {i}")
-        return 1
+        if not g.expected_ok:
+            i = g.first_expected_difference
+            print(f"MISMATCH against {g.source} in expected_tokens.json at generated id {i}")
+            return 1
+        n = len(g.expected)
+        print(f"{n}/{n} match the recorded golden continuation of {g.source}")
+        return 0
     if a.sweep:
         results = sweep(
             a.shapes,

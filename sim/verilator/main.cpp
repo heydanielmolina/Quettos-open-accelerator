@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,6 +25,17 @@
 
 namespace qcore {
 namespace {
+
+// A path as the filesystem names it, so a record of the file a run read is
+// read back the same way from any directory. POSIX.1-2008 realpath allocates
+// the buffer, which keeps the path length out of this file.
+std::string real_path(const std::string& path) {
+  char* resolved = realpath(path.c_str(), nullptr);
+  if (resolved == nullptr) return path;
+  std::string out(resolved);
+  free(resolved);
+  return out;
+}
 
 std::vector<int64_t> read_prompt(const std::string& path) {
   std::vector<int64_t> ids;
@@ -67,11 +79,36 @@ struct Run {
   std::vector<TokenRecord> tokens;
   uint64_t descriptors_dumped = 0;
   bool ok = true;
+  // What the run was given, recorded beside its counters: the prompt ids the
+  // token loop prefilled and where they came from, and the image file the
+  // hardware executed with the bytes the memory model mapped of it.
+  std::vector<int64_t> prompt;
+  std::string prompt_from;
+  std::string image_path;
+  uint64_t image_bytes = 0;
+  // What the counters read before this token's first descriptor. START clears
+  // them, so the base is zero on the token path; STEP clears none of them
+  // (docs/ISA.md, CTRL), so a stepped token's cost is measured from here.
+  PerfSnapshot perf_base;
+  Events event_base;
 
-  PerfSnapshot snapshot() {
+  PerfSnapshot raw_perf() {
     PerfSnapshot s;
     for (uint32_t i = 0; i < PERF_COUNT; i++) s[i] = m->perf(i);
     return s;
+  }
+
+  // This token's counters, whichever way it ran.
+  PerfSnapshot snapshot() { return raw_perf().minus(perf_base); }
+
+  Events events() {
+    Events now = read_events(*m);
+    Events e;
+    e.sat_req = now.sat_req - event_base.sat_req;
+    e.sat_vpu = now.sat_vpu - event_base.sat_vpu;
+    e.err_shift = now.err_shift - event_base.err_shift;
+    e.err_bounds = now.err_bounds - event_base.err_bounds;
+    return e;
   }
 
   // One descriptor at a time, dumping the state its plan entry names.
@@ -158,7 +195,9 @@ struct Run {
         j.kv("addr", addr);
         j.kv("size", size);
         // FNV-1a over the region: a KV region is 128 KB and the comparison
-        // side hashes isa_sim's bytes the same way.
+        // side hashes isa_sim's bytes the same way. --dump-bytes N carries the
+        // bytes themselves for a region of at most N, so a difference is
+        // reported at the byte it is in rather than as a hash.
         j.key("fnv1a64");
         std::vector<uint8_t> buf(static_cast<size_t>(size));
         m->bytes()->read(addr, static_cast<uint32_t>(size), buf.data());
@@ -168,6 +207,15 @@ struct Run {
           h *= 1099511628211ull;
         }
         j.num(h);
+        if (size <= opt->dump_bytes) {
+          static const char* kHex = "0123456789abcdef";
+          std::string hex(2 * buf.size(), '0');
+          for (size_t b = 0; b < buf.size(); b++) {
+            hex[2 * b] = kHex[buf[b] >> 4];
+            hex[2 * b + 1] = kHex[buf[b] & 0xF];
+          }
+          j.kv_s("hex", hex);
+        }
         j.close('}');
       }
     }
@@ -178,10 +226,35 @@ struct Run {
     if (cs != nullptr && cs->is_arr()) {
       for (size_t i = 0; i < cs->size(); i++) {
         const std::string& name = (*cs)[i].str();
-        uint32_t word = name == "ARGMAX_TOK" ? CSR_ARGMAX_TOK : CSR_ARGMAX_VAL;
+        // The plan names a register of the CSR window; a name the table does
+        // not carry stops the dump, so a comparison is never made against the
+        // wrong register.
+        uint32_t word = 0;
+        if (!csr_word_of(name, &word)) {
+          throw std::runtime_error("dump_plan.json names \"" + name +
+                                   "\", which is no register of the CSR window (" +
+                                   csr_name_list() + ")");
+        }
         j.kv(name, m->read(word));
       }
     }
+    j.close('}');
+    // The three counters the ISA simulator models and the four event counters,
+    // both since this token's first descriptor.
+    PerfSnapshot p = snapshot();
+    j.key("perf");
+    j.open('{');
+    j.kv("DESCRIPTORS", p[PERF_DESCRIPTORS]);
+    j.kv("MACS", p[PERF_MACS]);
+    j.kv("WT_BYTES", p[PERF_WT_BYTES]);
+    j.close('}');
+    Events ev = events();
+    j.key("events");
+    j.open('{');
+    j.kv("SAT_REQ", ev.sat_req);
+    j.kv("SAT_VPU", ev.sat_vpu);
+    j.kv("ERR_SHIFT", ev.err_shift);
+    j.kv("ERR_BOUNDS", ev.err_bounds);
     j.close('}');
     j.close('}');
   }
@@ -194,6 +267,8 @@ struct Run {
     m->write(CSR_TOK, tok);
     m->write(CSR_POS, pos);
     m->write(CSR_ROW_EN, 1);
+    perf_base = opt->step ? raw_perf() : PerfSnapshot{};
+    event_base = opt->step ? read_events(*m) : Events{};
     if (opt->step) {
       if (!step_program(which, pos)) return -1;
     } else {
@@ -212,19 +287,27 @@ struct Run {
 // WT_BYTES and MACS against the compiler's traffic model (docs/ISA.md).
 int check_token(const Layout& layout, const PerfSnapshot& p, bool decode, uint32_t pos,
                 uint32_t descriptors) {
-  if (p[PERF_DESCRIPTORS] != descriptors) return 0;  // the program did not run to its HALT
   int rc = 0;
-  uint64_t wt = layout.expected_wt_bytes(decode);
-  uint64_t macs = layout.expected_macs(decode, pos);
-  if (p[PERF_WT_BYTES] != wt) {
-    printf("FAIL: WT_BYTES=%llu against layout.json %llu\n", (unsigned long long)p[PERF_WT_BYTES],
-           (unsigned long long)wt);
+  if (p[PERF_DESCRIPTORS] != descriptors) {
+    // The traffic model is the whole program's, so a token that retired
+    // something other than the program's descriptor count is reported here
+    // rather than compared against it.
+    printf("FAIL: token at pos %u retired %llu descriptors, not the program's %u\n", pos,
+           (unsigned long long)p[PERF_DESCRIPTORS], descriptors);
     rc = 1;
-  }
-  if (p[PERF_MACS] != macs) {
-    printf("FAIL: MACS=%llu against layout.json %llu\n", (unsigned long long)p[PERF_MACS],
-           (unsigned long long)macs);
-    rc = 1;
+  } else {
+    uint64_t wt = layout.expected_wt_bytes(decode);
+    uint64_t macs = layout.expected_macs(decode, pos);
+    if (p[PERF_WT_BYTES] != wt) {
+      printf("FAIL: WT_BYTES=%llu against layout.json %llu\n", (unsigned long long)p[PERF_WT_BYTES],
+             (unsigned long long)wt);
+      rc = 1;
+    }
+    if (p[PERF_MACS] != macs) {
+      printf("FAIL: MACS=%llu against layout.json %llu\n", (unsigned long long)p[PERF_MACS],
+             (unsigned long long)macs);
+      rc = 1;
+    }
   }
   if (!p.buckets_exclusive()) {
     printf("FAIL: token at pos %u: BUSY=%llu is not the sum of the six buckets (%llu)\n", pos,
@@ -291,6 +374,20 @@ void write_perf_json(const Options& o, const Layout& layout, const Machine& m, c
   j.kv("clock_cycles", sim_cycles);
   j.kv_d("wall_seconds", seconds);
   j.kv_d("mcycles_per_s", seconds > 0 ? sim_cycles / seconds / 1e6 : 0.0);
+  // The image the hardware executed and the prompt the loop was given: a run's
+  // ids belong to one prompt, and a reader holds them to the record of that
+  // one (sw/quettos/cli.py, demo-report).
+  j.kv_s("image", run.image_path);
+  j.kv("image_bytes", run.image_bytes);
+  j.key("prompt");
+  j.open('{');
+  j.kv_s("from", run.prompt_from);
+  j.kv("count", static_cast<uint64_t>(run.prompt.size()));
+  j.key("ids");
+  j.open('[');
+  for (int64_t id : run.prompt) j.snum(id);
+  j.close(']');
+  j.close('}');
   j.close('}');
   j.key("counters");
   write_json_perf(j, total);
@@ -314,6 +411,9 @@ void write_perf_json(const Options& o, const Layout& layout, const Machine& m, c
   for (const TokenRecord& t : run.tokens) {
     j.open('{');
     j.kv("index", static_cast<uint64_t>(t.index));
+    // Which program ran, rather than what came out of it: a token that faulted
+    // has no id, and it still belongs to the program it faulted in.
+    j.kv_s("pass", t.decode ? "decode" : "prefill");
     j.kv("pos", t.pos);
     j.kv("in", t.in_id);
     j.kv_i("out", t.out_id);
@@ -340,6 +440,15 @@ int main_impl(int argc, char** argv) {
   if (o.eos_ids.empty()) o.eos_ids = layout.eos_ids;
   MemBytes bytes;
   bytes.open_image(layout.image_path());
+  // The image the hardware is about to execute is the one layout.json
+  // describes. The size costs nothing and is checked here; the SHA-256 is
+  // 0.179 s on the 513,950,464 B Qwen image, so it is checked where the demo
+  // checks its other invariants (`quettos demo-report`), once at the end of a
+  // run rather than at the start of every one.
+  if (bytes.size() != layout.image_size) {
+    throw std::runtime_error(layout.image_path() + " is " + std::to_string(bytes.size()) +
+                             " B; layout.json describes " + std::to_string(layout.image_size));
+  }
   if (!o.kv_load.empty()) {
     FILE* f = fopen(o.kv_load.c_str(), "rb");
     if (f == nullptr) throw std::runtime_error("cannot open " + o.kv_load);
@@ -355,13 +464,23 @@ int main_impl(int argc, char** argv) {
   Dut dut(&ctx);
   Machine m(&dut, &bytes, o);
 #ifdef QCORE_TRACE
-  if (o.trace) m.open_trace(o.trace_file, &ctx);
+  if (o.trace) m.open_trace(o.trace_file, &ctx, o.trace_cycles);
 #endif
   m.reset();
 
   if (!o.quiet) {
     printf("qcore_sim: top=%s WB=%d B_MAX=%d VSRAM_WORDS=%d threads=%d\n", Build::top, Build::wb,
            Build::b_max, Build::vsram_words, Build::threads);
+    if (o.trace) {
+      // A cycle is about 12 KB of VCD here, so the window is what keeps the
+      // file to a size a disk holds (--trace-cycles).
+      if (o.trace_cycles == 0) {
+        printf("trace: %s, every cycle of the run\n", o.trace_file.c_str());
+      } else {
+        printf("trace: %s, the first %llu cycles\n", o.trace_file.c_str(),
+               (unsigned long long)o.trace_cycles);
+      }
+    }
     printf("image: %s (%llu B) model=%s isa_version=%d\n", layout.image_path().c_str(),
            (unsigned long long)layout.image_size, layout.model_name.c_str(), layout.isa_version);
     printf("qmem: lat=%u bw_div=%u  programs: decode@0x%08x (%u) prefill@0x%08x (%u)\n", o.lat,
@@ -417,15 +536,30 @@ int main_impl(int argc, char** argv) {
   if (o.step || o.dump_ops) run.dump_plan = qjson::parse_file(o.image + "/dump_plan.json");
 
   std::vector<int64_t> prompt = o.prompt_ids;
-  if (prompt.empty()) prompt = read_prompt(o.prompt);
-  if (prompt.empty()) prompt.push_back(0);
-  if (!o.quiet) printf("prompt: %zu tokens, max_new=%d\n", prompt.size(), o.max_new);
+  std::string prompt_from = "--prompt-ids";
+  if (prompt.empty()) {
+    prompt = read_prompt(o.prompt);
+    prompt_from = real_path(o.prompt);
+  }
+  if (prompt.empty()) {
+    prompt.push_back(0);
+    prompt_from = "id 0, the harness default";
+  }
+  run.prompt = prompt;
+  run.prompt_from = prompt_from;
+  run.image_path = real_path(layout.image_path());
+  run.image_bytes = bytes.size();
+  if (!o.quiet) {
+    printf("prompt: %zu tokens from %s, max_new=%d\n", prompt.size(), prompt_from.c_str(),
+           o.max_new);
+  }
 
   TokenStream out(&run.vocab, stdout);
   auto t0 = std::chrono::steady_clock::now();
   uint64_t cycles0 = m.cycles();
 
   PerfSnapshot total;
+  Events ev_total;
   int rc_counters = 0;
   int index = 0;
   for (size_t i = 0; i + 1 < prompt.size() && run.ok; i++) {
@@ -438,7 +572,9 @@ int main_impl(int argc, char** argv) {
     rec.pos = static_cast<uint32_t>(i);
     rec.in_id = static_cast<uint32_t>(prompt[i]);
     rec.delta = now;
+    rec.decode = false;
     total = total.plus(now);
+    ev_total = ev_total.plus(run.events());
     run.tokens.push_back(rec);
     rc_counters |= check_token(layout, now, false, rec.pos, layout.prefill.descriptors);
     if (!o.quiet) {
@@ -459,10 +595,15 @@ int main_impl(int argc, char** argv) {
     rec.in_id = tok;
     rec.out_id = nxt;
     rec.delta = now;
+    rec.decode = true;
     total = total.plus(now);
+    ev_total = ev_total.plus(run.events());
     run.tokens.push_back(rec);
-    if (nxt < 0) break;
+    // Every token that ran is held to the traffic model and to the bucket sum,
+    // the one that faulted included: it retired fewer descriptors than the
+    // program has, which is what check_token reports.
     rc_counters |= check_token(layout, now, true, rec.pos, layout.decode.descriptors);
+    if (nxt < 0) break;
     if (!o.quiet) {
       printf("[token %d pos=%u id=%lld cycles=%llu mac=%.1f%%] ", jj, rec.pos,
              (long long)nxt, (unsigned long long)rec.delta[PERF_CYCLES],
@@ -480,7 +621,7 @@ int main_impl(int argc, char** argv) {
   uint64_t sim_cycles = m.cycles() - cycles0;
   printf("\n");
 
-  Events ev = read_events(m);
+  Events ev = ev_total;  // START clears them per token, so the run's events are the sum
   const char* mode = o.step ? "step" : "token";
   print_counters(total, "perf:");
   printf("events: SAT_REQ=%u SAT_VPU=%u ERR_SHIFT=%u ERR_BOUNDS=%u\n", ev.sat_req, ev.sat_vpu,

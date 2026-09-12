@@ -201,12 +201,15 @@ write VSRAM mid-token is a design change, not a fix.
   utilization and MAC utilization, read from the RTL's counters at a stated
   context length and batch. The memory model in simulation is fixed-latency,
   one beat per cycle; weight-port utilization counts read-beat busy cycles.
-- **FPGA throughput** is derived from those cycle counts at a stated clock and
-  memory bandwidth (100 MHz and 6.4 GB/s for the WB=64 configuration).
-  Synthesis results come from Yosys `synth_xilinx`, reported post-synthesis
-  with the exact command and tool version: `scripts/synth_report.py` writes each
-  `syn/reports/*.md` from the log of the run that produced it, and `make synth`
-  fails when a report stops reproducing. fmax comes from nextpnr when run.
+- **FPGA throughput** follows from those cycle counts once a clock and a memory
+  bandwidth are fixed: `tokens/s = clock / cycles-per-token` at a port that
+  sustains `WB` bytes a cycle. The clock is a place-and-route timing result, so
+  the throughput line is published with the nextpnr fmax run of
+  `docs/ROADMAP.md` and states the pair it was derived from. Synthesis results
+  come from Yosys `synth_xilinx`, reported post-synthesis with the exact command
+  and tool version: `scripts/synth_report.py` writes each `syn/reports/*.md`
+  from the log of the run that produced it, and `make synth` fails when a report
+  stops reproducing.
 - **Bit-exact** means the RTL matches the integer golden model bit for bit,
   token by token and, on request, over the full logit vector. **Quality** is a
   measured perplexity, KL and top-1 delta against fp32 at the tested context

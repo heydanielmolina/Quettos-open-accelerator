@@ -18,6 +18,11 @@ a failing command rather than a misleading page. The `## Notes (hand-written)`
 section at the end of a report is the one part written by a person; it is
 carried forward unchanged.
 
+The README row that quotes the whole-core report is held to the same run: every
+figure it states is read back off the row and required to equal what Yosys just
+reported for the demo configuration, so the front page cannot drift away from
+the page it points at.
+
 Yosys's own output is passed through, minus the lines `is_noise` names: the
 `check` pass that `synth_xilinx` runs between `proc` and its first `opt_clean`
 reports the scaffolding elaboration has just built, and the next pass deletes
@@ -43,6 +48,16 @@ SYN_DIR = ROOT / "syn"
 REPORT_DIR = SYN_DIR / "reports"
 LOG_DIR = ROOT / "build" / "synth"
 SHARED = SYN_DIR / "report.ys"
+FRONT_PAGE = ROOT / "README.md"
+
+# The README row that quotes syn/reports/qcore_top.md, and the figures it states.
+# Each is read off the row and held to the demo configuration of the run.
+FRONT_PAGE_ROW = "| `qcore_top` on xc7 |"
+FRONT_PAGE_CELLS = ("DSP48E1", "RAMB36E1", "RAMB18E1", "RAM32M", "SRL16E")
+FRONT_PAGE_TOTALS = ("LUTs", "flops", "cells", "estimated LCs")
+FRONT_PAGE_FIGURE = re.compile(
+    r"(\d[\d,]*) (" + "|".join(FRONT_PAGE_CELLS + FRONT_PAGE_TOTALS) + r")\b"
+)
 
 NOTES_HEADING = "## Notes (hand-written)"
 DEFAULT_NOTES = "What dominates the area of this block, in a sentence.\n"
@@ -488,11 +503,52 @@ def keep_notes(path: Path) -> str:
     return body if body.strip() else DEFAULT_NOTES
 
 
+# ------------------------------------------------------------------- front page
+
+
+def report_figures(cfg: Config) -> dict[str, int]:
+    """The figures the README row quotes, as this run measured them."""
+    table = dict(cfg.cells)
+    figures = {name: table.get(name, 0) for name in FRONT_PAGE_CELLS}
+    figures["LUTs"] = sum(v for k, v in cfg.cells if re.fullmatch(r"LUT\d", k))
+    figures["flops"] = sum(v for k, v in cfg.cells if re.fullmatch(r"FD\w+", k))
+    figures["cells"] = cfg.total_cells
+    figures["estimated LCs"] = cfg.est_lcs
+    return figures
+
+
+def check_front_page(cfgs: list[Config]) -> list[str]:
+    """Hold the README row that quotes the whole-core report to the run behind it.
+
+    The row is the front page's copy of a generated table, which is the one
+    place a synthesis figure can be typed. Every figure on it is read back and
+    required to equal this run's demo configuration, and a figure the row stops
+    stating fails too, so the check cannot be shortened away.
+    """
+    demo = next((c for c in cfgs if c.label == "demo"), None)
+    if demo is None:
+        return []
+    rows = [ln for ln in FRONT_PAGE.read_text().splitlines() if ln.startswith(FRONT_PAGE_ROW)]
+    if len(rows) != 1:
+        return [f"README.md carries {len(rows)} rows starting `{FRONT_PAGE_ROW}`, expected one"]
+    said = {unit: int(n.replace(",", "")) for n, unit in FRONT_PAGE_FIGURE.findall(rows[0])}
+    figures = report_figures(demo)
+    bad = [
+        f"README.md's synthesis row says {said[unit]:,} {unit}, the run says {value:,}"
+        for unit, value in figures.items()
+        if unit in said and said[unit] != value
+    ]
+    absent = [unit for unit in figures if unit not in said]
+    if absent:
+        bad.append("README.md's synthesis row states no " + ", ".join(absent))
+    return bad
+
+
 # ------------------------------------------------------------------------ main
 
 
-def build(script: Path) -> tuple[str, str]:
-    """Run one script and return (report file name, report text)."""
+def build(script: Path) -> tuple[str, str, list[Config]]:
+    """Run one script and return (report file name, report text, its configurations)."""
     log = LOG_DIR / f"{script.stem}.log"
     print(f"synth: {script.relative_to(ROOT)} -> {log.relative_to(ROOT)}")
     run_script(script, log)
@@ -507,7 +563,7 @@ def build(script: Path) -> tuple[str, str]:
     name = f"{cfgs[0].module}.md"
     page = render(script, log, version, cfgs, keep_notes(REPORT_DIR / name))
     check_facts_cover_params(name, cfgs, page)
-    return name, page
+    return name, page, cfgs
 
 
 # Cell types whose count is an inference outcome, not an optimization detail: a
@@ -609,32 +665,40 @@ def main() -> int:
     started = time.monotonic()
     built: dict[str, str] = {}
     source: dict[str, Path] = {}
+    configs: dict[str, list[Config]] = {}
     print(f"synth-report: {tool_banner()}")
     try:
         for script in scripts:
             try:
-                name, text = build(script)
+                name, text, cfgs = build(script)
             except ReportError as exc:
                 raise ReportError(f"{script.name}: {exc}") from exc
             if name in built:
                 raise ReportError(
                     f"{script.name} and {source[name].name} both write syn/reports/{name}"
                 )
-            built[name], source[name] = text, script
+            built[name], source[name], configs[name] = text, script, cfgs
     except ReportError as exc:
         sys.stderr.write(f"synth-report: {exc}\n")
         return 1
     elapsed = time.monotonic() - started
+
+    # The whole-core report is the one the front page quotes.
+    front = check_front_page(configs.get("qcore_top.md", []))
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     if not args.check:
         for name, text in built.items():
             (REPORT_DIR / name).write_text(text)
             print(f"synth-report: wrote syn/reports/{name}")
+        for line in front:
+            sys.stderr.write(f"synth-report: {line}\n")
+        if front:
+            return 1
         print(f"synth: {len(scripts)} script(s), {elapsed:.1f} s, OK")
         return 0
 
-    failures: list[str] = []
+    failures: list[str] = list(front)
     cross: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in built.items():

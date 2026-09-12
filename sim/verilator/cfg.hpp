@@ -80,6 +80,8 @@ const char* const USAGE =
     "  --dump-ops         with --step, write per-descriptor state from dump_plan.json\n"
     "  --allow-sat        report the saturation and error counters instead of failing\n"
     "  --trace FILE       write a VCD (the model must be built with TRACE=1)\n"
+    "  --trace-cycles N   dump at most N cycles into --trace, then close the file\n"
+    "                     and run on (20000, about 240 MB; 0 traces the whole run)\n"
     "  --program FILE     run this raw descriptor blob instead of the token loop\n"
     "  --program-addr N   where --program is loaded and PC starts (required with it)\n"
     "  --sreg B:I=WORD    load SREG[B][I] with WORD before the run (repeatable)\n"
@@ -99,10 +101,15 @@ const char* const USAGE =
     "                     model.eos_ids of layout.json)\n"
     "  --perf-json PATH   where to write the counters (build/perf/perf.json)\n"
     "  --dump-dir DIR     where --dump-ops writes (build/perf/steps)\n"
+    "  --dump-bytes N     --dump-ops also writes the bytes of every planned\n"
+    "                     memory region of at most N bytes, next to its hash (0)\n"
     "  --kv-save FILE     write the KV region to FILE after the run\n"
     "  --kv-load FILE     load the KV region from FILE before the run\n"
     "  --max-cycles N     stop and fail after N cycles (0: no limit)\n"
-    "  --quiet            counters and the final line only\n";
+    "  --quiet            counters and the final line only\n"
+    "  +verilator+...     a Verilator runtime plusarg, passed to the kernel;\n"
+    "                     +verilator+rand+reset+N and +verilator+seed+N set the\n"
+    "                     initial values of a model built with XINIT=unique\n";
 
 // One pass of a --program run: the TOK and POS the host writes before START.
 struct Pass {
@@ -143,7 +150,12 @@ struct Options {
   uint32_t row_en = 1;
   std::string perf_json = "build/perf/perf.json";
   std::string dump_dir = "build/perf/steps";
+  uint32_t dump_bytes = 0;
   std::string trace_file;
+  // A cycle of qcore_top is about 12 KB of VCD with --trace-structs, so a whole
+  // program is hundreds of gigabytes. The trace stops after this many cycles
+  // and the run carries on; 0 asks for all of them.
+  uint64_t trace_cycles = 20000;
   std::string kv_save;
   std::string kv_load;
   std::vector<int64_t> prompt_ids;
@@ -252,12 +264,14 @@ inline bool parse_args(int argc, char** argv, Options* o) {
     else if (a == "--dump-ops") { o->dump_ops = true; o->step = true; }
     else if (a == "--allow-sat") o->allow_sat = true;
     else if (a == "--trace") { o->trace = true; o->trace_file = next(i, "--trace"); }
+    else if (a == "--trace-cycles") o->trace_cycles = strtoull(next(i, "--trace-cycles").c_str(), nullptr, 0);
     else if (a == "--quiet") o->quiet = true;
     else if (a == "--prompt") o->prompt = next(i, "--prompt");
     else if (a == "--prompt-ids") o->prompt_ids = parse_ids(next(i, "--prompt-ids"));
     else if (a == "--eos") o->eos_ids = parse_ids(next(i, "--eos"));
     else if (a == "--perf-json") o->perf_json = next(i, "--perf-json");
     else if (a == "--dump-dir") o->dump_dir = next(i, "--dump-dir");
+    else if (a == "--dump-bytes") o->dump_bytes = static_cast<uint32_t>(strtoul(next(i, "--dump-bytes").c_str(), nullptr, 0));
     else if (a == "--kv-save") o->kv_save = next(i, "--kv-save");
     else if (a == "--kv-load") o->kv_load = next(i, "--kv-load");
     else if (a == "--program") o->program = next(i, "--program");
@@ -270,6 +284,11 @@ inline bool parse_args(int argc, char** argv, Options* o) {
     else if (a == "--tok") o->tok = static_cast<uint32_t>(strtoul(next(i, "--tok").c_str(), nullptr, 0));
     else if (a == "--pos") o->pos = static_cast<uint32_t>(strtoul(next(i, "--pos").c_str(), nullptr, 0));
     else if (a == "--row-en") o->row_en = static_cast<uint32_t>(strtoul(next(i, "--row-en").c_str(), nullptr, 0));
+    // A plusarg belongs to the simulation kernel, not to the host: main_impl
+    // hands the whole command line to VerilatedContext::commandArgs before it
+    // constructs the model, so +verilator+rand+reset+N and +verilator+seed+N
+    // reach the model's initial values.
+    else if (a.size() > 1 && a[0] == '+') continue;
     else throw std::runtime_error("unknown option " + a);
   }
   if (o->image.empty()) throw std::runtime_error("--image is required");

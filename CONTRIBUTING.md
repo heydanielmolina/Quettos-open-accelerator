@@ -179,8 +179,9 @@ message.
 ## 6. Measured numbers (README rule)
 
 - Every performance, synthesis or quality number in `README.md` comes from a
-  command in this repository (`make perf`, `make synth`, `make bringup-sweep`,
-  `uv run quettos check`) and the row names that command.
+  command in this repository (`make demo`, `make perf`, `make synth`,
+  `make bringup-sweep`, `uv run quettos compare`, `uv run quettos check`) and
+  the row names that command.
 - Synthesis figures are never typed by hand: `scripts/synth_report.py` writes
   each `syn/reports/*.md` from the Yosys log of the run that produced it -- the
   tool version, the elaborated parameters, the `stat -tech xilinx` table, the
@@ -197,8 +198,10 @@ message.
   harness run, that tool's own `sim/<tool>/README.md` for a `make` target of
   its own. Everywhere else names the command and points at that page.
 - Analytical projections live in `docs/`, labeled **estimate**.
-- FPGA tokens/s figures state the clock and memory bandwidth they are derived
-  from (100 MHz and 6.4 GB/s for WB=64).
+- An FPGA tokens/s figure states the clock and the memory bandwidth it is
+  derived from, and the clock is a place-and-route timing result: the derivation
+  is in `docs/ARCHITECTURE.md` (Scope and measurement conventions) and the
+  nextpnr fmax run that supplies the clock is in `docs/ROADMAP.md`.
 - Measurement conventions (what "bit-exact", "utilization" and "quality" mean
   here) are defined once, in `docs/ARCHITECTURE.md`, and used consistently.
 

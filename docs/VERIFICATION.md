@@ -3,14 +3,16 @@
 ## Oracle chain
 
 ```
-HF fp32 (transformers, optional torch)      quality reference only
+reference_np.py   float32 numpy forward, Hugging Face Llama/Qwen2 semantics;
+   |              argmax-identical to the transformers fp32 forward on the same
+   |              weights (sw/tests/test_reference_np.py)  quality reference only
    |  top-1 / KL / PPL deltas, never bit-exact
    v
 golden.py         op-by-op integer forward, float64 BLAS for exact integer GEMV (partials < 2^53);
    |              forward_tokens (teacher-forced, all positions) == step (one program at one
    |  bit-exact   position) at every position; program.py supplies the requant constants
    v
-quality.py        golden vs fp32 over the calibration set (uv run quettos check <alias>):
+quality.py        golden vs reference_np over the calibration set (uv run quettos check <alias>):
    |              top-1, KL, delta-NLL +/- SE, PPL -> models/<name>/quality.json
    |
 isa_sim.py        executes decode.prog / prefill.prog on image.bin at value level, with
@@ -22,12 +24,13 @@ RTL (Verilator)   qcore_top, all three configurations; compare.py runs the bring
    |              program, the directed vector program, the attention step and the whole
    |  bit-exact  decoder layer on both and reports the first differing element; the
    v             harness generates from a compiled image and the ids match isa_sim's
+                 and the golden model's recorded continuation (make demo)
 ```
 
 "Bit-exact" always means RTL == isa_sim == golden, our own integer model. It
-never means "matches PyTorch". Quality relative to HF fp32 is a **measured
-delta**, reported with standard errors at the calibration-set lengths (up to
-520 tokens).
+never means "matches PyTorch". Quality relative to the float32 reference is a
+**measured delta**, reported with standard errors at the calibration-set lengths
+(up to 520 tokens).
 
 ## The eight layers
 
@@ -88,8 +91,12 @@ delta**, reported with standard errors at the calibration-set lengths (up to
    `POS in {0, 1, 63, 64, 2047}` compared byte for byte against `isa_sim`;
    `seq_fetch` restarts at every position inside a beat, stepping across beat
    boundaries and the `fetch_hold` write fence; `seq_dispatch` POS-derived
-   fields over 2,160 decoded cases against `isa_sim.gemv_dims` and
-   `softmax_len`, the auto-fence ordering, the six exclusive stall buckets, the
+   fields against `isa_sim.gemv_dims` and `softmax_len` over every GEMV, EMBED
+   and VSOFTMAX shape whose extents come from `POS`, at each of the twelve
+   positions of `SWEEP_POSITIONS` -- every one that lands on a tile edge or a
+   capacity -- and each row set of `SWEEP_ROWS` that survives `ROW_EN` at this
+   `B_MAX`, the bench holding the descriptors it compared to that whole
+   product; the auto-fence ordering, the six exclusive stall buckets, the
    zero-work rule, step mode, the write fence a step, a fault or an ABORT ends
    on, the three decode-cycle faults -- both edges of the VSOFTMAX class window
    issue and five classes outside it fault with `FAULT = CLASS`, nothing issued
@@ -157,6 +164,64 @@ delta**, reported with standard errors at the calibration-set lengths (up to
    on the dispatcher and `sw/tests/test_isa_sim.py` on `isa_sim`. The
    `--layers N` truncated models and the KV region comparison follow through
    `isa_sim.compare_sequence`.
+
+   **Whole programs, descriptor by descriptor.** `sw/quettos/stepcmp.py`
+   (`make stepcmp`, `make stepcmp-models`, `make stepcmp-model`,
+   `sw/tests/test_stepcmp.py`) takes the
+   same comparison to the compiler's own programs end to end. The compiler
+   writes `dump_plan.json` beside `decode.prog` and `prefill.prog` naming, per
+   descriptor, the VSRAM range it writes, the scale registers it writes, the
+   memory regions it touches and the CSRs; the harness runs a program one
+   `CTRL.STEP` per descriptor and writes exactly that state out after each one
+   (`--step --dump-ops`, with `--dump-bytes N` carrying a region of at most `N`
+   bytes as bytes rather than as its FNV-1a hash), and `isa_sim` runs the same
+   program on the same image and captures the same state. Compared after every
+   descriptor: the VSRAM range, the scale registers as the words the bank holds,
+   the memory regions, the ARGMAX registers, `PC`, `DESCRIPTORS` / `MACS` /
+   `WT_BYTES` and the four event counters, the last two groups since the token's
+   first descriptor -- `START` clears the counters and a `STEP` clears none of
+   them, so a stepped token's cost is read against the base its first descriptor
+   started from. The first difference is reported as (program, position,
+   descriptor index, opcode, dataflow name, listing line, element).
+   `isa_sim.check_plan` runs over the simulator's own write log first, so the
+   plan is known to name every write each descriptor made and comparing the
+   planned state is comparing all of it.
+
+   The tiny sweep is five random shapes -- hidden 64 to 192, vocabulary 128 or
+   256, two to six query heads over one to three KV heads, grouped-query among
+   them, one and two layers, both RoPE tables and both bias settings -- at
+   WB=16, each run over every position of a two-tile KV cache, so the last
+   position of the first weight-port tile, the one that opens the second and the
+   last position the cache holds are all in it: 32 tokens and 10,047 descriptors
+   per sweep, in **3.35 s** (3.31 - 3.42, n=5) with the harness already built,
+   on the machine `docs/PERFORMANCE.md` names. `make stepcmp-models` runs the
+   first one and two layers of both real models at WB=64 over the same tile
+   boundary, 67 positions each: 22,871 descriptors in **36.8 s**
+   (36.2 - 37.3, n=3). Together they cover what the four bring-up
+   programs above do not -- every layer of the program, the final norm, the LM
+   head, and `prefill.prog` beside `decode.prog`.
+
+   **On the complete models.** `make stepcmp-model` runs the same comparison on
+   the whole of Qwen2.5-0.5B-Instruct and SmolLM2-135M-Instruct at WB=64 -- all
+   24 and all 30 decoder layers, the final norm and the LM head over the real
+   vocabulary -- at two prefill positions and two decode steps, so the KV cache
+   the first decode step writes is what the second one reads:
+   **11,860 descriptors** of `prefill.prog` and `decode.prog` compared element by
+   element, 5,966 on Qwen and 5,894 on SmolLM2, in **20.0 s** (19.7 - 20.3, n=3)
+   with the harness built and the quantized checkpoints on disk. That is the
+   whole of both programs at those positions: every descriptor's VSRAM range,
+   scale registers, KV bytes, ARGMAX registers, `PC` and counters. The positions
+   a weight-port tile boundary falls on are the one- and two-layer compiles'
+   job -- 67 positions each, above -- and the depth of a complete model is this
+   target's; the images are compiled at `max_ctx = 128` so every KV region
+   travels as bytes and a difference is reported at the byte it is in. The
+   nightly `e2e-qwen` and `e2e-smollm2` jobs run it beside the generated-id and
+   golden-model commands, so a complete model is compared as state and not only
+   as ids.
+
+   `sw/tests/test_stepcmp.py` runs the sweep, the tiny image, the four truncated
+   models and the two complete ones, the last six skipped when
+   `build/quant/<name>.npz` is not there.
 5. **End-to-end.** A whole compiled program runs on `qcore_top` (`make perf`,
    `make demo`): every descriptor of `decode.prog` and `prefill.prog` at its
    real address, stride, meta and partial tile, over the image's own prompt and
@@ -168,10 +233,116 @@ delta**, reported with standard errors at the calibration-set lengths (up to
    the ids `qcore_top` generates are compared with `isa_sim`'s over the same
    image and prompt, and `isa_sim` reproduces the integer golden model, whose
    own generation is recorded in `models/<name>/expected_tokens.json`.
-   Determinism is checked at `--lat 1 / 32 / 200` and `--bw-div 2` (layer 4
-   requires identical RTL records across the four settings), at `--threads 1`
-   against `--threads 4` (identical cycle counts on `qcore_top`), and at WB=64
-   against WB=128 through `make bringup-sweep`.
+
+   `make demo` (`scripts/demo.sh`) runs that from the checkpoint in one
+   command -- sync, download, quantize, compile, build the harness, generate on
+   `qcore_top` with every token printed as it leaves the hardware -- and
+   `quettos demo-report` then holds the finished run to what it has to be. The
+   files first: every entry of `layout.json` that carries a `file` and a
+   `sha256` -- the image, both descriptor programs, the dump plan, the token
+   table, the prompt ids, the RoPE and lookup tables and the golden model's
+   recorded continuation -- read again and hashed again, and held to what the
+   compiler recorded; the image also at its recorded size, and that same file at
+   that same byte count in the `image` and `image_bytes` the run says it mapped.
+   Then the prompt: the ids `perf.json` records the loop as having been given,
+   at the count and the SHA-256 `layout.json` carries for the prompt the image
+   was compiled with, with one prefill token for every id but the last -- and it
+   is that match which resolves the prompt file the record is looked up under.
+   Then the ids: identical to the golden model's recorded continuation of that
+   prompt, resolved through the `expected_tokens` entry `layout.json` carries
+   and held to the per-prompt count and SHA-256 the image was compiled against,
+   a run that generated nothing failing rather than matching an empty record.
+   Then the counters: `SAT_REQ`, `SAT_VPU`, `ERR_SHIFT` and `ERR_BOUNDS` all
+   zero; `BUSY` the sum of the six buckets; `RD_BYTES` equal to
+   `RD_BEATS * WB`; the write counters equal to the memory model's own; every
+   token retiring its program's full descriptor count; `CYCLES` equal to the sum
+   of the tokens' own counts; and the run's `status` `ok` rather than a stop. Any one of those failing
+   fails the command and is named in the report. The report computes no model
+   value of its own: the ids are the hardware's and the reference is the
+   checked-in record. `make demo` runs the complete SmolLM2-135M-Instruct and
+   `make demo-qwen` the complete Qwen2.5-0.5B-Instruct, both to the model's own
+   end-of-sequence id; `docs/PERFORMANCE.md` holds the wall clock and the stage
+   table of each.
+
+   Determinism and configuration equivalence are a runnable check of their own
+   (`sw/quettos/determinism.py`, `make determinism`): one compiled program runs
+   on `qcore_top` under every setting that changes the timing or the starting
+   state and nothing else, and each run is compared with the run at the
+   configuration every measurement is taken at, `--lat 32 --bw-div 1
+   --threads 1`. A setting runs the program twice -- once descriptor by
+   descriptor with every VSRAM element, SREG word, dumped region, CSR and
+   counter recorded, once as the image's own prefill/decode loop -- so it is
+   judged on the ids it generates as well as on the state it leaves, and a
+   difference is reported the way layer 4 reports one: the position, the
+   descriptor, the field and the first element it is in.
+
+   - **Timing.** `--lat` 1, 32 and 200, one returned beat every two cycles, and
+     one simulation thread against four. `--lat 200` is past the memory model's
+     64-beat in-flight window, so the weight port is bandwidth-bound rather
+     than saturated and the cycle count moves by more than a factor of three
+     across the set while no value moves at all; four threads take the same
+     cycles as one. Layer 4 holds its own records to the first four settings.
+   - **Port width.** One model compiled at `WB=64` and at `WB=128` -- separate
+     compiles of the same weights to the same context, with a different tiling
+     and a zero-padded last tile -- generates the same ids, dumps the same int32
+     logit for every vocabulary entry, and produces the same state descriptor by
+     descriptor over a whole decoder layer, in different numbers of cycles. That
+     is what the fallback configuration of `docs/PERFORMANCE.md` rests on.
+
+     Both programs run at both widths. The bring-up program takes the embedding
+     table and the tied head; the **layer** program takes the whole decoder layer
+     of the compiled `decode.prog` -- the norm and its quantize, the `Wqkv`
+     matrix-vector, the rotation, the per-head quantizes, both `KVWRITE`
+     descriptors, the `K^T` matrix-vector whose length comes from the position,
+     the softmax, the value matrix-vector, the output projection, the post norm,
+     the gate-and-up matrix-vector, the `VSILUMUL` and the down projection -- at
+     every position the two widths name in common, in order and on one machine.
+     Compared after every descriptor: every element of the used VSRAM range, all
+     32 SREG words of every bank, `PC`, `STATUS`, the ARGMAX registers, the four
+     event counters and `DESCRIPTORS`.
+
+     Two things about a run are the port width's own and are not compared across
+     widths. `MACS` and `WT_BYTES` are the first: a partial last tile is padded
+     to the width and streamed, so the padding is weight bytes the port carried
+     and products the array took, and the two counters differ by exactly that.
+     The KV cache is the second: both halves are stored in the weight tiling of
+     the port width (`compiler.kv_sizes`), so its address, its size and the order
+     of its bytes belong to the compile. What the cache holds is compared through
+     the arithmetic that reads it -- the passes run in order on one machine, so
+     the attention output of every position after the first is what the positions
+     before it wrote. `sw/tests/test_determinism.py` measures the exemption
+     rather than assuming it: over the layer program the two widths differ on
+     those two counters and on nothing else, and a single flipped byte of a
+     layer-0 gamma row or of the embedding table is reported at the VSRAM element
+     or the dumped logit it moves.
+
+     `make determinism` runs both programs on a random tiny model compiled at
+     each width, `make determinism-model` runs the layer program on a compiled
+     image at both widths, and `make bringup-sweep` holds both widths to the ISA
+     simulator as well.
+   - **Starting state.** `make determinism-x` builds the harness with
+     Verilator's `--x-initial unique` (`XINIT=unique` in `sim/verilator`) and
+     starts every variable no reset reaches at zeros, at ones, and at a value
+     drawn from each of eight seeds, one run per setting, over the layer and the
+     bring-up programs. Such a run is judged on what the program produces -- the
+     ids, the memory it writes and the registers the host reads -- because the
+     vector SRAM and the scale registers hold whatever the start put in the
+     elements the program has not written.
+
+     Twenty-one of the target's twenty-two runs produce the baseline's values.
+     The twenty-second stops on a simulation-only check rather than on a value:
+     `rtl/qcore_lut_interp.sv` holds its interpolated value to `[0, 65535]`
+     whenever `in_valid` is high, and `rtl/qcore_vpu_scalar.sv` raises
+     `in_valid` on both interpolators for every scalar request while enabling
+     only the table that request needs, so the other one still holds the sample
+     registers the start put there. The bring-up program's first scalar request
+     is a reciprocal, so the rsqrt samples are that start value, and one of the
+     eight seeds puts a pair there that leaves the range. The target reports the
+     run, the module and the values it stopped on and fails; the nightly
+     `x-initial-unique` job is held on it and its gate says so. The other check
+     that reads unreset state, the `ifndef SYNTHESIS` block of
+     `rtl/qcore_row.sv`, is qualified by `rst` like the registers beside it and
+     holds from every one of the ten starts.
 6. **Quality (golden vs fp32, not RTL).** `uv run quettos check <alias>`
    scores the calibration set teacher-forced (Qwen 1314 tokens and 1308 scored
    positions, SmolLM2 1181 and 1175): paired
@@ -206,28 +377,39 @@ delta**, reported with standard errors at the calibration-set lengths (up to
    `rtl/gen/*.hex` lookup-table images -- a regenerated table changes the
    design, since `$readmemh` loads it into the ROMs -- and the C++), uv without
    torch, and on nightly the Hugging Face download.
-   Five PR jobs with `timeout-minutes` each: the three-parser lint,
+   Six PR jobs with `timeout-minutes` each: the three-parser lint,
    `make style` and pytest, then the
    cocotb block tests, gate-level equivalence (`make gatesim`), the synthesis
    run (`make synth`: every block and the whole core in both configurations,
    with every `syn/reports/*.md` regenerated and checked against the run; a
    report written by a different Yosys build is held to its parameters and its
-   hard-block inventory, since LUT packing and path length belong to the build)
-   and
+   hard-block inventory, since LUT packing and path length belong to the build),
    the tiny-configuration bring-up comparison (`bringup-tiny`: `make
    harness-csr` then `make bringup`; `docs/PERFORMANCE.md` holds that target's
-   local wall clock), the last four gated on the first. Nightly holds the long
-   runs. Two of them run: `e2e-qwen` and `e2e-smollm2` quantize and compile the
+   local wall clock) and the demo on the small model (`demo-smollm2`: `make
+   demo`, the whole pipeline a clean clone runs -- checkpoint, quantize,
+   compile, harness, the complete 30-layer SmolLM2-135M-Instruct generating on
+   `qcore_top`, and layer 5's checks over the finished run), the last five gated
+   on the first. The checkpoint and the harness object directory are cached, so
+   the Hub fetch and the Verilator build are paid once. Nightly holds the long
+   runs. Three of them run: `e2e-qwen` and `e2e-smollm2` quantize and compile the
    checkpoint, generate from the image's own prompt on `qcore_top` and on
-   `isa_sim` and compare the ids, then run every descriptor of the same
-   programs against the integer golden model -- `RTL == isa_sim == golden` on a
-   complete model, one generated token on Qwen and four on SmolLM2, the
-   compiled program's six vector opcodes on `qcore_vpu_top`. Three are held by
+   `isa_sim` and compare the ids, compare the state after every descriptor of
+   both programs of the complete model (`make stepcmp-model`, layer 4), then run
+   every descriptor of the same programs against the integer golden model --
+   `RTL == isa_sim == golden` on a complete model as ids and as state, one
+   generated token on Qwen and four on SmolLM2, the
+   compiled program's six vector opcodes on `qcore_vpu_top`; `determinism-model`
+   compiles SmolLM2 at `WB=64` and at `WB=128` and runs layer 5's timing and
+   width checks over the complete model, the width half descriptor by descriptor
+   over a whole decoder layer. Three are held by
    `if: false`, each gate naming what it waits for: the ECP5 stat and nextpnr
    fmax (`syn/` carries no ECP5 script), the `--x-initial unique` determinism
-   run (the harness builds with a fixed `--x-initial fast`), and the quality
-   regeneration over the wider set (`uv run quettos check` scores the
-   calibration corpus). The whole-core synthesis is a PR job, so nightly
+   run (`make determinism-x` runs it and reports the one run of its twenty-two
+   that stops, on the `rtl/qcore_lut_interp.sv` range check reading the table a
+   scalar request did not address -- layer 5, **Starting state**), and
+   the quality regeneration over the wider set (`uv run quettos check` scores
+   the calibration corpus). The whole-core synthesis is a PR job, so nightly
    carries no synthesis of its own beyond ECP5.
 
 ## What is checked into `models/<model>/`

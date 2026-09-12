@@ -20,7 +20,7 @@ labelled **estimate**.
   and snapshots at the `HALT` that retires the program, so it is the program's
   own cost. The harness `RESULT` line reports `clock_cycles` instead: the same
   count plus the cycles the host loop spends writing `TOK` / `POS`, pulsing
-  `START` and polling `STATUS`, 44 per token here. Both are given where they
+  `START` and polling `STATUS`, 48 per token here. Both are given where they
   differ. Cycle counts are exact and repeat run to run; every count on this page
   was identical across every run of its command.
 - **Rates and wall clock.** Every rate and every wall clock is the median of a
@@ -29,13 +29,16 @@ labelled **estimate**.
   smaller sets than the short ones, and every table names its `n`.
 - **Sustained load.** Rates fall a few percent as the machine stays busy, so a
   single run reads high. Quoting a median with its range and its run count is
-  what makes these figures reproducible: the widest spread in any set on this
-  page is 9.4% of its median and the median spread is 1.7%.
+  what makes these figures reproducible: every set on this page carries all
+  three, and the widest spread among them is 11.8% of its median -- the demo's
+  sub-second checkpoint stage, where a hundredth of a second is 3%.
 - **Workload.** `make perf` and `make demo` run a compiled program on the RTL:
   every descriptor of `decode.prog` and `prefill.prog` at its real address,
   stride, meta and partial tile, all six vector opcodes on `qcore_vpu_top`, and
   the tokens the run generates printed as they leave the core. The traffic, the
-  cycles, the counters and the values are the compiled program's.
+  cycles, the counters and the values are the compiled program's. `make perf`
+  starts from a compiled image; `make demo` starts from the checkpoint and
+  builds one (**The demo** below).
 - **Memory model.** `image.bin` mapped copy-on-write behind the QMEM ports of
   `docs/RTL.md` 2.1: fixed read latency (`--lat`, default 32), one returned beat
   every `--bw-div` cycles (default 1), in-order returns across tags, a 64-beat
@@ -129,6 +132,8 @@ buckets, and the harness fails a run whose buckets do not sum to `BUSY`.
 | Qwen 24 layers, decode token | 8,321,833 | 93.01% | 1.03% | 5.09% | 0.078% | 0.077% | 0.722% |
 | Qwen 24 layers, 32 prompt + 20 decode | 358,570,293 | 91.82% | 1.05% | 6.09% | 0.093% | 0.091% | 0.854% |
 | SmolLM2 30 layers, 32 prompt + 20 decode | 116,937,992 | 80.97% | 2.00% | 14.03% | 0.463% | 0.276% | 2.250% |
+| SmolLM2 30 layers, the demo (37 prompt + 8 decode) | 96,655,010 | 80.24% | 2.03% | 14.61% | 0.484% | 0.288% | 2.348% |
+| Qwen 24 layers, the demo (36 prompt + 8 decode) | 283,190,917 | 91.34% | 1.07% | 6.48% | 0.099% | 0.097% | 0.911% |
 
 `BUSY` equals `CYCLES` in every run here, so each share is a share of the whole
 run. The vector unit's is the `STALL_VPU` column: 6.1% of the Qwen demo run and
@@ -140,31 +145,109 @@ between 0.02% and 0.28% across these runs.
 
 | Run | Counted cycles | Clock cycles | Wall clock, median | Range, n |
 |---|---|---|---|---|
-| Qwen 2 layers, 36-token prompt + 1 decode (`make perf`) | 20,736,018 | 20,737,602 | **7.544 s** | 7.434 - 7.811, n=9 |
-| Qwen 24 layers, 32 prompt + 20 decode | 358,570,293 | 358,572,537 | **126.015 s** | 125.126 - 126.271, n=3 |
-| Qwen 24 layers, 4 prompt + 1 decode | 26,846,758 | 26,846,934 | 9.365 s | 9.299 - 9.418, n=9 |
-| SmolLM2 30 layers, 32 prompt + 20 decode | 116,937,992 | 116,940,236 | 41.313 s | 41.215 - 41.347, n=3 |
-| SmolLM2 30 layers, 8 prompt + 4 decode | 24,977,368 | 24,977,852 | 8.756 s | 8.721 - 8.811, n=9 |
-| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 18,072,985 | 6.401 s | 6.300 - 6.500, n=9 |
-| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 216,440,385 | 76.176 s | 75.901 - 76.329, n=3 |
+| Qwen 2 layers, 36-token prompt + 1 decode (`make perf`) | 20,736,018 | 20,737,746 | **7.544 s** | 7.434 - 7.811, n=9 |
+| Qwen 24 layers, 32 prompt + 20 decode | 358,570,293 | 358,572,741 | **127.722 s** | 125.519 - 129.071, n=3 |
+| Qwen 24 layers, the demo (36 prompt + 8 decode) | 283,190,917 | 283,192,981 | **102.288 s** | 101.653 - 102.505, n=3 |
+| SmolLM2 30 layers, the demo (37 prompt + 8 decode) | 96,655,010 | 96,657,122 | **34.822 s** | 34.776 - 35.107, n=3 |
+| Qwen 24 layers, 4 prompt + 1 decode | 26,846,758 | 26,846,950 | 9.365 s | 9.299 - 9.418, n=9 |
+| SmolLM2 30 layers, 32 prompt + 20 decode | 116,937,992 | 116,940,440 | 41.313 s | 41.215 - 41.347, n=3 |
+| SmolLM2 30 layers, 8 prompt + 4 decode | 24,977,368 | 24,977,896 | 8.756 s | 8.721 - 8.811, n=9 |
+| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 18,073,125 | 6.401 s | 6.300 - 6.500, n=9 |
+| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 216,440,525 | 76.176 s | 75.901 - 76.329, n=3 |
 
-Three of those rows are reference points rather than one-off measurements: the
-Qwen 32 + 20 demo the configuration was chosen by, and the Qwen 4 + 1 and
-SmolLM2 8 + 4 shapes, which are what a run sized to a CI budget costs. The
-nightly end-to-end jobs run each image's own prompt instead, plus one generated
-token on Qwen and four on SmolLM2 (`.github/workflows/nightly.yml`).
+The two demo rows are what `make demo-qwen` and `make demo` run, and the wall
+clock beside them is the harness clock loop inside the run; the section below
+carries the whole command, from the checkpoint. Four more rows are reference
+points rather than one-off measurements: the Qwen 32 + 20 shape the
+configuration was chosen by with the SmolLM2 run of the same shape beside it,
+and the Qwen 4 + 1 and SmolLM2 8 + 4 shapes, which are what a run sized to a CI
+budget costs. The nightly end-to-end jobs run each image's own prompt instead,
+plus one generated token on Qwen and four on SmolLM2
+(`.github/workflows/nightly.yml`).
 
 ```sh
 make perf                                                     # the first row
 make perf PERF_ARGS="--max-new 0"                             # prefill tokens only
-IDS=$(tr '\n' ',' < build/images/qwen2.5-0.5b-instruct/prompt.tokens | sed 's/,$//' | cut -d, -f1-32)
-make perf IMAGE=build/images/qwen2.5-0.5b-instruct \
-  PERF_ARGS="--max-new 20 --prompt-ids $IDS --eos 999999999"
+
+# The prompt an image was compiled with, cut to the length a row names.
+ids() { tr '\n' ',' < "$1/prompt.tokens" | sed 's/,$//' | cut -d, -f1-"$2"; }
+QWEN=build/images/qwen2.5-0.5b-instruct
+SMOL=build/images/smollm2-135m-instruct
+
+make perf IMAGE=$QWEN PERF_ARGS="--max-new 20 --prompt-ids $(ids $QWEN 32) --eos 999999999"
+make perf IMAGE=$QWEN PERF_ARGS="--max-new 1 --prompt-ids $(ids $QWEN 4) --eos 999999999"
+make perf IMAGE=$SMOL PERF_ARGS="--max-new 20 --prompt-ids $(ids $SMOL 32) --eos 999999999"
+make perf IMAGE=$SMOL PERF_ARGS="--max-new 4 --prompt-ids $(ids $SMOL 8) --eos 999999999"
 ```
 
-`--eos 999999999` is an id the vocabulary does not contain, so the loop runs its
-full twenty tokens whatever the model generates, and the run is a fixed 32 + 20
-shape.
+`--eos 999999999` is an id the vocabulary does not contain, so a loop runs its
+full length whatever the model generates and every row above is the fixed shape
+its command names.
+
+### The demo
+
+`make demo` is the whole pipeline in one command (`scripts/demo.sh`): it syncs
+the Python environment, fetches the checkpoint from the Hugging Face Hub,
+quantizes it to int8, compiles `image.bin` and the two descriptor programs,
+builds the Verilator harness and runs the model on `qcore_top`, printing every
+token as it leaves the hardware with the cycles it cost and the share of them
+the MAC array was active in. `quettos demo-report` finishes it: every file
+`layout.json` carries a SHA-256 for, hashed again and held to it; the prompt the
+run was given, held to the ids the image was compiled with; the ids against the
+golden model's recorded continuation; the four counters a clean run leaves at
+zero; the cycle and utilization table; and the seconds every stage took. Any
+counter that should be zero and is not fails the command, and so does an id the
+record does not carry (`docs/VERIFICATION.md`, layer 5).
+
+`make demo` runs SmolLM2-135M-Instruct and `make demo-qwen`
+Qwen2.5-0.5B-Instruct. Both generate from `prompts/chat_short.json` until the
+model's own end-of-sequence id, which is eight tokens on each, and both print
+`The capital of France is Paris.<|im_end|>` -- the same text, id for id, that
+the integer golden model recorded in `models/<name>/expected_tokens.json`.
+
+| Stage | SmolLM2, median (range) | Qwen, median (range) |
+|---|---|---|
+| `uv sync --frozen --inexact` | 0.01 s | 0.01 s |
+| `quettos download` | 0.34 s (0.31 - 0.35) | 0.33 s (0.33 - 0.34) |
+| `quettos quantize` | 1.38 s (1.36 - 1.39) | 3.06 s (3.06 - 3.10) |
+| `quettos compile` | 0.52 s (0.51 - 0.52) | 0.93 s (0.92 - 0.94) |
+| harness build | 1.59 s (1.58 - 1.61) | 1.61 s (1.60 - 1.61) |
+| the run on `qcore_top` | 35.09 s (34.99 - 35.37) | 102.53 s (101.92 - 102.81) |
+| **end to end** | **38.91 s** (38.84 - 39.21) | **108.47 s** (107.87 - 108.79) |
+
+n=3 each, and the run itself times every stage and prints the table. Each run
+started cold: `build/quant/<name>.npz`, `build/images/<name>` and
+`build/verilator` were removed before it, so the quantizer, the compiler and
+Verilator all did their work again. The checkpoint and the uv cache were already
+on the machine, which is what those two rows measure; a first clone pays the Hub
+fetch once, 269,060,552 B of `model.safetensors` for SmolLM2 and 988,097,824 B
+for Qwen.
+
+The RTL is most of both runs -- 35.09 s of the 38.91 s and 102.53 s of the
+108.47 s -- and what it produced is in the two demo rows above: 96,655,010
+cycles at 80.24% `MAC_ACTIVE` and 52.15 read bytes per cycle for SmolLM2,
+283,190,917 at 91.34% and 58.94 for Qwen, with `SAT_REQ`, `SAT_VPU`,
+`ERR_SHIFT` and `ERR_BOUNDS` all zero. The prefill and decode halves are
+separate rows of the summary the run prints:
+
+| Run | Pass | Tokens | Cycles | Cycles per token | `MAC_ACTIVE` | Read bytes per cycle |
+|---|---|---|---|---|---|---|
+| SmolLM2 30 layers | prefill | 36 | 76,071,582 | 2,113,099 | 79.56% | 51.70 |
+| SmolLM2 30 layers | decode | 8 | 20,583,428 | 2,572,928 | 82.76% | 53.80 |
+| Qwen 24 layers | prefill | 35 | 216,438,845 | 6,183,967 | 90.86% | 58.62 |
+| Qwen 24 layers | decode | 8 | 66,752,072 | 8,344,009 | 92.92% | 59.98 |
+
+The cycles column is the sum of those tokens' own counts and the one beside it
+is that sum over the token count; the per-token records `perf.json` keeps carry
+the steps a position costs, which **The cost of one token** above measures.
+
+```sh
+make demo                     # SmolLM2-135M-Instruct, checkpoint to text
+make demo-qwen                # Qwen2.5-0.5B-Instruct, the same command
+make demo MODEL=qwen MAX_NEW=4        # fewer decode steps
+make demo DEMO_ARGS="--fresh"         # quantize and compile again
+make demo DEMO_ARGS="-- --lat 200"    # flags after -- go to the harness run
+```
 
 ### Simulation rate
 
@@ -173,14 +256,16 @@ shape.
 | Demo, `--threads 1` | decode token, 2 layers | **2.754** | 2.679 - 2.787, n=9 |
 | Demo, `--threads 1` | decode token, 24 layers | 2.803 | 2.707 - 2.829, n=9 |
 | Demo, `--threads 1` | 36-token prompt + 1 decode | 2.749 | 2.655 - 2.789, n=9 |
-| Demo, `--threads 1` | 32 prompt + 20 decode, 24 layers | 2.845 | 2.840 - 2.866, n=3 |
+| Demo, `--threads 1` | 32 prompt + 20 decode, 24 layers | 2.807 | 2.778 - 2.857, n=3 |
+| Demo, `--threads 1` | the demo run, 24-layer Qwen | 2.769 | 2.763 - 2.786, n=3 |
+| Demo, `--threads 1` | the demo run, 30-layer SmolLM2 | 2.776 | 2.753 - 2.779, n=3 |
 | Demo, `--threads 4` | decode token, 2 layers | 0.395 | 0.392 - 0.397, n=9 |
 | `WB=128`, `--threads 1` | decode token, 2 layers | 0.971 | 0.892 - 0.976, n=9 |
 
 Every set is consecutive runs of one command on an otherwise idle machine.
 
 `--threads 4` is **7.0x slower than one thread**, and the cycle count is
-identical to the bit (2,662,993 clock cycles either way), so the threaded build
+identical to the bit (2,662,997 clock cycles either way), so the threaded build
 is deterministic and functionally the same run. The design is far too small for Verilator's MTask partitioning; per-`eval`
 thread synchronization dominates. **`--threads 1` is the default.**
 
@@ -233,14 +318,17 @@ there because the RTL supports it, not because it simulates faster.
 
 **Locked: `WB=64, B_MAX=1, VL=4, VSRAM_WORDS=4096, FIFO_BEATS=128, ACC_W=40`,
 Verilator `--threads 1`.** This is the configuration `make synth` reports and
-the one `make perf` runs.
+the one `make perf` and `make demo` run.
 
 The rule the configuration was chosen by: *if Qwen 32+20 takes 8 minutes or less
 at `WB=64`, that is the demo configuration and the synthesized configuration.*
-Measured on the complete core, every descriptor executing: **126.0 s, two
-minutes, against a budget of eight.** Eight minutes over 358,570,293 cycles is
-0.747 Mcycles/s; the measured 2.845 is 3.8x above it, so the design would have
-to become nearly four times more expensive per cycle to change the answer.
+Measured again on the complete core with every descriptor executing:
+**127.722 s, two minutes, against a budget of eight** (125.519 - 129.071, n=3,
+358,570,293 counted cycles in every run). Eight minutes over 358,570,293 cycles
+is 0.747 Mcycles/s; the measured 2.807 is 3.8x above it, so the design would
+have to become nearly four times more expensive per cycle to change the answer.
+The command the project ships is shorter still: `make demo-qwen` takes the
+checkpoint to the text in 108.47 s, of which 102.288 s is the RTL.
 
 `WB=128` stays the same-RTL fallback at both the width and the value level, and
 the tiny configuration `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048` is what the
@@ -268,18 +356,22 @@ make regen-prefix IMAGE=build/images/qwen2.5-0.5b-instruct
 
 `sim/verilator/` is the host side of the machine: the clock loop, the QMEM
 memory model, the CSR driver, the prefill/decode loop, the bring-up run, token
-printing and the counter output. It drives `rtl/qcore_top.sv` over the top's two
-ports and nothing else. `make harness` builds it, `make perf` runs it on `IMAGE`
-and writes `build/perf/perf.json`, and `make bringup` runs the RTL-vs-simulator
+printing and the counter output. It drives `rtl/qcore_top.sv` over the top's
+two ports, plus the two row backdoors `device.hpp` opens for a bring-up run:
+the VSRAM words a descriptor wrote and the SREG bank `--sreg` loads.
+`make harness` builds it, `make perf` runs it on `IMAGE` and writes
+`build/perf/perf.json`, `make demo` builds an image from the checkpoint and
+then runs the same loop on it, and `make bringup` runs the RTL-vs-simulator
 comparison.
 
 - **Memory model** (`mem_model.hpp`): the ports and the timing described under
   the protocol above. A read takes its bytes when the request is accepted and
   holds them in the pending beat, so a write accepted while the burst is in
-  flight cannot change what the burst returns and a missing fence shows up as a
-  value difference. It follows the same drive-and-sample discipline as
-  `sim/cocotb/qc_qmem.py`, which snapshots a beat the same way, so the bus the
-  C++ presents and the bus the cocotb tests present are the same bus.
+  flight leaves the returned data alone: memory the core has not fenced against
+  returns what was there at the request. It follows the same drive-and-sample
+  discipline as `sim/cocotb/qc_qmem.py`, which snapshots a beat the same way,
+  so the bus the C++ presents and the bus the cocotb tests present are the same
+  bus.
 - **CSR driver** (`csr.hpp`): `CsrBus` performs every host operation over the
   `csr_*` port with the one-cycle read latency of `docs/RTL.md` 3.3, one clock
   per operation; `CsrFile` is the same register table in C++. `make harness-csr`
@@ -289,8 +381,12 @@ comparison.
   prints its id, its cycle count and its MAC utilization, and the tokens stream
   out as UTF-8 from `tokens.bin` with multi-byte characters held until they are
   complete. `--step` runs one descriptor per `CTRL.STEP` and `--dump-ops`
-  writes the VSRAM range, scale registers, memory regions and CSRs that each
-  descriptor's `dump_plan.json` entry names.
+  writes, after each one, the VSRAM range, the scale registers, the memory
+  regions and the CSRs that its `dump_plan.json` entry names, plus
+  `DESCRIPTORS`, `MACS`, `WT_BYTES` and the four event counters since the
+  token's first descriptor. A memory region travels as its FNV-1a hash, and as
+  its bytes when `--dump-bytes N` covers it. A plan entry naming something that
+  is no register of the CSR window stops the run.
 - **Bring-up run** (`bringup.hpp`, `--program FILE --program-addr N`): a
   descriptor blob of the caller's own, loaded into the copy-on-write image and
   run from `PC = N`. `--sreg B:I=WORD` loads a scale register before the run,
@@ -308,25 +404,41 @@ comparison.
   model and the port width that produced it. `make regen-prefix` writes one.
 - **What `perf.json` records.** The counters and events, the memory model's own
   counts, the per-token records, the build widths, and a `run` object that says
-  how the run was taken: `lat`, `bw_div`, `max_new`, `step`, `status`, and on a
-  run that stopped early `stop_reason`, `fault`, `fault_op` and `fault_pc`. A
-  number is therefore never separated from the conditions it was measured
-  under.
+  how the run was taken: `lat`, `bw_div`, `max_new`, `step`, `status`,
+  `clock_cycles`, `wall_seconds` and `mcycles_per_s`, the `image` the hardware
+  executed with the `image_bytes` the memory model mapped of it, the `prompt`
+  ids with the file they were read from, and on a run that stopped early
+  `stop_reason`, `fault`, `fault_op` and `fault_pc`. A number is therefore read
+  back beside the image, the prompt and the settings that produced it, which is
+  what `quettos demo-report` holds a finished run to.
 - **End-of-sequence ids.** `layout.json` carries the compiled model's own
   `model.eos_ids` and the harness stops on them; `--eos` overrides the list.
 - **What it asserts.** `BUSY` equals the sum of the six exclusive buckets;
-  `WT_BYTES` and `MACS` equal `layout.json`'s traffic model for every token that
-  runs a program to its `HALT`, including the POS-derived attention terms;
-  `RD_BYTES` equals `RD_BEATS * WB`; the write counters equal the memory model's
-  own counts and `RD_BEATS` trails it by at most the fetch unit's two
-  outstanding bursts per token; and a run fails on any `SAT_*` or `ERR_*` event
-  unless `--allow-sat` is given. Every run on this page reported
+  every token retires its program's whole descriptor count, and `WT_BYTES` and
+  `MACS` then equal `layout.json`'s traffic model, including the POS-derived
+  attention terms; `RD_BYTES` equals `RD_BEATS * WB`; the write counters equal
+  the memory model's own counts and `RD_BEATS` trails it by at most the fetch
+  unit's two outstanding bursts per token; and a run fails on any `SAT_*` or
+  `ERR_*` event unless `--allow-sat` is given, the events summed per token
+  because `START` clears them. Every run on this page reported
   `SAT_REQ=0 SAT_VPU=0 ERR_SHIFT=0 ERR_BOUNDS=0`.
+- **What it refuses.** Before the first cycle: a `layout.json` compiled for
+  another `WB` or another `ISA_VERSION`, an `image.bin` whose size is not the
+  one that `layout.json` describes, a model whose `ISA_VERSION` register is not
+  the harness table's, and `--threads` or `--trace` the linked model was not
+  built for. From the command line: `--program` without `--program-addr`,
+  `--sreg` / `--dump-vsram` / `--dump-mem` / `--at` outside a `--program` run,
+  and a bank, a scale-register index or a VSRAM range outside the built widths.
+  Each is an error naming both values, so a run is the one its files describe or
+  no run at all. `--max-cycles N` ends a run that outlives its budget, with
+  `stop_reason` in the record.
 - **Build caching.** The object directory is `build/verilator/<top>-<hash>`,
   where the hash covers `rtl/*.sv`, `rtl/*.svh`, the `rtl/gen/*.hex` lookup-table
   images that `$readmemh` loads into the ROMs, the C++ and the configuration, so
   an unchanged tree relinks nothing and an include-only or table-only edit still
-  rebuilds. `TRACE=1` adds `--trace` and enables `--trace FILE`.
+  rebuilds. `TRACE=1` adds `--trace` and enables `--trace FILE`, and
+  `--trace-cycles N` closes the file after `N` cycles and lets the run carry on
+  to its `HALT`, so the window is what sets the file size.
 
 ## Measured against the ISA simulator
 
@@ -334,15 +446,16 @@ comparison.
 four-descriptor bring-up program of `docs/ISA.md`, the eight-descriptor
 directed vector program, the attention step of the compiled `decode.prog` and
 the whole decoder layer, the last two at six positions on one machine, over
-random tiny models, on `qcore_top` and on `sw/quettos/isa_sim.py`, comparing
-every VSRAM element, SREG word, dumped logit, KV byte, CSR and PERF counter
-after every descriptor.
+random tiny models, on `qcore_top` and on `sw/quettos/isa_sim.py`, comparing,
+after every descriptor, every VSRAM element, every SREG word, every dumped
+logit, every KV byte, `PC`, `STATUS`, the ARGMAX registers, the four event
+counters and `DESCRIPTORS` / `MACS` / `WT_BYTES`.
 
 | Run | Result | Wall clock, median, cold | Range, n |
 |---|---|---|---|
 | `make bringup` -- 2 shapes at WB=16, 2 tokens, four programs | **16/16 match** | 11.83 s | 11.82 - 12.08, n=5 |
 | `make bringup-sweep` -- 5 shapes at WB=64 and WB=128, 2 tokens, four programs | **80/80 match** | 47.83 s | 47.54 - 47.93, n=3 |
-| `uv run pytest -q sw/tests/test_bringup.py` (WB 16 and 64) | 38 passed | 32.38 s | 32.25 - 32.55, n=3 |
+| `uv run pytest -q sw/tests/test_bringup.py` (WB 16 and 64) | 44 passed | 37.29 s | 35.71 - 38.60, n=3 |
 
 Cold means `build/verilator` was removed before each run, so each figure
 includes the Verilator builds the run needs -- one at `WB=16`, two more for the
@@ -399,9 +512,10 @@ measurement with 3.8x to spare.
 - CI runs on `ubuntu-latest` (4 vCPU, no Apple silicon) with the same flags, so
   expect several times slower per cycle there. At five times slower the
   SmolLM2 8 + 4 shape above is an **estimate**d 44 s of simulation, well inside
-  a 15-minute budget.
+  a 15-minute budget, and the whole SmolLM2 demo the `demo-smollm2` job runs is
+  an **estimate**d three minutes of simulation inside a 30-minute timeout.
 - `--threads` results were taken on macOS without core pinning; the direction
   is unambiguous at every run count.
-- FPGA throughput is a separate derivation from these cycle counts at a stated
-  clock and memory bandwidth, and belongs with the synthesis numbers in
-  `syn/reports/`.
+- FPGA throughput is a separate derivation from these cycle counts, at a clock
+  a place-and-route timing result supplies and a stated memory bandwidth, and
+  belongs with the synthesis numbers in `syn/reports/`.
