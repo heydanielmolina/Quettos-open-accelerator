@@ -19,12 +19,17 @@ the gitignored build/ directory. The models used are:
     Copyright Hugging Face. Licensed under the Apache License, Version 2.0.
     https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct
 
-Evaluation data (not redistributed; downloaded on demand, used only for quality
-measurement and never shipped in any artifact):
+Evaluation data (not redistributed; downloaded on demand into the gitignored
+build/ directory, used only for quality measurement and never shipped in any
+artifact):
 
   * WikiText-2 (Merity, Xiong, Bradbury, Socher, 2016)
-    Licensed under Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0).
-    https://huggingface.co/datasets/Salesforce/wikitext
+    Text extracted from English Wikipedia, under Creative Commons
+    Attribution-ShareAlike terms: the dataset card records CC BY-SA 3.0 and the
+    GFDL in its metadata and CC BY-SA 4.0 in its licensing section.
+    Archive fetched by `uv run quettos corpus` (sw/quettos/corpus.py):
+    https://wikitext.smerity.com/wikitext-2-raw-v1.zip
+    Dataset card: https://huggingface.co/datasets/Salesforce/wikitext
 
 --------------------------------------------------------------------------------
 Derived artifacts
@@ -37,7 +42,17 @@ the source weights:
 
   * models/<model>/calib.json          (calibration maxima and per-class formats)
   * models/<model>/expected_tokens.json (greedy tokens produced by the integer golden model)
+  * models/<model>/quality.json        (the measured quality of the integer model
+                                        against the float32 reference)
   * the tool-call prefix KV-cache release asset (`make regen-prefix`)
 
 Per-model layout.json, program.lst and sha256 files describe the compiled image
 and are derived from the same weights.
+
+The held-out rows of quality.json are measurements over WikiText-2 as well as
+over the weights. That file carries per-window statistics -- top-1 agreement,
+KL, NLL and perplexity -- beside the SHA-256 of the archive, of the member read
+out of it and of the token ids scored, and it carries no text and no token ids
+from the corpus; the archive itself stays in the gitignored build/corpus/ and
+is redistributed neither here nor as a release asset. WikiText-2 is credited
+above, as its Attribution-ShareAlike terms ask.

@@ -995,7 +995,7 @@ async def test_stall_bucket_invariant(dut):
 
 
 @cocotb.test()
-async def test_the_issue_cycle_of_a_gemv_is_stall_mem(dut):
+async def test_issue_cycle_of_a_gemv_is_stall_mem(dut):
     """The stream re-evaluates stream_done at the command pulse, so on the issue cycle the level
     still belongs to the descriptor before it; the new one is waiting for its first beat."""
     env, _ = await setup(dut, wb=WB, gemv_beats=6, gemv_drain=5)
@@ -1024,7 +1024,7 @@ async def test_the_issue_cycle_of_a_gemv_is_stall_mem(dut):
 
 
 @cocotb.test()
-async def test_a_fault_declares_done_only_after_the_writes_land(dut):
+async def test_fault_declares_done_after_the_writes_land(dut):
     """A fault stops the program at once and waits on the write fence before DONE, as HALT does."""
     env, _ = await setup(dut, wb=WB)
     env.wr_idle = 0
@@ -1048,7 +1048,7 @@ async def test_a_fault_declares_done_only_after_the_writes_land(dut):
 
 
 @cocotb.test()
-async def test_an_abort_declares_done_only_after_the_writes_land(dut):
+async def test_abort_declares_done_after_the_writes_land(dut):
     """ABORT stops issuing at once; DONE waits for the writes of the descriptor that retired."""
     env, _ = await setup(dut, wb=WB, kv_cycles=8)
     env.wr_idle = 0
@@ -1129,7 +1129,7 @@ async def test_abort_at_every_point_of_a_descriptor_setup(dut):
 
 
 @cocotb.test()
-async def test_the_prefetch_takes_the_write_fence(dut):
+async def test_prefetch_takes_the_write_fence(dut):
     """fetch_hold holds the descriptor prefetch exactly while a write is unacknowledged."""
     env, _ = await setup(dut, wb=WB)
     for idle in (1, 0, 1, 0):
@@ -1159,7 +1159,7 @@ CAPPED_GEMV = isa.Descriptor(
 
 
 @cocotb.test()
-async def test_an_unexecuted_descriptor_counts_no_bounds_event(dut):
+async def test_unexecuted_descriptor_counts_no_bounds_event(dut):
     """ERR_BOUNDS follows the descriptors the core commits to, not the ones an ABORT discards."""
     env, _ = await setup(dut, wb=WB)
     env.pos = 2047
@@ -1211,7 +1211,7 @@ async def test_an_unexecuted_descriptor_counts_no_bounds_event(dut):
 
 
 @cocotb.test()
-async def test_a_zero_work_descriptor_still_counts_its_bounds_event(dut):
+async def test_zero_work_descriptor_counts_its_bounds_event(dut):
     """A capped VSOFTMAX with n == 0 retires without an issue and still counts its clamped len."""
     env, _ = await setup(dut, wb=WB)
     env.pos = 2047
@@ -1231,7 +1231,7 @@ async def test_a_zero_work_descriptor_still_counts_its_bounds_event(dut):
 
 
 @cocotb.test()
-async def test_a_stepped_descriptor_halts_on_the_write_fence(dut):
+async def test_stepped_descriptor_halts_on_the_write_fence(dut):
     """STEP_HALTED waits on the same write fence every other stop takes."""
     env, _ = await setup(dut, wb=WB, kv_cycles=6)
     kv = next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE)
@@ -1257,7 +1257,7 @@ async def test_a_stepped_descriptor_halts_on_the_write_fence(dut):
 
 
 @cocotb.test()
-async def test_a_step_an_abort_cuts_short_ends_on_done(dut):
+async def test_step_an_abort_cuts_short_ends_on_done(dut):
     """An ABORT written during a step ends the run on the fence with DONE, not STEP_HALTED."""
     env, _ = await setup(dut, wb=WB, kv_cycles=8)
     kv = next(d for d in every_opcode() if d.opcode == Opcode.KVWRITE)

@@ -22,6 +22,7 @@
 #include "device.hpp"
 #include "json.hpp"
 #include "perf.hpp"
+#include "prefix.hpp"
 
 namespace qcore {
 namespace {
@@ -86,6 +87,14 @@ struct Run {
   std::string prompt_from;
   std::string image_path;
   uint64_t image_bytes = 0;
+  // The prefix this run restored and the one it saved, and the token fed in at
+  // every position the machine has consumed -- the restored ones first, then
+  // this run's own, in position order. That list is what the saved file is
+  // held to when it is restored (prefix.hpp).
+  std::string prefix_in;
+  std::string prefix_out;
+  std::vector<uint32_t> covered;
+  uint32_t restored = 0;
   // What the counters read before this token's first descriptor. START clears
   // them, so the base is zero on the token path; STEP clears none of them
   // (docs/ISA.md, CTRL), so a stepped token's cost is measured from here.
@@ -379,6 +388,17 @@ void write_perf_json(const Options& o, const Layout& layout, const Machine& m, c
   // one (sw/quettos/cli.py, demo-report).
   j.kv_s("image", run.image_path);
   j.kv("image_bytes", run.image_bytes);
+  // The prefix the run restored and the one it left: how many leading
+  // positions came out of a file rather than out of this run's own prefill,
+  // which is what a reader needs to hold the token records to the prompt
+  // (sw/quettos/cli.py, demo-report).
+  j.key("prefix");
+  j.open('{');
+  j.kv("restored", static_cast<uint64_t>(run.restored));
+  j.kv_s("from", run.prefix_in);
+  j.kv_s("to", run.prefix_out);
+  j.kv("positions", static_cast<uint64_t>(run.covered.size()));
+  j.close('}');
   j.key("prompt");
   j.open('{');
   j.kv_s("from", run.prompt_from);
@@ -448,15 +468,6 @@ int main_impl(int argc, char** argv) {
   if (bytes.size() != layout.image_size) {
     throw std::runtime_error(layout.image_path() + " is " + std::to_string(bytes.size()) +
                              " B; layout.json describes " + std::to_string(layout.image_size));
-  }
-  if (!o.kv_load.empty()) {
-    FILE* f = fopen(o.kv_load.c_str(), "rb");
-    if (f == nullptr) throw std::runtime_error("cannot open " + o.kv_load);
-    std::vector<uint8_t> buf(static_cast<size_t>(layout.kv_size));
-    size_t n = fread(buf.data(), 1, buf.size(), f);
-    fclose(f);
-    bytes.write(layout.kv_base, static_cast<uint32_t>(n), buf.data());
-    printf("kv: loaded %llu bytes from %s\n", (unsigned long long)n, o.kv_load.c_str());
   }
 
   VerilatedContext ctx;
@@ -549,9 +560,48 @@ int main_impl(int argc, char** argv) {
   run.prompt_from = prompt_from;
   run.image_path = real_path(layout.image_path());
   run.image_bytes = bytes.size();
+
+  // --- the prefix this run starts from, if it was given one. The file carries
+  // the KV region and what it belongs to; verify_prefix holds every term of
+  // that record to this run, so a file that does not belong to it stops the
+  // run here rather than being restored into the wrong machine. What it covers
+  // is what this run does not recompute: the token loop starts at the first
+  // position after it.
+  size_t first = 0;
+  if (!o.kv_load.empty()) {
+    std::vector<uint8_t> kv;
+    PrefixHeader h = read_prefix(o.kv_load, &kv);
+    verify_prefix(h, layout, prompt, o.kv_load);
+    bytes.write(layout.kv_base, static_cast<uint32_t>(kv.size()), kv.data());
+    first = h.positions();
+    run.restored = h.positions();
+    run.prefix_in = real_path(o.kv_load);
+    run.covered.assign(h.ids.begin(), h.ids.end());
+    if (!o.quiet) {
+      printf("prefix: restored %u positions and %llu KV bytes from %s\n", h.positions(),
+             (unsigned long long)kv.size(), o.kv_load.c_str());
+    }
+  }
+  // The prefill extent: every prompt id but the last, which the decode pass
+  // consumes -- or the first --prefix-len of them, which is a run that computes
+  // a prefix and stops.
+  size_t last = prompt.size() - 1;
+  if (o.prefix_len != 0) {
+    if (o.prefix_len > prompt.size()) {
+      throw std::runtime_error("--prefix-len " + std::to_string(o.prefix_len) +
+                               " is longer than the " + std::to_string(prompt.size()) +
+                               "-id prompt");
+    }
+    if (o.prefix_len <= first) {
+      throw std::runtime_error("--prefix-len " + std::to_string(o.prefix_len) +
+                               " is inside the " + std::to_string(first) +
+                               " positions " + o.kv_load + " already carries");
+    }
+    last = o.prefix_len;
+  }
   if (!o.quiet) {
-    printf("prompt: %zu tokens from %s, max_new=%d\n", prompt.size(), prompt_from.c_str(),
-           o.max_new);
+    printf("prompt: %zu tokens from %s, prefill %zu..%zu, max_new=%d\n", prompt.size(),
+           prompt_from.c_str(), first, last == 0 ? 0 : last - 1, o.max_new);
   }
 
   TokenStream out(&run.vocab, stdout);
@@ -562,7 +612,7 @@ int main_impl(int argc, char** argv) {
   Events ev_total;
   int rc_counters = 0;
   int index = 0;
-  for (size_t i = 0; i + 1 < prompt.size() && run.ok; i++) {
+  for (size_t i = first; i < last && run.ok; i++) {
     run.run_token(layout.prefill, "prefill", static_cast<uint32_t>(prompt[i]),
                   static_cast<uint32_t>(i));
     // START clears the counters, so a token's snapshot is that token's cost.
@@ -576,6 +626,7 @@ int main_impl(int argc, char** argv) {
     total = total.plus(now);
     ev_total = ev_total.plus(run.events());
     run.tokens.push_back(rec);
+    run.covered.push_back(rec.in_id);
     rc_counters |= check_token(layout, now, false, rec.pos, layout.prefill.descriptors);
     if (!o.quiet) {
       printf("prefill %zu: pos=%zu cycles=%llu mac=%.1f%% descriptors=%llu\n", i, i,
@@ -586,6 +637,10 @@ int main_impl(int argc, char** argv) {
 
   uint32_t tok = static_cast<uint32_t>(prompt.back());
   uint32_t pos = static_cast<uint32_t>(prompt.size() - 1);
+  // The generated text gets the terminal to itself, a token at a time as the
+  // core produces it. What each token cost is printed under it, once the
+  // sentence is whole.
+  if (!o.quiet && o.max_new > 0) printf("\ngenerated text\n\n");
   for (int jj = 0; jj < o.max_new && run.ok; jj++) {
     int64_t nxt = run.run_token(layout.decode, "decode", tok, pos + static_cast<uint32_t>(jj));
     PerfSnapshot now = run.snapshot();
@@ -599,16 +654,12 @@ int main_impl(int argc, char** argv) {
     total = total.plus(now);
     ev_total = ev_total.plus(run.events());
     run.tokens.push_back(rec);
+    run.covered.push_back(rec.in_id);
     // Every token that ran is held to the traffic model and to the bucket sum,
     // the one that faulted included: it retired fewer descriptors than the
     // program has, which is what check_token reports.
     rc_counters |= check_token(layout, now, true, rec.pos, layout.decode.descriptors);
     if (nxt < 0) break;
-    if (!o.quiet) {
-      printf("[token %d pos=%u id=%lld cycles=%llu mac=%.1f%%] ", jj, rec.pos,
-             (long long)nxt, (unsigned long long)rec.delta[PERF_CYCLES],
-             100.0 * rec.delta.mac_utilization());
-    }
     out.push(static_cast<uint32_t>(nxt));
     bool stop = false;
     for (int64_t e : o.eos_ids) stop = stop || e == nxt;
@@ -620,6 +671,21 @@ int main_impl(int argc, char** argv) {
   double seconds = std::chrono::duration<double>(t1 - t0).count();
   uint64_t sim_cycles = m.cycles() - cycles0;
   printf("\n");
+
+  // What every generated token cost, in the shape of the prefill lines above.
+  if (!o.quiet) {
+    int step = 0;
+    for (const TokenRecord& r : run.tokens) {
+      if (!r.decode || r.out_id < 0) continue;
+      if (step == 0) printf("\n");
+      printf("decode %d: pos=%u id=%lld cycles=%llu mac=%.1f%% descriptors=%llu\n", step, r.pos,
+             (long long)r.out_id, (unsigned long long)r.delta[PERF_CYCLES],
+             100.0 * r.delta.mac_utilization(),
+             (unsigned long long)r.delta[PERF_DESCRIPTORS]);
+      step++;
+    }
+    if (step != 0) printf("\n");
+  }
 
   Events ev = ev_total;  // START clears them per token, so the run's events are the sum
   const char* mode = o.step ? "step" : "token";
@@ -681,14 +747,29 @@ int main_impl(int argc, char** argv) {
   if (o.dump_ops) printf("dumps: %llu descriptors into %s\n",
                          (unsigned long long)run.descriptors_dumped, o.dump_dir.c_str());
 
+  // The prefix this run leaves behind: the KV region as the machine has it,
+  // with the record of what it belongs to. A run that stopped is not a prefix
+  // anyone may restore -- its KV holds however far the faulting token got --
+  // so nothing is written and the run still reports what it found.
   if (!o.kv_save.empty()) {
-    FILE* f = fopen(o.kv_save.c_str(), "wb");
-    if (f != nullptr) {
+    if (rc != 0) {
+      printf("prefix: not saved -- this run did not finish clean, so its KV is not a prefix\n");
+    } else {
+      PrefixHeader h;
+      h.isa_version = ISA_VERSION;
+      h.wb = static_cast<uint32_t>(Build::wb);
+      h.max_ctx = static_cast<uint32_t>(layout.max_ctx);
+      h.kv_base = layout.kv_base;
+      h.kv_size = layout.kv_size;
+      h.model = layout.model_name;
+      h.image_sha256 = layout.image_sha256;
+      h.ids = run.covered;
       std::vector<uint8_t> buf(static_cast<size_t>(layout.kv_size));
       bytes.read(layout.kv_base, static_cast<uint32_t>(buf.size()), buf.data());
-      fwrite(buf.data(), 1, buf.size(), f);
-      fclose(f);
-      printf("kv: wrote %llu bytes to %s\n", (unsigned long long)buf.size(), o.kv_save.c_str());
+      write_prefix(o.kv_save, h, buf.data());
+      run.prefix_out = real_path(o.kv_save);
+      printf("prefix: wrote %u positions and %llu KV bytes to %s\n", h.positions(),
+             (unsigned long long)buf.size(), o.kv_save.c_str());
     }
   }
 

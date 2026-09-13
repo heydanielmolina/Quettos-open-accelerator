@@ -1,9 +1,10 @@
 # Quettos Core CI: three-parser lint, the Python lint and the software tests,
 # the cocotb block tests on the tiny configuration, the bring-up comparison of
-# qcore_top against the ISA simulator, the per-block synthesis, and the demo on
-# the small model, checkpoint to text (docs/VERIFICATION.md layer 8). Every job
-# runs on ubuntu-latest with its own timeout; lint-and-pytest gates the other
-# five.
+# qcore_top against the ISA simulator, the per-block synthesis, the demo on the
+# small model, checkpoint to text, and that same demo from a clone of the commit
+# under test with nothing cached (docs/VERIFICATION.md layers 8 and 9). Every
+# job runs on ubuntu-latest with its own timeout; lint-and-pytest gates the
+# other six.
 #
 # Action versions were checked against the upstream repos on 2026-09-02:
 #   actions/checkout v7, actions/cache v6, astral-sh/setup-uv v10.0.1 (exact tag; it publishes no floating v10),
@@ -227,3 +228,44 @@ jobs:
           key: verilator-wb64-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}-${{ hashFiles('rtl/**/*.sv', 'rtl/**/*.svh', 'rtl/gen/*.hex', 'sim/verilator/**') }}
       - name: The whole pipeline, checkpoint to text on qcore_top
         run: make demo
+
+  # The quick start as a new reader runs it (docs/VERIFICATION.md, layer 9):
+  # scripts/clean-clone.sh clones the commit under test into a directory of its
+  # own and runs `make demo` there with a fresh uv cache and a fresh managed
+  # Python, so the job pays what a first run pays -- the environment from the
+  # index, the checkpoint from the Hub, the quantizer, the compiler, a cold
+  # Verilator build and the whole 30-layer SmolLM2-135M-Instruct on qcore_top --
+  # and holds it to the demo's own verdict. The only thing cached is the tool
+  # suite, which stands for the Verilator a reader installs from their own
+  # package manager: demo-smollm2 above is the same pipeline with the checkpoint
+  # and the object directory paid once, and this job is the same pipeline with
+  # nothing paid in advance. The checkout here is the commit under test with
+  # nothing else in it, so the committed tree the job checks and the tree on
+  # disk are the same tree; on a working copy they are not, and
+  # `make clean-clone-worktree` checks the one on disk -- a file that was never
+  # added, or a package installed by hand, stops the demo there rather than on a
+  # reader's machine.
+  clean-clone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: lint-and-pytest
+    steps:
+      - uses: actions/checkout@v7
+      # No uv cache: the clone syncs its environment from cold, which is the
+      # stage this job exists to measure.
+      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/oss-cad-suite
+          key: oss-cad-suite-${{ runner.os }}-${{ env.OSS_CAD_SUITE_VERSION }}
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: ${{ env.OSS_CAD_SUITE_VERSION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Clone the commit under test and run the quick start in the clone
+        run: make clean-clone
+      - name: The stage wall clocks and the verdict of that run
+        if: always()
+        run: |
+          cat build/clean-clone/smollm2.json 2>/dev/null ||
+            echo "no report: the run stopped before the clone was in place"

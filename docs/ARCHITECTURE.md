@@ -175,9 +175,14 @@ bytes per prompt token on Qwen (LM head share of linear MACs; see
 `MEMORY_MAP.md`).
 
 Prefix reuse: the **harness** copies the KV region byte for byte at its image
-layout (`--kv-save`, `--kv-load`; `make regen-prefix` writes one), so a saved
-file belongs to the model and the port width that produced it, and the host
-restores `POS` alongside it. This is a harness save and restore of the RTL's KV
+layout, behind a record of what those bytes were computed under -- the ISA
+version, `WB`, `MAX_CTX`, the model, the SHA-256 of `image.bin` and the token id
+of every position the file covers (`--kv-save`, `--kv-load`; `make regen-prefix`
+and `make demo-toolcall` write one, and `docs/MEMORY_MAP.md` lays the file out).
+A restore holds every term of that record to the run taking the file and refuses
+it before the first cycle when one differs, then starts the token loop at the
+first position the file does not cover, so the host takes `POS` from the file
+rather than being told it. This is a harness save and restore of the RTL's KV
 state, not a prefix-caching system in hardware.
 
 ## Host / RTL boundary
@@ -215,7 +220,10 @@ write VSRAM mid-token is a design change, not a fix.
   measured perplexity, KL and top-1 delta against fp32 at the tested context
   lengths.
 - **v1 runs a single sequence with heads sequential.** Every headline number
-  runs the full vocabulary with the LM head on the accelerator. The row
-  dimension (`B_MAX`) and KV save/restore across requests are the foundations
-  for batched decode and a paged KV cache; those, constrained decoding and the
-  tool-call demo that shows it off are on the roadmap (`docs/ROADMAP.md`).
+  runs the full vocabulary with the LM head on the accelerator. KV save/restore
+  across requests ships, and `make demo-toolcall` is the demonstration: an agent
+  turn's system-and-tools head computed once on `qcore_top`, restored, and the
+  tool call generated after it (`docs/PERFORMANCE.md`). That and the row
+  dimension (`B_MAX`) are the foundations for a paged KV cache and batched
+  decode, which, with constrained decoding, are on the roadmap
+  (`docs/ROADMAP.md`).

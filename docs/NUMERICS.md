@@ -554,56 +554,134 @@ every position and max |logit difference| 3.3e-4 / 7.6e-4 on Qwen
 
 ## Quality
 
-Measured by `uv run quettos check <alias>` (`sw/quettos/quality.py`), which
-runs the calibration set (the three prompt files under `prompts/` and three
-prose passages of `calibrate.py`, rendered through the chat template)
-teacher-forced through the integer golden model and the float32 reference and
-scores every position that has a next token: top-1 agreement of the argmax,
-mean `KL(p_fp32 || p_int)` from float64 log-softmax, the paired next-token
-NLL difference `NLL_int - NLL_fp32` with its standard error, and the
-perplexities `exp(mean NLL)`. The results, with per-sequence values, are
-written to `models/<name>/quality.json`; the token ids are the ones hashed in
-`calib.json`.
+Two sets, scored the same way, and every row names the text it was scored on.
+`uv run quettos check <alias>` (`sw/quettos/quality.py`) runs the calibration
+set: the three prompt files under `prompts/` and three prose passages of
+`calibrate.py`, rendered through the chat template. `uv run quettos check
+<alias> --heldout` runs 64 non-overlapping windows of 512 tokens cut from the
+start of the WikiText-2 raw test split -- 32,768 tokens of plain prose that the
+calibration run never saw and that the ranges, formats, K-centering rows and
+smoothing factors of the quantizer were not chosen against.
 
-| Model | Config | Tokens | top-1 vs fp32 | mean KL (nats) | delta-NLL +/- SE (nats) | PPL fp32 -> int |
-|---|---|---|---|---|---|---|
-| Qwen2.5-0.5B-Instruct | W8A16 | 1308 | 95.57% (1250) | 0.0124 | +0.0026 +/- 0.0066 | 34.97 -> 35.06 |
-| Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.39% (1130) | 0.110 | +0.0111 +/- 0.0208 | 34.97 -> 35.36 |
-| SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00485 | -0.0023 +/- 0.0030 | 35.91 -> 35.82 |
-| SmolLM2-135M-Instruct | W8A8 | 1175 | 89.19% (1048) | 0.0454 | +0.0302 +/- 0.0113 | 35.91 -> 37.01 |
-| Qwen2.5-0.5B-Instruct | W8A16-nosmooth | 1308 | 93.65% (1225) | 0.0556 | +0.0492 +/- 0.0132 | 34.97 -> 36.73 |
-| Qwen2.5-0.5B-Instruct | W8A8-nosmooth | 1308 | 86.01% (1125) | 0.109 | +0.0302 +/- 0.0242 | 34.97 -> 36.04 |
-| SmolLM2-135M-Instruct | W8A16-nosmooth | 1175 | 95.66% (1124) | 0.00464 | +0.0052 +/- 0.0028 | 35.91 -> 36.09 |
-| SmolLM2-135M-Instruct | W8A8-nosmooth | 1175 | 87.15% (1024) | 0.0468 | -0.0185 +/- 0.0101 | 35.91 -> 35.25 |
+`uv run quettos corpus` fetches `wikitext-2-raw-v1.zip` (4,721,645 B, SHA-256
+`ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11`) into
+`build/corpus/` from `https://wikitext.smerity.com/wikitext-2-raw-v1.zip`, the
+copy the dataset's first author hosts; the dataset is
+[`Salesforce/wikitext`](https://huggingface.co/datasets/Salesforce/wikitext) on
+the Hub, and `NOTICE` carries its attribution and its license.
+`sw/quettos/corpus.py` carries that URL and that hash and checks the hash on
+every read, takes `wikitext-2-raw/wiki.test.raw` (SHA-256
+`173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08`) out of the
+archive with `zipfile`, tokenizes it with the model's own tokenizer and no
+chat template, and cuts the id stream into windows from the start. The
+held-out protocol in `quality.json` records the URL, the archive hash, the
+member hash, the cut and the SHA-256 of the ids themselves, so the windows
+behind a row rebuild byte for byte -- which is what `make provenance`
+(`uv run quettos provenance <alias>`) does, holding every published row to the
+text its own record names without scoring anything
+(`docs/VERIFICATION.md`, layer 6).
+
+Both sets run teacher-forced through the integer golden model and the float32
+reference and score every position that has a next token: top-1 agreement of
+the argmax, mean `KL(p_fp32 || p_int)` from float64 log-softmax, the paired
+next-token NLL difference `NLL_int - NLL_fp32` with its standard error, and
+the perplexities `exp(mean NLL)`. Both land in `models/<name>/quality.json`
+with their per-sequence values: the calibration rows under `rows`, over the
+token ids hashed in `calib.json`, and the held-out rows under `heldout`, over
+the windows their own record names.
+
+**The headline numbers are the held-out rows** -- 32,704 scored positions,
+twenty-five times the Qwen calibration set and twenty-eight times SmolLM2's.
+The calibration rows are in the same table beneath them, and every row says
+which text it belongs to.
+
+| Set | Model | Config | Tokens | top-1 vs fp32 | mean KL (nats) | delta-NLL +/- SE (nats) | PPL fp32 -> int |
+|---|---|---|---|---|---|---|---|
+| held-out | Qwen2.5-0.5B-Instruct | W8A16 | 32704 | 96.65% (31610) | 0.00435 | -0.0037 +/- 0.0006 | 18.59 -> 18.53 |
+| held-out | Qwen2.5-0.5B-Instruct | W8A8 | 32704 | 89.18% (29164) | 0.0414 | +0.0302 +/- 0.0018 | 18.59 -> 19.17 |
+| held-out | SmolLM2-135M-Instruct | W8A16 | 32704 | 96.10% (31429) | 0.00405 | +0.0023 +/- 0.0005 | 23.07 -> 23.12 |
+| held-out | SmolLM2-135M-Instruct | W8A8 | 32704 | 88.66% (28994) | 0.0353 | +0.0311 +/- 0.0016 | 23.07 -> 23.80 |
+| held-out | Qwen2.5-0.5B-Instruct | W8A16-nosmooth | 32704 | 95.08% (31096) | 0.0106 | +0.0038 +/- 0.0010 | 18.59 -> 18.67 |
+| held-out | Qwen2.5-0.5B-Instruct | W8A8-nosmooth | 32704 | 88.94% (29087) | 0.0471 | +0.0327 +/- 0.0020 | 18.59 -> 19.21 |
+| held-out | SmolLM2-135M-Instruct | W8A16-nosmooth | 32704 | 96.09% (31424) | 0.00404 | +0.0018 +/- 0.0005 | 23.07 -> 23.11 |
+| held-out | SmolLM2-135M-Instruct | W8A8-nosmooth | 32704 | 88.70% (29010) | 0.0350 | +0.0284 +/- 0.0016 | 23.07 -> 23.74 |
+| calibration | Qwen2.5-0.5B-Instruct | W8A16 | 1308 | 95.57% (1250) | 0.0124 | +0.0026 +/- 0.0066 | 34.97 -> 35.06 |
+| calibration | Qwen2.5-0.5B-Instruct | W8A8 | 1308 | 86.39% (1130) | 0.110 | +0.0111 +/- 0.0208 | 34.97 -> 35.36 |
+| calibration | SmolLM2-135M-Instruct | W8A16 | 1175 | 95.66% (1124) | 0.00485 | -0.0023 +/- 0.0030 | 35.91 -> 35.82 |
+| calibration | SmolLM2-135M-Instruct | W8A8 | 1175 | 89.19% (1048) | 0.0454 | +0.0302 +/- 0.0113 | 35.91 -> 37.01 |
+| calibration | Qwen2.5-0.5B-Instruct | W8A16-nosmooth | 1308 | 93.65% (1225) | 0.0556 | +0.0492 +/- 0.0132 | 34.97 -> 36.73 |
+| calibration | Qwen2.5-0.5B-Instruct | W8A8-nosmooth | 1308 | 86.01% (1125) | 0.109 | +0.0302 +/- 0.0242 | 34.97 -> 36.04 |
+| calibration | SmolLM2-135M-Instruct | W8A16-nosmooth | 1175 | 95.66% (1124) | 0.00464 | +0.0052 +/- 0.0028 | 35.91 -> 36.09 |
+| calibration | SmolLM2-135M-Instruct | W8A8-nosmooth | 1175 | 87.15% (1024) | 0.0468 | -0.0185 +/- 0.0101 | 35.91 -> 35.25 |
 
 W8A16 is the default (int16 activations into every weight GEMV, int8 K/V
 cache, table-driven nonlinearities, K-centering and the Q/K smoothing fold);
 W8A8 feeds int8 activations to the weight GEMVs with everything else
-unchanged. `sat` and `err_shift` are 0 on every row; the VQUANT and softmax
-clip counts are 243621 / 194390 on Qwen (W8A16 / W8A8) and 171687 / 140157 on
-SmolLM2, and 246540 / 196472 and 169416 / 138576 on the two ablation rows.
+unchanged. `sat` and `err_shift` are 0 on every row of both sets. The VQUANT
+and softmax clip counts over the held-out windows are 6054522 / 4828696 on
+Qwen (W8A16 / W8A8) and 4733603 / 3843359 on SmolLM2, and 6127479 / 4900074
+and 4699953 / 3810364 on the four ablation rows; over the calibration set they
+are 243621 / 194390 on Qwen and 171687 / 140157 on SmolLM2, and 246540 /
+196472 and 169416 / 138576 on its ablation rows.
+
+### What the held-out set says
+
+Scoring on the calibration set did not flatter the quantizer: held out, the
+numbers are better. At W8A16 Qwen goes from 95.57% top-1 and KL 0.0124 on the
+calibration set to 96.65% and 0.00435, and SmolLM2 from 95.66% and 0.00485 to
+96.10% and 0.00405. The calibration set is the harder text of the two --
+ChatML specials, a `<tools>` JSON block and two short prompts, which is where
+the largest per-sequence KL of the whole table sits (0.038 at T = 36 and 0.034
+at T = 180 on Qwen, against 0.0054 to 0.0117 for its four longer sequences;
+SmolLM2 lies between 0.0040 and 0.0080 on all six) -- and WikiText-2 is plain
+prose these models are much more certain about: fp32 perplexity 18.59 and
+23.07 against 34.97 and 35.91. Absolute perplexity moves between the sets; the
+delta beside it does not follow it.
+
+What the larger set buys is resolution. On the calibration set Qwen's W8A16
+delta-NLL was +0.0026 +/- 0.0066, consistent with anything from -0.010 to
++0.015. Over 32,704 held-out positions it is -0.0037 +/- 0.0006 and SmolLM2's
+is +0.0023 +/- 0.0005: both resolved, both under 0.004 nats against an fp32
+NLL of 2.92 and 3.14, and of opposite sign -- W8A16 moves the likelihood of
+the true token by 0.13% of it on Qwen and 0.07% on SmolLM2, in opposite
+directions. W8A8 is resolved as well, and it is a plain loss: +0.0302 +/-
+0.0018 on Qwen and +0.0311 +/- 0.0016 on SmolLM2, with 7.5 and 7.4 points of
+top-1 and 9.5x and 8.7x the KL.
+
+Across the 64 windows, Qwen's W8A16 KL runs from 0.00301 to 0.00557 (median
+0.00435) and its top-1 from 94.72% to 98.04%; SmolLM2's KL from 0.00332 to
+0.00535 (median 0.00398) and its top-1 from 93.74% to 98.24%. The table pools
+those windows, and the protocol block beside the rows records the corpus and
+the cut they came from.
+
+### The Q/K smoothing ablation
 
 The `-nosmooth` rows are the ablation of the fold, built and scored the same
 way as the rest of the table: `uv run quettos quantize <alias>
 --no-qk-smoothing` rebuilds the model with every smoothing factor forced to 1
 and everything else identical (the same `calib.json`, formats, K-centering
 rows, class maxima and program constants), and `uv run quettos check <alias>
---no-qk-smoothing` scores it over the same token ids against the same fp32
-reference. At W8A16 the fold is worth 1.91 points of top-1 and 4.5x in KL on
-Qwen, whose `k_proj` biases are large, and leaves SmolLM2 inside its own noise
-(95.66% either way, KL 0.00485 against 0.00464). At W8A8 the picture changes:
-the fold is worth 0.38 points on Qwen with the KL unmoved (0.110 against
-0.109) and 2.04 points on SmolLM2, because the int8 activation error dominates
-the K-cache error the fold conditions. On Qwen the KL is largest on
-the two short prompts (0.038 per position at T = 36 and 0.034 at T = 180,
-W8A16) while the four longer sequences lie between 0.0054 and 0.0117; on
-SmolLM2 every sequence lies between 0.0040 and 0.0080. The W8A8 rows lose 9.2
-(Qwen) and 6.5 (SmolLM2) points of top-1 and raise the KL about 9x, with
-delta-NLL +0.011 +/- 0.021 and +0.030 +/- 0.011: the int8 activations perturb
-the distribution far more than they shift the likelihood of the true token.
+--no-qk-smoothing`, with `--heldout` for the second set, scores it over the
+same ids against the same fp32 reference.
 
-`sw/tests/test_quality.py` gates SmolLM2 W8A16 on this set at `KL <= 0.02`
-nats and `top-1 >= 93%`, and checks that `quality.json` agrees with a fresh
-evaluation (integers exactly, floats within `2e-3` absolute plus `1e-3`
-relative, the room float32 summation order needs across BLAS libraries); Qwen
-is reported.
+Held out at W8A16, the fold is worth 1.57 points of top-1 and 2.4x in KL on
+Qwen, whose `k_proj` biases are large, and 0.02 points on SmolLM2 -- five
+argmaxes in 32,704, with KL 0.00405 against 0.00404. At W8A8 the int8
+activation error dominates the K-cache error the fold conditions, and it is
+worth 0.24 points on Qwen and -0.05 on SmolLM2, both small beside the seven
+points the narrower activations cost on their own.
+
+Two of those four figures come out differently on the calibration set, which
+reports 1.91 points and 4.5x for Qwen at W8A16 and 2.04 points for SmolLM2 at
+W8A8 where the held-out windows show none. Six sequences of one text do not
+settle an ablation of this size, and the held-out rows are the ones to read.
+
+`sw/tests/test_quality.py` gates SmolLM2 W8A16 at `KL <= 0.02` nats and
+`top-1 >= 93%` on both sets, each measured fresh in the test run: the whole
+calibration set, and the first two held-out windows. It checks that the stored
+`quality.json` agrees with a fresh evaluation -- the calibration rows in full
+(integers exactly, floats within `2e-3` absolute plus `1e-3` relative, the
+room float32 summation order needs across BLAS libraries), and every held-out
+row window by window over the first four windows it names -- and it rebuilds
+the corpus record from the archive and holds the stored held-out protocol to
+it, hash for hash. Qwen is reported.

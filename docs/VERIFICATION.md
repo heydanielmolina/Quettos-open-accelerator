@@ -12,7 +12,8 @@ golden.py         op-by-op integer forward, float64 BLAS for exact integer GEMV 
    |              forward_tokens (teacher-forced, all positions) == step (one program at one
    |  bit-exact   position) at every position; program.py supplies the requant constants
    v
-quality.py        golden vs reference_np over the calibration set (uv run quettos check <alias>):
+quality.py        golden vs reference_np over two sets kept apart (uv run quettos check
+   |              <alias>, and --heldout for the 64 WikiText-2 windows corpus.py cuts):
    |              top-1, KL, delta-NLL +/- SE, PPL -> models/<name>/quality.json
    |
 isa_sim.py        executes decode.prog / prefill.prog on image.bin at value level, with
@@ -29,10 +30,11 @@ RTL (Verilator)   qcore_top, all three configurations; compare.py runs the bring
 
 "Bit-exact" always means RTL == isa_sim == golden, our own integer model. It
 never means "matches PyTorch". Quality relative to the float32 reference is a
-**measured delta**, reported with standard errors at the calibration-set lengths
-(up to 520 tokens).
+**measured delta**, reported with standard errors on both sets: 32,704 held-out
+positions in 64 windows of 512 tokens, and the calibration set beside them, whose
+sequences run from 36 to 520 tokens.
 
-## The eight layers
+## The nine layers
 
 1. **Static and structural, every push.** Three-parser lint (`scripts/lint.sh`:
    Verilator `--lint-only -Wall -Wpedantic`, Yosys `hierarchy -check; proc;
@@ -343,23 +345,53 @@ never means "matches PyTorch". Quality relative to the float32 reference is a
      that reads unreset state, the `ifndef SYNTHESIS` block of
      `rtl/qcore_row.sv`, is qualified by `rst` like the registers beside it and
      holds from every one of the ten starts.
-6. **Quality (golden vs fp32, not RTL).** `uv run quettos check <alias>`
+6. **Quality (golden vs fp32, not RTL).** Two sets, scored the same way and
+   kept apart in `models/<name>/quality.json`. `uv run quettos check <alias>`
    scores the calibration set teacher-forced (Qwen 1314 tokens and 1308 scored
-   positions, SmolLM2 1181 and 1175): paired
-   delta-NLL +/- SE, KL, top-1 and PPL for W8A16 and W8A8 on both models,
-   written to `models/<name>/quality.json` and tabulated in `NUMERICS.md`.
+   positions, SmolLM2 1181 and 1175) into `rows`.
+   `uv run quettos check <alias> --heldout` scores 64 non-overlapping windows
+   of 512 tokens from the start of the WikiText-2 raw test split -- 32,768
+   tokens, 32,704 scored positions -- into `heldout`: plain prose that the
+   calibration run never saw and that no quantizer range, format or smoothing
+   factor was chosen against. Both report paired delta-NLL +/- SE, KL, top-1
+   and PPL for W8A16 and W8A8 on both models, tabulated in one table in
+   `NUMERICS.md` with a column naming the set. **The headline rows are the
+   held-out ones.** `uv run quettos corpus` fetches the archive from the URL
+   `sw/quettos/corpus.py` names and checks its SHA-256; the stored held-out
+   protocol carries that URL and that hash, the hash of the member it reads, the
+   cut and the SHA-256 of the ids, so a row's windows rebuild byte for byte.
+
+   **Which text a published row was scored on** is a command rather than a
+   paragraph: `make provenance` (`uv run quettos provenance <alias>`) reads a
+   written `quality.json` back and rebuilds the ids of both its sets in this
+   clone -- the held-out windows out of the archive the record names, that
+   archive held to the hash `corpus.py` carries and to the one the record
+   carries, the member to its own, and the calibration set from `prompts/` and
+   the passages of `calibrate.py` -- then holds each set's id SHA-256 to the
+   one stored beside its rows and names every check that disagrees. It prints
+   the two sets' id hashes side by side as well, so the suspicion that the
+   held-out rows are the calibration text under another name is settled by the
+   record's own hash. Nothing is rescored and no model runs, and the command
+   prints the seconds it took. `sw/tests/test_quality.py` runs it over the
+   checked-in files and over a doctored copy of one, which is where the
+   disagreeing case is exercised.
+
    `--no-qk-smoothing` scores a build with every smoothing factor forced to 1
-   into the `-nosmooth` rows of the same file, on the same ids against the same
+   into the `-nosmooth` rows of the same block, on the same ids against the same
    reference, so the fold that conditions int8 K carries a measured ablation
-   rather than an assertion. The slow test re-evaluates every row of the file
-   against a fresh run of the build it names.
-   CI gate on SmolLM2 W8A16 (`KL <= 0.02 nats`, `top-1 >= 93%`; measured
-   0.0048 and 95.66%); Qwen is reported (W8A16 measured `KL 0.0124`, `top-1
-   95.57%`, with the int8 K cache conditioned by K-centering and the
-   pairwise Q/K smoothing fold, see the K-centering section of
-   `NUMERICS.md`). Saturation and shift-error
-   counters are zero on every reported run. The table covers the calibration
-   set; `docs/ROADMAP.md` lists the longer WikiText-2 run.
+   rather than an assertion -- and the held-out windows move two of its four
+   figures, which is why they are the ones quoted. The slow test re-evaluates
+   every calibration row of the file against a fresh run of the build it names,
+   and every held-out row over the first four of the windows it names, window
+   by window.
+   CI gate on SmolLM2 W8A16 (`KL <= 0.02 nats`, `top-1 >= 93%`) on both sets,
+   each measured fresh in the test run: the calibration set (0.0048 and
+   95.66%) and the first two held-out windows (the full held-out row is 0.0041
+   and 96.10%). Qwen is reported (W8A16 held out: `KL 0.0044`, `top-1 96.65%`,
+   `delta-NLL -0.0037 +/- 0.0006`, with the int8 K cache conditioned by
+   K-centering and the pairwise Q/K smoothing fold, see the K-centering section
+   of `NUMERICS.md`). Saturation and shift-error counters are zero on every
+   reported run of both sets.
 7. **Perf counters.** The harness asserts `busy = mac_active + stall_mem +
    stall_vpu + stall_kv + stall_seq + stall_drain`; `RD_BYTES == RD_BEATS * WB`;
    the write counters equal the C++ memory model's own counts and `RD_BEATS`
@@ -377,7 +409,7 @@ never means "matches PyTorch". Quality relative to the float32 reference is a
    `rtl/gen/*.hex` lookup-table images -- a regenerated table changes the
    design, since `$readmemh` loads it into the ROMs -- and the C++), uv without
    torch, and on nightly the Hugging Face download.
-   Six PR jobs with `timeout-minutes` each: the three-parser lint,
+   Seven PR jobs with `timeout-minutes` each: the three-parser lint,
    `make style` and pytest, then the
    cocotb block tests, gate-level equivalence (`make gatesim`), the synthesis
    run (`make synth`: every block and the whole core in both configurations,
@@ -389,10 +421,12 @@ never means "matches PyTorch". Quality relative to the float32 reference is a
    local wall clock) and the demo on the small model (`demo-smollm2`: `make
    demo`, the whole pipeline a clean clone runs -- checkpoint, quantize,
    compile, harness, the complete 30-layer SmolLM2-135M-Instruct generating on
-   `qcore_top`, and layer 5's checks over the finished run), the last five gated
-   on the first. The checkpoint and the harness object directory are cached, so
-   the Hub fetch and the Verilator build are paid once. Nightly holds the long
-   runs. Three of them run: `e2e-qwen` and `e2e-smollm2` quantize and compile the
+   `qcore_top`, and layer 5's checks over the finished run) and that same demo
+   from a clone of the commit under test with nothing cached (`clean-clone`:
+   `make clean-clone`, layer 9), the last six gated on the first. Every job but
+   that last one caches the checkpoint and the harness object directory, so the
+   Hub fetch and the Verilator build are paid once. Nightly holds the long
+   runs. Four of them run: `e2e-qwen` and `e2e-smollm2` quantize and compile the
    checkpoint, generate from the image's own prompt on `qcore_top` and on
    `isa_sim` and compare the ids, compare the state after every descriptor of
    both programs of the complete model (`make stepcmp-model`, layer 4), then run
@@ -402,15 +436,65 @@ never means "matches PyTorch". Quality relative to the float32 reference is a
    compiled program's six vector opcodes on `qcore_vpu_top`; `determinism-model`
    compiles SmolLM2 at `WB=64` and at `WB=128` and runs layer 5's timing and
    width checks over the complete model, the width half descriptor by descriptor
-   over a whole decoder layer. Three are held by
+   over a whole decoder layer; and `quality-regen` fetches the WikiText-2
+   archive, checks its SHA-256 and scores the 64 held-out windows again on both
+   models at W8A16 and W8A8, against the float32 reference forward of
+   `sw/quettos/reference_np.py` -- numpy over the same checkpoint, so nothing
+   nightly installs torch -- printing what the run moved in the rows the
+   repository ships. Two are held by
    `if: false`, each gate naming what it waits for: the ECP5 stat and nextpnr
-   fmax (`syn/` carries no ECP5 script), the `--x-initial unique` determinism
+   fmax (`syn/` carries no ECP5 script) and the `--x-initial unique` determinism
    run (`make determinism-x` runs it and reports the one run of its twenty-two
    that stops, on the `rtl/qcore_lut_interp.sv` range check reading the table a
-   scalar request did not address -- layer 5, **Starting state**), and
-   the quality regeneration over the wider set (`uv run quettos check` scores
-   the calibration corpus). The whole-core synthesis is a PR job, so nightly
+   scalar request did not address -- layer 5, **Starting state**).
+   The whole-core synthesis is a PR job, so nightly
    carries no synthesis of its own beyond ECP5.
+
+9. **The quick start from a clean clone, every push.** `make clean-clone`
+   (`scripts/clean-clone.sh`) clones the committed tree into a directory of its
+   own outside the working copy and runs `make demo` there with a fresh uv cache
+   and a fresh managed Python, so the packages come from the index and the
+   checkpoint from the Hub: what a first run pays, and nothing on the machine
+   the clone did not bring. The clone is held to carrying no `build/` and no
+   virtual environment and to matching the commit; the run is held to the demo's
+   own verdict -- every file `layout.json` records a SHA-256 for hashed again,
+   the ids `qcore_top` generated against `models/<name>/expected_tokens.json`,
+   and `SAT_REQ` / `SAT_VPU` / `ERR_SHIFT` / `ERR_BOUNDS` at zero (layer 5). The
+   clone carries what the commit carries and the environment carries what the
+   lock names, so a file that is in the working tree and was never added, and a
+   package installed by hand rather than declared in `pyproject.toml`, both stop
+   the demo here rather than on a reader's machine. Every stage carries its wall
+   clock and the report is `build/clean-clone/<model>.json`. The `clean-clone` job of
+   `.github/workflows/ci.yml` runs the check on the small model, where the
+   checkout is already the commit and what is under test is the cold path: no uv
+   cache, no checkpoint and no harness object directory, and the only thing
+   cached is the tool suite, which stands for the Verilator a reader installs
+   from their own package manager.
+
+   The stages, from `git clone` to the text, on the machine
+   `docs/PERFORMANCE.md` names. Each figure is the median of a set of three
+   consecutive runs, with the extremes of that set beside it; every run cloned
+   again, synced again and fetched the checkpoint again.
+
+   | Stage | SmolLM2, median (range) | Qwen, median (range) |
+   |---|---|---|
+   | `git clone` | 0.27 s (0.27 - 0.28) | 0.30 s (0.28 - 0.31) |
+   | `uv sync --frozen --inexact` | 5.41 s (5.29 - 5.47) | 5.96 s (5.17 - 11.42) |
+   | `quettos download` (269,060,552 B / 988,097,824 B from the Hub) | 17.07 s (17.04 - 17.43) | 45.12 s (44.12 - 46.15) |
+   | `quettos quantize` | 1.47 s (1.38 - 1.53) | 3.49 s (3.43 - 3.62) |
+   | `quettos compile` | 0.53 s (0.51 - 0.53) | 0.98 s (0.97 - 1.01) |
+   | harness build | 1.60 s (1.53 - 1.61) | 1.68 s (1.64 - 1.68) |
+   | the run on `qcore_top` | 34.93 s (33.95 - 36.20) | 103.90 s (99.55 - 105.63) |
+   | **end to end** | **61.67 s** (60.64 - 62.85) | **160.12 s** (158.59 - 169.00) |
+
+   n=3 each. The download stage measures this machine's link as much as it
+   measures the repository, and it is the one figure here that moves with where
+   the run happens. The end-to-end row is the whole command, so it carries the
+   summary the demo prints after the run as well as the stages above it.
+   `docs/PERFORMANCE.md` holds the same demo timed with the environment and the
+   checkpoint already on the machine; what separates the two sets is the 17.1 s
+   and 45.1 s of Hub fetch and the environment sync above it, which a machine
+   pays once and every run after the first one skips.
 
 ## What is checked into `models/<model>/`
 
@@ -420,5 +504,10 @@ golden model's greedy continuation of `prompts/chat_short.json` and
 with the SHA-256 of each id list,
 written by `uv run quettos golden <alias> --write-expected` and reproduced by
 `sw/tests/test_golden.py`; the RTL and the ISA simulator must emit exactly
-these ids. `image.bin` stays in the gitignored `build/`. A clean clone must
-reproduce the sha256s (checked on CI and on a second machine).
+these ids. `image.bin` stays in the gitignored `build/`. A clean clone
+reproduces the sha256s: `make clean-clone` runs the demo inside a fresh clone,
+where every file `layout.json` records a SHA-256 for is hashed again and the
+ids `qcore_top` generated are held to this record's per-prompt count and
+SHA-256 (layer 9), and the `clean-clone` job of `.github/workflows/ci.yml` runs
+that on `ubuntu-latest` on every push. `make provenance` does the same for the
+ids behind the `quality.json` rows (layer 6).

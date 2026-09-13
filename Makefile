@@ -23,36 +23,40 @@ DEMO_PROMPT ?= prompts/chat_short.json
 MAX_NEW     ?= 20
 DEMO_ARGS   ?=
 
-.PHONY: all help demo demo-qwen regen-prefix ci test lint style cocotb synth gatesim perf waves probe harness harness-csr bringup bringup-sweep stepcmp stepcmp-models stepcmp-model determinism determinism-model determinism-x clean
+.PHONY: all help demo demo-qwen demo-toolcall clean-clone clean-clone-worktree regen-prefix provenance ci test lint style cocotb synth gatesim perf waves probe harness harness-csr bringup bringup-sweep stepcmp stepcmp-truncated stepcmp-full stepcmp-models stepcmp-model determinism determinism-model determinism-x clean
 
 all: help
 
 help:
-	@echo "Quettos Core targets:"
-	@echo "  make lint          three-parser lint over rtl/*.sv and sim/cocotb/wrappers/*.sv (scripts/lint.sh)"
-	@echo "  make style         ruff check and ruff format --check over every .py in the repository"
-	@echo "  make test          uv run pytest -q sw/tests"
-	@echo "  make cocotb        cocotb block tests on the tiny RTL configuration (sim/cocotb)"
-	@echo "  make probe         Verilator speed probe (sim/probe)"
-	@echo "  make harness       build the Verilator harness (sim/verilator)"
-	@echo "  make harness-csr   run the harness CSR driver against rtl/qcore_csr.sv"
-	@echo "  make bringup       RTL vs isa_sim on the tiny configuration, four programs (sw/quettos/compare.py)"
-	@echo "  make bringup-sweep the same over random shapes at WB=64 and WB=128"
-	@echo "  make stepcmp       whole compiled programs, descriptor by descriptor, RTL vs isa_sim (sw/quettos/stepcmp.py)"
-	@echo "  make stepcmp-models the same over truncated Qwen and SmolLM2 images"
-	@echo "  make stepcmp-model  the same over the complete Qwen and SmolLM2 models"
-	@echo "  make determinism   one program run every way the machine allows: the ids and the state do not move (sw/quettos/determinism.py)"
-	@echo "  make determinism-model the same over IMAGE and WB128_IMAGE, one model compiled at each width"
-	@echo "  make determinism-x an undefined-value start (Verilator --x-initial unique)"
-	@echo "  make clean         remove build/ and Verilator obj_dir directories"
-	@echo "  make demo          the whole pipeline: checkpoint -> image -> text on qcore_top (MODEL, scripts/demo.sh)"
-	@echo "  make demo-qwen     the same on the headline model (MODEL=qwen)"
-	@echo "  make regen-prefix  prefill IMAGE's prompt and save the KV region to PREFIX_KV"
-	@echo "  make ci            the CI job set, run locally"
-	@echo "  make synth         Yosys synth_xilinx of every syn/synth_*.ys script; logs in build/synth/, and every syn/reports/*.md has to still reproduce"
-	@echo "  make gatesim       gate-level equivalence: each Yosys netlist against the source it came from (sim/gatesim)"
-	@echo "  make perf          run the harness on IMAGE and write build/perf/perf.json"
-	@echo "  make waves         a VCD of the first WAVE_CYCLES cycles of a harness run into build/waves (20,000 cycles, 241 MB)"
+	@echo "Quettos Core targets. Times are from the machine docs/PERFORMANCE.md names."
+	@echo "  make lint                 8 s     three-parser lint over rtl/*.sv and the cocotb wrappers"
+	@echo "  make style                        ruff check and ruff format --check over every .py here"
+	@echo "  make test                 10 min  the Python suite: compiler, golden model, ISA simulator, CLI"
+	@echo "  make cocotb               85 s    block tests on the tiny RTL configuration (sim/cocotb)"
+	@echo "  make probe                        Verilator speed probe (sim/probe)"
+	@echo "  make harness                      build the Verilator harness (sim/verilator)"
+	@echo "  make harness-csr                  the harness CSR driver against rtl/qcore_csr.sv"
+	@echo "  make bringup              20 s    RTL vs isa_sim on the tiny configuration (sw/quettos/compare.py)"
+	@echo "  make bringup-sweep        95 s    the same over random shapes at WB=64 and WB=128"
+	@echo "  make stepcmp                      whole programs, descriptor by descriptor (sw/quettos/stepcmp.py)"
+	@echo "  make stepcmp-truncated    40 s    the same over one- and two-layer Qwen and SmolLM2 compiles"
+	@echo "  make stepcmp-full         20 s    the same over the complete Qwen and SmolLM2 models"
+	@echo "  make determinism          12 s    one program every way the machine allows: ids and state hold"
+	@echo "  make determinism-model    60 s    the same over IMAGE and WB128_IMAGE, one model at each width"
+	@echo "  make determinism-x        14 s    an undefined-value start (Verilator --x-initial unique)"
+	@echo "  make clean                        remove build/ and the Verilator obj_dir directories"
+	@echo "  make demo                 35 s    the whole pipeline: checkpoint -> image -> text (MODEL, demo.sh)"
+	@echo "  make demo-qwen            105 s   the same on the headline model (MODEL=qwen)"
+	@echo "  make demo-toolcall        15 min  the tool call, over a prefix computed once and restored"
+	@echo "  make clean-clone          55 s    the quick start elsewhere, nothing cached (clean-clone.sh)"
+	@echo "  make clean-clone-worktree 55 s    the same on the tree as it stands here, changes included"
+	@echo "  make provenance                   which text every published quality row was scored on"
+	@echo "  make regen-prefix         7 s     prefill IMAGE's prompt and save the prefix to PREFIX_KV"
+	@echo "  make perf                 9 s     run the harness on IMAGE and write build/perf/perf.json"
+	@echo "  make waves                        a VCD of a harness run: WAVE_CYCLES cycles, 241 MB at 20,000"
+	@echo "  make synth                3 min   Yosys synth_xilinx; every syn/reports/*.md has to reproduce"
+	@echo "  make gatesim              70 s    each Yosys netlist against the source it came from (sim/gatesim)"
+	@echo "  make ci                   17 min  every job of .github/workflows/ci.yml, and make determinism"
 
 lint:
 	@TOPS="$(TOPS)" VERILATOR=$(VERILATOR) YOSYS=$(YOSYS) IVERILOG=$(IVERILOG) bash scripts/lint.sh
@@ -82,10 +86,10 @@ clean:
 
 # The demo, from a clean clone: sync the environment, fetch the checkpoint,
 # quantize it, compile the image and the two descriptor programs, build the
-# harness and run the whole model on qcore_top -- every token printed as it
-# leaves the hardware with its cycle cost and its MAC utilization, then the
-# summary of `quettos demo-report`: the ids against the golden model's recorded
-# continuation, the counters a clean run leaves at zero, the cycle and
+# harness and run the whole model on qcore_top -- the text printed as it leaves
+# the hardware, then what each token cost in cycles and MAC utilization, then
+# the summary of `quettos demo-report`: the ids against the golden model's
+# recorded continuation, the counters a clean run leaves at zero, the cycle and
 # utilization table and the wall clock of every stage. A counter that should be
 # zero and is not fails the target. `make demo` runs the fast model and
 # `make demo-qwen` the headline one.
@@ -95,9 +99,68 @@ demo:
 demo-qwen:
 	@$(MAKE) demo MODEL=qwen
 
+# The quick start as a new reader runs it (scripts/clean-clone.sh): put the
+# repository in a directory of its own, outside this one, and run `make demo`
+# there with a fresh uv cache and a fresh managed Python, so the packages come
+# from the index and the checkpoint from the Hub. The demo's own verdict decides
+# the result -- the ids the hardware generated against
+# models/<name>/expected_tokens.json and the counters a clean run leaves at
+# zero -- and the stage wall clocks and the verdict go to
+# build/clean-clone/<model>.json.
+#
+# `clean-clone` checks the committed tree, which is what anyone else can fetch;
+# `clean-clone-worktree` checks the tree as it stands here, every tracked path
+# at the content on disk, which is what a commit made now would carry. Both name
+# the tree they checked in their first line, their last line and the report.
+# MODEL picks the model, and CLEAN_CLONE_ARGS passes flags to the script
+# (--keep leaves the clone in place).
+CLEAN_CLONE_ARGS ?=
+
+clean-clone:
+	@bash scripts/clean-clone.sh --model $(MODEL) $(CLEAN_CLONE_ARGS)
+
+clean-clone-worktree:
+	@bash scripts/clean-clone.sh --model $(MODEL) --worktree $(CLEAN_CLONE_ARGS)
+
+# Which text the rows of models/<name>/quality.json were scored on, answered
+# without scoring anything (sw/quettos/quality.py, provenance). The calibration
+# ids are rebuilt from prompts/ and the passages of calibrate.py and the
+# held-out windows from the WikiText-2 archive the record names -- the archive
+# checked against the hash corpus.py carries and the one the record carries,
+# the member against its own -- and each set's id SHA-256 is held to the one
+# stored beside its rows. It also prints the two hashes side by side, so a
+# reader who suspects the held-out rows are the calibration text can see that
+# they are not. Seconds, against the scoring run behind the numbers themselves
+# (uv run quettos check <alias> --heldout). PROVENANCE_MODELS picks the models.
+PROVENANCE_MODELS ?= qwen smollm2
+
+provenance:
+	@for m in $(PROVENANCE_MODELS); do $(UV) run quettos provenance $$m || exit 1; done
+
+# The tool-call demo, and the prefix reuse under it (sw/quettos/prefix.py): the
+# system turn of TOOLCALL_PROMPT -- the one that carries the tool descriptions,
+# which every turn of an agent conversation repeats -- is prefilled once on
+# qcore_top and its KV region saved; a second run restores that file and
+# prefills only the user's turn before generating the tool call; and a third
+# runs the same prompt with no reuse at all, which is what the ids after the
+# restore are held to. The summary is the one every demo ends in, with the
+# prefill cycles of the three passes in it. TOOLCALL_ARGS goes to the driver
+# (--model, --prompt, --max-new, --wb, --fresh).
+TOOLCALL_MODEL  ?= qwen
+TOOLCALL_PROMPT ?= prompts/tool_call_weather.json
+TOOLCALL_MAX_NEW ?= 20
+TOOLCALL_ARGS   ?=
+
+demo-toolcall:
+	$(UV) run python -m quettos.prefix --model $(TOOLCALL_MODEL) \
+	  --prompt $(TOOLCALL_PROMPT) --max-new $(TOOLCALL_MAX_NEW) $(TOOLCALL_ARGS)
+
 # The prefix a later run restores: prefill every prompt token of IMAGE, generate
-# nothing, and write the KV region out at its image layout, so the file belongs
-# to the model and the port width that produced it (docs/ARCHITECTURE.md).
+# nothing, and write the KV region out at its image layout with the record of
+# what it belongs to -- the model, the port width, MAX_CTX, the image SHA-256
+# and the token id of every position it covers -- so a run given the file for
+# another image, width or prompt refuses it (docs/MEMORY_MAP.md, the prefix
+# file).
 regen-prefix:
 	@test -f $(IMAGE)/layout.json || { \
 	  echo "make regen-prefix: $(IMAGE)/layout.json not found (uv run quettos compile <model>)"; exit 1; }
@@ -106,8 +169,15 @@ regen-prefix:
 	  ARGS="--max-new 0 --kv-save $(abspath $(PREFIX_KV))"
 	@echo "regen-prefix: $(PREFIX_KV)"
 
-ci: lint style test cocotb synth gatesim harness-csr bringup determinism demo
-	@echo "ci: OK (the job set of .github/workflows/ci.yml, run locally)"
+# Every job of .github/workflows/ci.yml, in one command, with `make determinism`
+# beside them: lint + style + test is the lint-and-pytest job, cocotb is
+# cocotb-units, synth is synth-xc7, gatesim is gatesim, harness-csr + bringup is
+# bringup-tiny, demo is demo-smollm2 and clean-clone is clean-clone. The
+# workflow has no determinism job -- the nightly one runs `determinism-model`
+# over a complete model -- so this target runs one check more than a pull
+# request does, and nothing less.
+ci: lint style test cocotb synth gatesim harness-csr bringup determinism demo clean-clone
+	@echo "ci: OK (every job of .github/workflows/ci.yml, and make determinism beside them)"
 
 # One block per syn/synth_*.ys script (run from the repo root; each script names
 # its block and its configurations, and ends every configuration with
@@ -157,20 +227,20 @@ bringup-sweep:
 # memory regions, CSRs, PC and counters that each descriptor's dump_plan.json
 # entry names are compared after every one of them. STEPCMP_TINY is five random
 # tiny models at WB=16, each run over every position of a two-tile KV cache;
-# STEPCMP_MODELS is the first one and two layers of Qwen and SmolLM2, which needs
+# STEPCMP_TRUNCATED is the first one and two layers of Qwen and SmolLM2, which needs
 # build/quant/<name>.npz (uv run quettos quantize <alias>). Both take --wb, so
 # `make stepcmp STEPCMP_TINY="--sweep --shapes 5 --wb 64 --prompt-len 64
 # --max-new 65"` runs the same comparison at the demo width, and --lat / --bw-div
 # run it at another memory setting.
-STEPCMP_TINY   ?= --sweep --shapes 5 --wb 16 --prompt-len 16 --max-new 17 --seed 0
-STEPCMP_MODELS ?= --models qwen,smollm2 --layers 1,2 --wb 64 --max-ctx 128 --prompt-len 66 --max-new 2
-STEPCMP_MODEL  ?= --models qwen,smollm2 --layers all --wb 64 --max-ctx 128 --prompt-len 3 --max-new 2
+STEPCMP_TINY      ?= --sweep --shapes 5 --wb 16 --prompt-len 16 --max-new 17 --seed 0
+STEPCMP_TRUNCATED ?= --models qwen,smollm2 --layers 1,2 --wb 64 --max-ctx 128 --prompt-len 66 --max-new 2
+STEPCMP_FULL      ?= --models qwen,smollm2 --layers all --wb 64 --max-ctx 128 --prompt-len 3 --max-new 2
 
 stepcmp:
 	$(UV) run python -m quettos.stepcmp $(STEPCMP_TINY)
 
-stepcmp-models:
-	$(UV) run python -m quettos.stepcmp $(STEPCMP_MODELS)
+stepcmp-truncated:
+	$(UV) run python -m quettos.stepcmp $(STEPCMP_TRUNCATED)
 
 # The same comparison on the complete models: every decoder layer, the final
 # norm and the LM head of Qwen and SmolLM2, two prefill positions and two decode
@@ -178,6 +248,18 @@ stepcmp-models:
 # The tile-boundary positions are the truncated compiles' job above, which run
 # every position of a two-tile cache; this target is what the depth of a whole
 # model adds to them.
+stepcmp-full:
+	$(UV) run python -m quettos.stepcmp $(STEPCMP_FULL)
+
+# `stepcmp-models` and `stepcmp-model` are what these two were called before,
+# kept so anything that already names them keeps working. Each passes its own
+# variable, so `make stepcmp-model STEPCMP_MODEL="..."` still reaches the run.
+STEPCMP_MODELS ?= $(STEPCMP_TRUNCATED)
+STEPCMP_MODEL  ?= $(STEPCMP_FULL)
+
+stepcmp-models:
+	$(UV) run python -m quettos.stepcmp $(STEPCMP_MODELS)
+
 stepcmp-model:
 	$(UV) run python -m quettos.stepcmp $(STEPCMP_MODEL)
 

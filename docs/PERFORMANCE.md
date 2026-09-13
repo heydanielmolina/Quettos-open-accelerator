@@ -26,12 +26,18 @@ labelled **estimate**.
 - **Rates and wall clock.** Every rate and every wall clock is the median of a
   set of consecutive runs of one command on an otherwise idle machine, quoted
   with the extremes of that set and the size of the set. The long runs carry
-  smaller sets than the short ones, and every table names its `n`.
-- **Sustained load.** Rates fall a few percent as the machine stays busy, so a
-  single run reads high. Quoting a median with its range and its run count is
-  what makes these figures reproducible: every set on this page carries all
-  three, and the widest spread among them is 11.8% of its median -- the demo's
-  sub-second checkpoint stage, where a hundredth of a second is 3%.
+  smaller sets than the short ones, and every table names its `n`. A wall clock
+  is quoted to the place its own spread supports -- the coarsest digit that
+  still divides the range in two -- and its extremes to that same place.
+- **Machine load.** Every set here was taken on an otherwise idle machine,
+  because work running beside a run costs it wall clock: on a working laptop or
+  a shared runner a rate reads low and a wall clock reads high, and that is the
+  direction to expect against the figures below. What the machine is doing
+  never reaches a cycle count (**Cycles** above); it reaches the seconds and the
+  rates. Quoting a median with its range and its run count is what makes the
+  wall clocks reproducible: every set on this page carries all three, and the
+  widest spread among them is 11.8% of its median -- the demo's sub-second
+  checkpoint stage, where a hundredth of a second is 3%.
 - **Workload.** `make perf` and `make demo` run a compiled program on the RTL:
   every descriptor of `decode.prog` and `prefill.prog` at its real address,
   stride, meta and partial tile, all six vector opcodes on `qcore_vpu_top`, and
@@ -145,15 +151,15 @@ between 0.02% and 0.28% across these runs.
 
 | Run | Counted cycles | Clock cycles | Wall clock, median | Range, n |
 |---|---|---|---|---|
-| Qwen 2 layers, 36-token prompt + 1 decode (`make perf`) | 20,736,018 | 20,737,746 | **7.544 s** | 7.434 - 7.811, n=9 |
-| Qwen 24 layers, 32 prompt + 20 decode | 358,570,293 | 358,572,741 | **127.722 s** | 125.519 - 129.071, n=3 |
-| Qwen 24 layers, the demo (36 prompt + 8 decode) | 283,190,917 | 283,192,981 | **102.288 s** | 101.653 - 102.505, n=3 |
-| SmolLM2 30 layers, the demo (37 prompt + 8 decode) | 96,655,010 | 96,657,122 | **34.822 s** | 34.776 - 35.107, n=3 |
-| Qwen 24 layers, 4 prompt + 1 decode | 26,846,758 | 26,846,950 | 9.365 s | 9.299 - 9.418, n=9 |
-| SmolLM2 30 layers, 32 prompt + 20 decode | 116,937,992 | 116,940,440 | 41.313 s | 41.215 - 41.347, n=3 |
-| SmolLM2 30 layers, 8 prompt + 4 decode | 24,977,368 | 24,977,896 | 8.756 s | 8.721 - 8.811, n=9 |
-| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 18,073,125 | 6.401 s | 6.300 - 6.500, n=9 |
-| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 216,440,525 | 76.176 s | 75.901 - 76.329, n=3 |
+| Qwen 2 layers, 36-token prompt + 1 decode (`make perf`) | 20,736,018 | 20,737,746 | **7.5 s** | 7.4 - 7.8, n=9 |
+| Qwen 24 layers, 32 prompt + 20 decode | 358,570,293 | 358,572,741 | **128 s** | 126 - 129, n=3 |
+| Qwen 24 layers, the demo (36 prompt + 8 decode) | 283,190,917 | 283,192,981 | **102.3 s** | 101.7 - 102.5, n=3 |
+| SmolLM2 30 layers, the demo (37 prompt + 8 decode) | 96,655,010 | 96,657,122 | **34.8 s** | 34.8 - 35.1, n=3 |
+| Qwen 24 layers, 4 prompt + 1 decode | 26,846,758 | 26,846,950 | 9.37 s | 9.30 - 9.42, n=9 |
+| SmolLM2 30 layers, 32 prompt + 20 decode | 116,937,992 | 116,940,440 | 41.31 s | 41.22 - 41.35, n=3 |
+| SmolLM2 30 layers, 8 prompt + 4 decode | 24,977,368 | 24,977,896 | 8.76 s | 8.72 - 8.81, n=9 |
+| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 18,073,125 | 6.41 s | 6.37 - 6.56, n=9 |
+| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 216,440,525 | 77.7 s | 77.1 - 77.8, n=3 |
 
 The two demo rows are what `make demo-qwen` and `make demo` run, and the wall
 clock beside them is the harness clock loop inside the run; the section below
@@ -189,10 +195,11 @@ its command names.
 `make demo` is the whole pipeline in one command (`scripts/demo.sh`): it syncs
 the Python environment, fetches the checkpoint from the Hugging Face Hub,
 quantizes it to int8, compiles `image.bin` and the two descriptor programs,
-builds the Verilator harness and runs the model on `qcore_top`, printing every
-token as it leaves the hardware with the cycles it cost and the share of them
-the MAC array was active in. `quettos demo-report` finishes it: every file
-`layout.json` carries a SHA-256 for, hashed again and held to it; the prompt the
+builds the Verilator harness and runs the model on `qcore_top`, printing the
+text as it leaves the hardware and, under it, what each token cost in cycles and
+in the share of them the MAC array was active in. `quettos demo-report`
+finishes it: every file `layout.json` carries a SHA-256 for, hashed again and
+held to it; the prompt the
 run was given, held to the ids the image was compiled with; the ids against the
 golden model's recorded continuation; the four counters a clean run leaves at
 zero; the cycle and utilization table; and the seconds every stage took. Any
@@ -212,8 +219,8 @@ the integer golden model recorded in `models/<name>/expected_tokens.json`.
 | `quettos quantize` | 1.38 s (1.36 - 1.39) | 3.06 s (3.06 - 3.10) |
 | `quettos compile` | 0.52 s (0.51 - 0.52) | 0.93 s (0.92 - 0.94) |
 | harness build | 1.59 s (1.58 - 1.61) | 1.61 s (1.60 - 1.61) |
-| the run on `qcore_top` | 35.09 s (34.99 - 35.37) | 102.53 s (101.92 - 102.81) |
-| **end to end** | **38.91 s** (38.84 - 39.21) | **108.47 s** (107.87 - 108.79) |
+| the run on `qcore_top` | 35.1 s (35.0 - 35.4) | 102.5 s (101.9 - 102.8) |
+| **end to end** | **38.9 s** (38.8 - 39.2) | **108.5 s** (107.9 - 108.8) |
 
 n=3 each, and the run itself times every stage and prints the table. Each run
 started cold: `build/quant/<name>.npz`, `build/images/<name>` and
@@ -223,8 +230,8 @@ on the machine, which is what those two rows measure; a first clone pays the Hub
 fetch once, 269,060,552 B of `model.safetensors` for SmolLM2 and 988,097,824 B
 for Qwen.
 
-The RTL is most of both runs -- 35.09 s of the 38.91 s and 102.53 s of the
-108.47 s -- and what it produced is in the two demo rows above: 96,655,010
+The RTL is most of both runs -- 35.1 s of the 38.9 s and 102.5 s of the
+108.5 s -- and what it produced is in the two demo rows above: 96,655,010
 cycles at 80.24% `MAC_ACTIVE` and 52.15 read bytes per cycle for SmolLM2,
 283,190,917 at 91.34% and 58.94 for Qwen, with `SAT_REQ`, `SAT_VPU`,
 `ERR_SHIFT` and `ERR_BOUNDS` all zero. The prefill and decode halves are
@@ -323,12 +330,12 @@ the one `make perf` and `make demo` run.
 The rule the configuration was chosen by: *if Qwen 32+20 takes 8 minutes or less
 at `WB=64`, that is the demo configuration and the synthesized configuration.*
 Measured again on the complete core with every descriptor executing:
-**127.722 s, two minutes, against a budget of eight** (125.519 - 129.071, n=3,
+**128 s, two minutes, against a budget of eight** (126 - 129, n=3,
 358,570,293 counted cycles in every run). Eight minutes over 358,570,293 cycles
 is 0.747 Mcycles/s; the measured 2.807 is 3.8x above it, so the design would
 have to become nearly four times more expensive per cycle to change the answer.
 The command the project ships is shorter still: `make demo-qwen` takes the
-checkpoint to the text in 108.47 s, of which 102.288 s is the RTL.
+checkpoint to the text in 108.5 s, of which 102.3 s is the RTL.
 
 `WB=128` stays the same-RTL fallback at both the width and the value level, and
 the tiny configuration `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048` is what the
@@ -336,16 +343,70 @@ cocotb benches and the CI bring-up job run.
 
 ## The prefix a run restores
 
-`make regen-prefix` prefills every prompt token of `IMAGE`, generates nothing,
-and writes the KV region to `PREFIX_KV`; `--kv-load` puts it back before a later
-run. The file is the region at its image layout, so it belongs to the model and
-the port width that produced it: 1,179,648 B for the two-layer Qwen image and
-14,155,776 B for the whole model, both at `max_ctx = 2048`.
+An agent turn repeats a long head: the system message and the tool descriptions
+are the same on every call, and only the user's turn changes. `--kv-save FILE`
+writes the KV region of the positions a run has consumed, byte for byte at its
+image layout, behind the record of what those bytes were computed under
+(`docs/MEMORY_MAP.md`, the prefix file). `--kv-load FILE` holds every term of
+that record to the run restoring it -- the ISA version, the width, `MAX_CTX`,
+the model, the image SHA-256, the region, and the token id at every position
+the file covers -- and starts the token loop at the first position the file
+does not cover. The region is 1,179,648 B for the two-layer Qwen image and
+14,155,776 B for the whole model at `max_ctx = 2048`, and the record is
+`176 + 4 * positions` bytes ahead of it.
+
+### The tool call over a restored prefix (`make demo-toolcall`)
+
+One prompt, `prompts/tool_call_weather.json`, run three ways on the whole
+Qwen2.5-0.5B-Instruct at the demo configuration. It renders to 180 ids: the
+first 162 are its system turn, which carries the tool description, and the
+other 18 are the user's question and the assistant header. Prefill runs
+positions 0 to 178 and the first decode step consumes id 179.
+
+| Prefill pass | Positions | Tokens | Counted cycles | Cycles/token |
+|---|---|---|---|---|
+| the prefix, computed once (`--prefix-len 162 --max-new 0 --kv-save`) | 0 - 161 | 162 | 1,011,148,686 | 6,241,658 |
+| the user's turn, after the restore (`--kv-load`) | 162 - 178 | 17 | 107,568,383 | 6,327,551 |
+| the same prompt, no reuse | 0 - 178 | 179 | 1,118,717,069 | 6,249,816 |
+
+The restore leaves 1,011,148,686 of those 1,118,717,069 prefill cycles unspent,
+90.4% of them, and the two passes above it add up to the third exactly. They add
+up position by position as well: every one of the 179 prefill positions and all
+20 decode steps cost the same cycles in the restored run as in the run that
+recomputed everything, which is what the equality of the totals is made of.
+
+The generation after the restore is the run the summary reports: 20 decode
+tokens, 169,946,516 cycles, 277,514,899 for the run at 91.6% MAC-active and
+59.3 read bytes per cycle. Its 20 ids are
+`<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call><|im_end|>`,
+identical to the 20 the same prompt generates with no reuse at all (that run is
+1,288,663,585 cycles, the two above it summed) and to the integer golden model's
+recorded continuation in `models/qwen2.5-0.5b-instruct/expected_tokens.json`.
+The saved file is 14,156,600 B: the 14,155,776 B KV region behind 824 B of
+record. The three passes are 2,577,327,170 simulated cycles in all, and the
+command runs them back to back in **940 s** (920 - 950, n=3) with the
+checkpoint, the quantized model, the compiled image and the harness build
+already on the machine, so what those seconds measure is the three passes on
+`qcore_top`. Every run of that set produced the cycle counts above, to the
+cycle.
+
+```sh
+make demo-toolcall                                       # the three passes and the summary
+make demo-toolcall TOOLCALL_ARGS="--fresh"               # quantize and compile again first
+```
+
+### The prefix of `IMAGE`'s own prompt
+
+`make regen-prefix` prefills every prompt token of `IMAGE` but the last,
+generates nothing, and writes the file to `PREFIX_KV`: on the 36-id prompt both
+images are compiled with, 1,179,964 B for the two-layer image and 14,156,092 B
+for the whole model, each the KV region behind the 316 B record of the 35
+positions it covers.
 
 | Run | Counted cycles | Wall clock, median | Range, n |
 |---|---|---|---|
-| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 6.401 s | 6.300 - 6.500, n=9 |
-| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 76.176 s | 75.901 - 76.329, n=3 |
+| Qwen 2 layers, 35 prefill tokens (`make regen-prefix`) | 18,071,445 | 6.41 s | 6.37 - 6.56, n=9 |
+| Qwen 24 layers, 35 prefill tokens | 216,438,845 | 77.7 s | 77.1 - 77.8, n=3 |
 
 ```sh
 make regen-prefix                                        # the first row
@@ -399,9 +460,16 @@ comparison.
   reads back at the next position what the pass before it wrote. The
   `--dump-mem` regions are read at the end of every pass and every record
   carries the pass, the token and the position it belongs to.
-- **KV save and restore** (`--kv-save FILE`, `--kv-load FILE`): the KV region
-  copied byte for byte at its image layout, so a saved file belongs to the
-  model and the port width that produced it. `make regen-prefix` writes one.
+- **Prefix save and restore** (`prefix.hpp`; `--kv-save FILE`, `--kv-load
+  FILE`, `--prefix-len N`): the KV region copied byte for byte at its image
+  layout, behind the record of what it belongs to; a restore holds every term of
+  that record to the run taking it and starts the token loop at the first
+  position the file does not cover, so a file from another image, width or
+  prompt is refused before the first cycle rather than restored into a machine
+  it does not belong to (`docs/MEMORY_MAP.md`, the prefix file). `--prefix-len
+  N` prefills the first `N` prompt ids and stops, which is the pass that
+  computes a prefix; `make regen-prefix` and `make demo-toolcall` write one, and
+  `sw/quettos/prefix.py` reads the header of one back.
 - **What `perf.json` records.** The counters and events, the memory model's own
   counts, the per-token records, the build widths, and a `run` object that says
   how the run was taken: `lat`, `bw_div`, `max_new`, `step`, `status`,
@@ -453,9 +521,9 @@ counters and `DESCRIPTORS` / `MACS` / `WT_BYTES`.
 
 | Run | Result | Wall clock, median, cold | Range, n |
 |---|---|---|---|
-| `make bringup` -- 2 shapes at WB=16, 2 tokens, four programs | **16/16 match** | 11.83 s | 11.82 - 12.08, n=5 |
-| `make bringup-sweep` -- 5 shapes at WB=64 and WB=128, 2 tokens, four programs | **80/80 match** | 47.83 s | 47.54 - 47.93, n=3 |
-| `uv run pytest -q sw/tests/test_bringup.py` (WB 16 and 64) | 44 passed | 37.29 s | 35.71 - 38.60, n=3 |
+| `make bringup` -- 2 shapes at WB=16, 2 tokens, four programs | **16/16 match** | 11.8 s | 11.8 - 12.1, n=5 |
+| `make bringup-sweep` -- 5 shapes at WB=64 and WB=128, 2 tokens, four programs | **80/80 match** | 47.8 s | 47.5 - 47.9, n=3 |
+| `uv run pytest -q sw/tests/test_bringup.py` (WB 16 and 64) | 44 passed | 37 s | 36 - 39, n=3 |
 
 Cold means `build/verilator` was removed before each run, so each figure
 includes the Verilator builds the run needs -- one at `WB=16`, two more for the
@@ -498,7 +566,7 @@ Mcycles/s against the skeleton's 5.945, so a cycle of the complete design costs
 2.16x a cycle of the skeleton. In cycles the skeleton is close: its synthetic
 decode token is 8,217,614 cycles against the 8,321,833 the core spends on the
 real 24-layer one, 1.3% apart. In wall clock it is not: 1.38 s a token against
-2.968 s. The decision the skeleton was built to
+2.97 s. The decision the skeleton was built to
 settle -- eight minutes for Qwen 32 + 20 at `WB=64` -- holds on the core's own
 measurement with 3.8x to spare.
 

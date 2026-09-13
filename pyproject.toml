@@ -24,12 +24,21 @@ ref = [
     "transformers>=4.45",
     "datasets>=3.0",
 ]
-# Hardware verification and lint helpers.
+# Hardware verification and lint helpers: what `make test`, `make cocotb` and
+# `make style` need on top of the project's own dependencies. uv syncs this
+# group by default, so a clean clone gets it -- keep it to what a checkout has
+# to have, and nothing that only one target uses.
 dev = [
     "mpmath>=1.3",      # exact table generation (quettos.lutgen)
     "cocotb>=2.1",
-    "yowasp-nextpnr-ecp5",
     "ruff>=0.16",       # `make style`, the Python half of the lint
+]
+# Place and route, for the ECP5 fmax run of docs/ROADMAP.md: a wasm build of
+# nextpnr, 30 MB, and the wasmtime runtime under it, 8 MB more. No target in
+# this repository runs it, so it is a group of its own and a clean clone does
+# not carry it; `uv sync --group pnr` installs it.
+pnr = [
+    "yowasp-nextpnr-ecp5",
 ]
 
 [build-system]

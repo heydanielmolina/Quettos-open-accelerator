@@ -19,10 +19,35 @@
 # from the same modules; they are linted with the rtl/*.sv files plus the
 # wrapper on the command line, and the forbidden-construct greps cover them.
 #
+# Icarus notes
+# ------------
+# Elaborating an always_comb whose right-hand side reads a constant
+# part-select, Icarus 13 prints
+#   <file>:<line>: sorry: constant selects in always_* processes are not fully
+#   supported (the process will be sensitive to all bits in '<signal>').
+# That is a note about Icarus's own implicit sensitivity list, not about the
+# design: the whole vector joins the list in place of the selected bits, which
+# is the sensitivity an always_comb asks for and what the standard prescribes
+# for a part-select in an implicit list. Icarus says the same thing about the
+# `always @*` spelling as `warning: @* is sensitive to all bits in '<signal>'`
+# under -Wsensitivity-entire-vector, and its own manual page calls that
+# behaviour standard-prescribed. A wider list only re-evaluates a
+# combinational block more often than it needs to; the settled value is the
+# same one, Verilator -Wall -Wpedantic and Yosys `check -assert` report nothing
+# on the same lines, synthesis reads no sensitivity list at all, and
+# `make gatesim` drives the Icarus-elaborated source of qcore_vpu_top -- which
+# holds all but three of these lines -- against the Yosys netlist of the same
+# module and compares every output on every cycle.
+# So this script counts them and prints one summary line instead of the fifty,
+# and every other line Icarus prints fails the lint -- including a `warning:`,
+# which on its own leaves the Icarus exit status at 0. LINT_ICARUS_NOTES=1
+# prints the notes themselves.
+#
 # Environment overrides: TOPS (space-separated subset of tops; default all),
 # VERILATOR, YOSYS, IVERILOG, RTL_DIR (default rtl), WRAP_DIR (default
 # sim/cocotb/wrappers), ROM_FILE (absolute path used for every ROM_FILE
-# parameter; default the matching rtl/gen/<table>.hex).
+# parameter; default the matching rtl/gen/<table>.hex), LINT_ICARUS_NOTES=1
+# (print the Icarus sensitivity-list notes rather than counting them).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -73,6 +98,32 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/qcore_lint.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 WRAP="$WORK/qcore_lint_wrap.sv"
 echo "module qcore_lint_wrap; endmodule" > "$WRAP"
+
+# --- Icarus output: one known note, everything else is a finding -----------
+# The sensitivity-list note of the header comment. Any other line Icarus writes
+# -- a warning, which does not move its exit status, as much as an error --
+# fails the lint.
+ICARUS_NOTE_RE='^[^:]+:[0-9]+: sorry: constant selects in always_\* processes are not fully supported \(the process will be sensitive to all bits in .+\)\.$'
+NOTES="$WORK/iverilog-notes.txt"
+: > "$NOTES"
+ICARUS_OTHER=0
+
+icarus() {
+  # $1 = top, rest = the iverilog command line. Runs it, files the notes and
+  # fails the lint on any other output.
+  local top="$1" out other
+  shift
+  out="$WORK/$top.iverilog.txt"
+  if ! "$@" > "$out" 2>&1; then
+    echo "lint: $top: iverilog FAILED"; sed 's/^/  /' "$out"; FAIL=1; return
+  fi
+  grep -E -- "$ICARUS_NOTE_RE" "$out" >> "$NOTES" || true
+  other="$(grep -vE -- "$ICARUS_NOTE_RE" "$out" | grep -v '^[[:space:]]*$' || true)"
+  if [ -n "$other" ]; then
+    echo "lint: $top: iverilog reported:"; printf '%s\n' "$other" | sed 's/^/  /'
+    ICARUS_OTHER=1; FAIL=1
+  fi
+}
 
 # --- ROM images: every `parameter [string] ROM_FILE*` of the top gets an absolute path.
 rom_path() {
@@ -136,9 +187,7 @@ for top in "${TOP_LIST[@]}"; do
     if ! "$YOSYS" -q -l "$WORK/$top.yosys.log" -p "$YCMD" >/dev/null 2>&1; then
       echo "lint: $top: yosys FAILED; log follows"; tail -n 40 "$WORK/$top.yosys.log"; FAIL=1
     fi
-    if ! "$IVERILOG" -g2012 -I"$RTL_DIR" -s qcore_lint_wrap -o /dev/null "$file" "$WRAP"; then
-      echo "lint: $top: iverilog FAILED"; FAIL=1
-    fi
+    icarus "$top" "$IVERILOG" -g2012 -I"$RTL_DIR" -s qcore_lint_wrap -o /dev/null "$file" "$WRAP"
     continue
   fi
 
@@ -151,11 +200,25 @@ for top in "${TOP_LIST[@]}"; do
   if ! "$YOSYS" -q -l "$WORK/$top.yosys.log" -p "$YCMD" >/dev/null 2>&1; then
     echo "lint: $top: yosys FAILED; log follows"; tail -n 40 "$WORK/$top.yosys.log"; FAIL=1
   fi
-  if ! "$IVERILOG" -g2012 -I"$RTL_DIR" -s "$top" -o /dev/null \
-       ${ROM_I[@]+"${ROM_I[@]}"} "${FILES[@]}"; then
-    echo "lint: $top: iverilog FAILED"; FAIL=1
-  fi
+  icarus "$top" "$IVERILOG" -g2012 -I"$RTL_DIR" -s "$top" -o /dev/null \
+    ${ROM_I[@]+"${ROM_I[@]}"} "${FILES[@]}"
 done
+
+# --- The Icarus notes, as a count ------------------------------------------
+if [ -s "$NOTES" ]; then
+  N_NOTES="$(wc -l < "$NOTES" | tr -d ' ')"
+  N_SEL="$(sort -u "$NOTES" | wc -l | tr -d ' ')"
+  N_FILES="$(cut -d: -f1 "$NOTES" | sort -u | wc -l | tr -d ' ')"
+  CLEAN=", no warnings"
+  [ "$ICARUS_OTHER" -eq 0 ] || CLEAN=""
+  echo "lint: iverilog: $N_NOTES sensitivity-list note(s) at $N_SEL select(s) in $N_FILES file(s)$CLEAN"
+  echo "lint:   (a constant part-select read in an always_comb; see \"Icarus notes\" in scripts/lint.sh)."
+  if [ -n "${LINT_ICARUS_NOTES:-}" ]; then
+    sort -u "$NOTES" | sed 's/^/lint:   /'
+  else
+    echo "lint:   LINT_ICARUS_NOTES=1 prints them; any other line Icarus prints fails this lint."
+  fi
+fi
 
 # --- Forbidden-construct greps --------------------------------------------
 # Each pattern below must produce zero matches across the RTL. Comments are

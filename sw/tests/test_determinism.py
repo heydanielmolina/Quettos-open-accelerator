@@ -77,7 +77,7 @@ def tiny_case() -> tuple[Case, Run, Run]:
 # --------------------------------------------------------------------------- the settings
 
 
-def test_the_baseline_is_the_configuration_every_measurement_is_taken_at() -> None:
+def test_baseline_is_the_measured_configuration() -> None:
     """`--lat 32 --bw-div 1`, one thread, and the zero start every measured run builds with."""
     assert (determinism.BASELINE.lat, determinism.BASELINE.bw_div) == (32, 1)
     assert determinism.BASELINE.threads == 1
@@ -85,7 +85,7 @@ def test_the_baseline_is_the_configuration_every_measurement_is_taken_at() -> No
     assert determinism.BASELINE.plusargs == [], "a fast build takes no runtime argument"
 
 
-def test_the_timing_settings_move_the_memory_model_and_the_thread_count() -> None:
+def test_timing_settings_move_memory_and_threads() -> None:
     """Latency 1 and 200, one beat every two cycles, and four threads -- nothing else."""
     by_name = {s.name: s for s in determinism.TIMING}
     assert set(by_name) == {"lat 1", "lat 200", "bw-div 2", "threads 4"}
@@ -95,14 +95,14 @@ def test_the_timing_settings_move_the_memory_model_and_the_thread_count() -> Non
     assert all(s.x_initial == "fast" for s in determinism.TIMING)
 
 
-def test_an_undefined_start_builds_unique_and_names_its_value() -> None:
+def test_undefined_start_builds_unique_and_names_its_value() -> None:
     """`XINIT=unique` plus the two plusargs that say what a variable starts at."""
     s = Setting("x", x_initial="unique", rand_reset=2, seed=7)
     assert s.make_args == ["THREADS=1", "XINIT=unique"]
     assert s.plusargs == ["+verilator+rand+reset+2", "+verilator+seed+7"]
 
 
-def test_the_undefined_starts_are_zeros_ones_and_one_per_seed() -> None:
+def test_undefined_starts_are_zeros_ones_and_seeds() -> None:
     """Every value Verilator's `unique` initialization can take, and a seed for the random one."""
     settings = determinism.x_initial((4, 9))
     assert [s.rand_reset for s in settings] == [0, 1, 2, 2]
@@ -111,12 +111,12 @@ def test_the_undefined_starts_are_zeros_ones_and_one_per_seed() -> None:
     assert len(determinism.x_initial()) == 2 + len(determinism.X_SEEDS)
 
 
-def test_a_setting_names_a_file_the_shell_takes() -> None:
+def test_setting_names_a_file_the_shell_takes() -> None:
     assert determinism._tag(Setting("x-init seed 12")) == "x-init-seed-12"
     assert determinism._tag(Setting("bw-div 2")) == "bw-div-2"
 
 
-def test_a_stopped_run_carries_the_line_it_stopped_on_without_the_repository_path() -> None:
+def test_stopped_run_names_the_line_not_the_path() -> None:
     """What the simulator printed is the report, so a stop names the file and the line."""
     line = f"%Error: {determinism.REPO}/rtl/qcore_row.sv:254: Assertion failed"
     proc = subprocess.CompletedProcess(["qcore_sim"], 1, stdout=f"{line}\n", stderr="")
@@ -128,13 +128,13 @@ def test_a_stopped_run_carries_the_line_it_stopped_on_without_the_repository_pat
 # --------------------------------------------------------------------------- the comparison
 
 
-def test_the_first_id_that_moved_is_the_one_reported() -> None:
+def test_first_moved_id_is_the_one_reported() -> None:
     assert determinism.first_difference([1, 2, 3], [1, 2, 3]) is None
     assert determinism.first_difference([1, 2, 3], [1, 9, 3]) == 1
     assert determinism.first_difference([1, 2], [1, 2, 3]) == 2
 
 
-def test_a_moved_id_is_reported_with_its_index_and_both_values() -> None:
+def test_moved_id_reports_its_index_and_both_values() -> None:
     base = run_of(determinism.BASELINE, [], ids=[4, 5, 6])
     got = run_of(Setting("lat 1", lat=1), [], ids=[4, 7, 6])
     (d,) = determinism.differences(base, got)
@@ -143,7 +143,7 @@ def test_a_moved_id_is_reported_with_its_index_and_both_values() -> None:
     assert "5 at the baseline, 7 here" in str(d)
 
 
-def test_a_moved_vsram_element_is_reported_with_the_descriptor_it_is_in() -> None:
+def test_moved_vsram_element_names_its_descriptor() -> None:
     """The comparison is compare.compare, so a difference names the descriptor and the element."""
     c = case(descriptors=2, count=4)
     base = run_of(determinism.BASELINE, [record(0, [1, 2, 3, 4]), record(1, [1, 2, 3, 4])])
@@ -161,7 +161,7 @@ def test_two_runs_that_agree_report_nothing() -> None:
     assert determinism.differences(base, got, c) == []
 
 
-def test_an_undefined_start_is_not_held_to_storage_the_program_did_not_write() -> None:
+def test_undefined_start_skips_unwritten_storage() -> None:
     """The vector SRAM and the scale registers hold whatever the start put in them."""
     c = case(descriptors=1, count=4)
     s = Setting("x-init seed 1", x_initial="unique", rand_reset=2)
@@ -195,14 +195,14 @@ def test_what_an_undefined_start_is_still_held_to_is_measured(tiny_case) -> None
     assert [d.what for d in ids] == ["generated id"], "and the ids are compared regardless"
 
 
-def test_a_bank_filter_that_covers_the_comparison_leaves_nothing(tiny_case, monkeypatch) -> None:
+def test_bank_filter_that_covers_everything_leaves_nothing(tiny_case, monkeypatch) -> None:
     """The no-op the guard exists for: a filter that swallows every field it is given."""
     c, base_case, base_gen = tiny_case
     monkeypatch.setattr(determinism, "BANK_FIELDS", ("",))
     assert determinism.kept_fields(base_case, base_gen, c) == frozenset()
 
 
-def test_a_row_says_what_happened_and_a_report_is_only_ok_when_every_row_is() -> None:
+def test_report_is_ok_only_when_every_row_is() -> None:
     ok = Row("lat 1", 10, [3])
     stopped = Row("x-init ones", 0, stopped="%Error: rtl/qcore_row.sv:254: Assertion failed")
     moved = Row(
@@ -215,7 +215,7 @@ def test_a_row_says_what_happened_and_a_report_is_only_ok_when_every_row_is() ->
     assert not Report("timing", "m", stopped, []).ok
 
 
-def test_the_width_check_leaves_out_only_the_padded_traffic() -> None:
+def test_width_check_leaves_out_only_padded_traffic() -> None:
     """A partial last tile is padded to the width, so only the two traffic counters are its own."""
     assert determinism.WIDTH_EXEMPT == frozenset({"PERF MACS", "PERF WT_BYTES"})
     assert not {"PC", "STATUS", "ARGMAX_TOK", "PERF DESCRIPTORS"} & determinism.WIDTH_EXEMPT
@@ -231,7 +231,7 @@ def tiny(tmp_path_factory) -> dict[int, Path]:
     return determinism.tiny_images(tmp_path_factory.mktemp("det"), seed=0)
 
 
-def test_the_two_widths_are_one_model(tiny) -> None:
+def test_two_widths_are_one_model(tiny) -> None:
     """Same weights, same descriptors, same context, different tiling."""
     layouts = {wb: compiler.load_layout(tiny[wb]) for wb in tiny}
     assert set(layouts) == {64, 128}
@@ -244,7 +244,7 @@ def test_the_two_widths_are_one_model(tiny) -> None:
     )
 
 
-def test_the_width_cases_dump_the_same_elements_at_both_widths(tiny) -> None:
+def test_width_cases_dump_the_same_elements(tiny) -> None:
     """One int32 per vocabulary entry, and the VSRAM window the shorter compile has."""
     cases = determinism.width_cases(tiny, tok=0)
     counts = {c.ranges[0][2] for c in cases.values()}
@@ -255,7 +255,7 @@ def test_the_width_cases_dump_the_same_elements_at_both_widths(tiny) -> None:
     assert all(len(c.program) == 4 for c in cases.values())
 
 
-def test_the_layer_width_case_runs_the_positions_both_widths_name(tiny) -> None:
+def test_layer_width_case_runs_the_shared_positions(tiny) -> None:
     """A whole decoder layer at the shared positions, and no region the tiling moves."""
     cases = determinism.width_cases(tiny, tok=0, program="layer")
     passes = {c.passes for c in cases.values()}
@@ -323,7 +323,7 @@ def stub_rtl(
     monkeypatch.setattr(determinism, "run_generate", run_generate)
 
 
-def test_the_width_report_prints_the_cycles_of_the_program_its_row_names(tiny, monkeypatch) -> None:
+def test_width_report_prints_its_programs_cycles(tiny, monkeypatch) -> None:
     """A row names a program, so the cycles beside it are that program's own run."""
     stub_rtl(monkeypatch, case_cycles={64: 1111, 128: 2222}, gen_cycles={64: 3333, 128: 4444})
     r = determinism.check_width(tiny, program="bringup", max_new=2)
@@ -333,7 +333,7 @@ def test_the_width_report_prints_the_cycles_of_the_program_its_row_names(tiny, m
     assert [row.ids for row in r.all_rows] == [[5, 6], [5, 6]]
 
 
-def test_a_check_whose_filter_leaves_nothing_to_compare_is_refused(tiny, monkeypatch) -> None:
+def test_check_with_nothing_to_compare_is_refused(tiny, monkeypatch) -> None:
     """The guard: a bank-free comparison that judges a run on nothing does not run at all.
 
     It is the counterpart of the width check's, where two widths that share no
@@ -349,7 +349,7 @@ def test_a_check_whose_filter_leaves_nothing_to_compare_is_refused(tiny, monkeyp
         determinism.check(tiny[64], DEMO, settings, **kw)
 
 
-def test_a_filter_that_leaves_only_the_ids_is_refused(tiny, monkeypatch) -> None:
+def test_filter_that_leaves_only_the_ids_is_refused(tiny, monkeypatch) -> None:
     """A filter that strips the per-descriptor state, but not the ids, is still a no-op.
 
     The stepped state run is what a bank-free comparison judges; the generation
@@ -380,7 +380,7 @@ def test_a_filter_that_leaves_only_the_ids_is_refused(tiny, monkeypatch) -> None
 # --------------------------------------------------------------------------- the RTL
 
 
-def test_the_timing_does_not_move_a_value(tiny) -> None:
+def test_timing_does_not_move_a_value(tiny) -> None:
     """Latency 1 / 32 / 200, half bandwidth and four threads, over a whole decoder layer."""
     needs_verilator()
     r = determinism.check_timing(tiny[64], DEMO, program="layer", max_new=2)
@@ -393,7 +393,7 @@ def test_the_timing_does_not_move_a_value(tiny) -> None:
     assert len(set(r.baseline.ids)) >= 1 and r.baseline.ids == r.rows[0].ids
 
 
-def test_the_two_port_widths_produce_the_same_values(tiny) -> None:
+def test_two_port_widths_produce_the_same_values(tiny) -> None:
     """WB 64 against WB 128 on one model: the ids and every dumped logit, at different cycles."""
     needs_verilator()
     r = determinism.check_width(tiny, max_new=2)
@@ -403,7 +403,7 @@ def test_the_two_port_widths_produce_the_same_values(tiny) -> None:
     assert r.baseline.cycles != r.rows[0].cycles, "the widths read the weights in different beats"
 
 
-def test_the_two_port_widths_agree_over_a_whole_decoder_layer(tiny) -> None:
+def test_two_port_widths_agree_over_a_decoder_layer(tiny) -> None:
     """The layer program at both widths: every VSRAM element and scale register, per descriptor."""
     needs_verilator()
     r = determinism.check_width(tiny, program="layer", max_new=2)
@@ -413,7 +413,7 @@ def test_the_two_port_widths_agree_over_a_whole_decoder_layer(tiny) -> None:
     assert r.baseline.ids == r.rows[0].ids and r.baseline.ids
 
 
-def test_the_padded_traffic_is_the_only_thing_the_two_widths_disagree_on(tiny) -> None:
+def test_padded_traffic_is_the_only_difference(tiny) -> None:
     """What the exemption covers is measured, not assumed: it is the whole of the difference."""
     needs_verilator()
     cases = determinism.width_cases(tiny, 0, program="layer")
@@ -440,7 +440,7 @@ def _flipped(image_dir: Path, region: str, where: Path) -> Path:
     return where
 
 
-def test_the_width_check_reports_a_flipped_embedding_byte(tiny, tmp_path) -> None:
+def test_width_check_reports_a_flipped_embedding_byte(tiny, tmp_path) -> None:
     """The counterpart for the bring-up program: a byte of the row the token gathers."""
     needs_verilator()
     hurt = _flipped(tiny[128], "embed", tmp_path / "hurt-embed")
@@ -451,7 +451,7 @@ def test_the_width_check_reports_a_flipped_embedding_byte(tiny, tmp_path) -> Non
     )
 
 
-def test_the_layer_width_check_reports_a_flipped_weight_byte(tiny, tmp_path) -> None:
+def test_layer_width_check_reports_a_flipped_weight_byte(tiny, tmp_path) -> None:
     """The counterpart for the layer program: one byte of a layer-0 gamma row, at its element."""
     needs_verilator()
     hurt = _flipped(tiny[128], "layer.0.gamma_in", tmp_path / "hurt-gamma")

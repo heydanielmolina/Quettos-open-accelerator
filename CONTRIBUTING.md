@@ -1,9 +1,8 @@
 # Contributing to Quettos Core
 
-Thanks for looking. This repository is a small, opinionated hardware project.
-The rules below exist so that the same SystemVerilog passes Verilator 5,
-Yosys 0.65 and Icarus 13 with zero rewrites, and so that every number in the
-README can be traced to a command that produced it.
+The rules below keep the same SystemVerilog passing Verilator 5, Yosys 0.65 and
+Icarus 13 with zero rewrites, and every number in `README.md` traceable to the
+command that produced it.
 
 ## 1. Pull requests and commits
 
@@ -23,6 +22,11 @@ README can be traced to a command that produced it.
   Do not use a system or Homebrew Python. `torch` is never a core dependency; it
   lives in the optional `ref` group and CI never installs it.
 - No secrets and no Hugging Face tokens. Both models are ungated.
+- A dependency belongs in `pyproject.toml` and a file belongs in the commit.
+  `make clean-clone` runs the quick start from a clone of the committed tree
+  with nothing cached, so a package installed by hand or a file that was never
+  added fails there instead of on a reader's machine
+  (`docs/VERIFICATION.md`, layer 9).
 - Do not vendor code from other projects without a license review.
 
 ## 3. SystemVerilog subset and coding rules
@@ -76,15 +80,14 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   `always_ff @(posedge clk) if (rst) ... else ...`.
 - **`unique case` / `priority case`**, `unique if`, `priority if`.
 - **`interface`**, **`class`**, `modport`, `program`, `clocking`, `assert
-  property`, `always_latch`, `initial` blocks in synthesizable modules -- with
-  one exception, for one reason. The table images the ROM rule above mandates
-  reach their memory through `$readmemh`, and an initializing `$readmemh` has
-  no placement outside an `initial` block that Verilator, Yosys and Icarus all
-  read the same way. `rtl/qcore_lut_rom.sv` therefore carries
-  `initial $readmemh(ROM_FILE, mem);` and is the only file under `rtl/` with an
-  `initial` block (`docs/RTL.md` 3.15). State a reset can reach is initialized
-  in `always_ff` under `rst` instead, and a second initial block needs a reason
-  of the same kind.
+  property`, `always_latch`, `initial` blocks in synthesizable modules.
+  `rtl/qcore_lut_rom.sv` is the exception: the table images the ROM rule above
+  mandates reach their memory through `$readmemh`, and an initializing
+  `$readmemh` has no placement outside an `initial` block that Verilator, Yosys
+  and Icarus all read the same way, so that file carries
+  `initial $readmemh(ROM_FILE, mem);` and is the only one under `rtl/` that does
+  (`docs/RTL.md` 3.15). State a reset can reach is initialized in `always_ff`
+  under `rst`.
 - Literal **`$readmemh("...")`** with a string constant (CI greps for it).
 - Multi-dimensional unpacked memories, `automatic` variables, `real`,
   `string` variables and `string` parameters, `$clog2` on anything but
@@ -108,24 +111,23 @@ Yosys 0.65 (`read_verilog -sv`) and Icarus 13 (`-g2012`).
   localparams, one module per file, file name equals module name.
 - Every module header comment states the module's contract in a few lines:
   inputs, outputs, latency, and what it does not do.
-- Keep modules small enough to lint individually. A file over 1,000 lines needs
-  a header comment giving the reason the module does not split, and one file
-  carries such a note: `rtl/qcore_vpu_top.sv`, whose passes are stages of one
-  shift register, so a boundary drawn through them would carry the stage indices
-  across it and put the issue decision on a combinational round trip through an
-  interface -- the shape the handshake rules of `docs/RTL.md` section 1 exist to
-  keep out. Without a reason of that kind, split the module.
+- Keep modules small enough to lint individually, and split one that is not.
+  `rtl/qcore_vpu_top.sv` is the one file over 1,000 lines: its passes are stages
+  of one shift register, so a boundary drawn through them would carry the stage
+  indices across it and put the issue decision on a combinational round trip
+  through an interface -- the shape the handshake rules of `docs/RTL.md` section
+  1 exist to keep out. Its header comment says so.
 
 ## 4. Three-parser lint recipe
 
-`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` file -- the
-seventeen modules and the package -- and every `sim/cocotb/wrappers/*.sv` block
-assembly as its own top: nineteen tops. The package is taken the way each tool
-takes a package (Verilator elaborates it as the top unit, Yosys parses it, and
-Icarus, which needs a module, gets an empty wrapper). The file list is
-`qcore_pkg.sv` first and then every other file once: Yosys and Icarus resolve
-`qcore_pkg::` references only after parsing the package, and a file named twice
-is a duplicate declaration (Verilator `MODDUP`, an Icarus syntax error).
+`make lint` runs `scripts/lint.sh`, which lints every `rtl/*.sv` file and every
+`sim/cocotb/wrappers/*.sv` block assembly as its own top. The package is taken
+the way each tool takes a package (Verilator elaborates it as the top unit,
+Yosys parses it, and Icarus, which needs a module, gets an empty wrapper). The
+file list is `qcore_pkg.sv` first and then every other file once: Yosys and
+Icarus resolve `qcore_pkg::` references only after parsing the package, and a
+file named twice is a duplicate declaration (Verilator `MODDUP`, an Icarus
+syntax error).
 
 ```sh
 SV="rtl/qcore_pkg.sv $(ls rtl/*.sv | grep -v qcore_pkg.sv | tr '\n' ' ')"
@@ -179,9 +181,12 @@ message.
 ## 6. Measured numbers (README rule)
 
 - Every performance, synthesis or quality number in `README.md` comes from a
-  command in this repository (`make demo`, `make perf`, `make synth`,
-  `make bringup-sweep`, `uv run quettos compare`, `uv run quettos check`) and
-  the row names that command.
+  command in this repository (`make demo`, `make demo-toolcall`,
+  `make clean-clone`, `make perf`, `make synth`, `make bringup-sweep`,
+  `uv run quettos compare`, `uv run quettos check`) and the row names that
+  command. The quality rows carry one more: `make provenance` rebuilds the text
+  each of them was scored on and holds its SHA-256 to the record stored beside
+  the rows, so which set a number belongs to is a command rather than a claim.
 - Synthesis figures are never typed by hand: `scripts/synth_report.py` writes
   each `syn/reports/*.md` from the Yosys log of the run that produced it -- the
   tool version, the elaborated parameters, the `stat -tech xilinx` table, the
@@ -196,7 +201,9 @@ message.
 - A wall-clock figure is a median with its range and the number of runs, and
   it is quoted once, on the page that owns it: `docs/PERFORMANCE.md` for a
   harness run, that tool's own `sim/<tool>/README.md` for a `make` target of
-  its own. Everywhere else names the command and points at that page.
+  its own, and `docs/VERIFICATION.md` (layer 9) for a run timed from `git clone`
+  with nothing cached. Everywhere else names the command and points at that
+  page.
 - Analytical projections live in `docs/`, labeled **estimate**.
 - An FPGA tokens/s figure states the clock and the memory bandwidth it is
   derived from, and the clock is a place-and-route timing result: the derivation

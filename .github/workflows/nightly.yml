@@ -1,10 +1,10 @@
 # Quettos Core nightly: the checks that are too long for a pull request
 # (docs/VERIFICATION.md layer 8). The two end-to-end jobs build a compiled
-# image from the checkpoint and run the whole oracle chain on it, and
+# image from the checkpoint and run the whole oracle chain on it,
 # determinism-model runs one complete model at both port widths and at every
-# memory and thread setting; the three jobs that are still held say on the gate
-# what they are waiting for, and their step repeats it so a manual run reports
-# it.
+# memory and thread setting, and quality-regen scores the held-out corpus again
+# on both models; the two jobs that are still held say on the gate what they
+# are waiting for, and their step repeats it so a manual run reports it.
 # The whole-core xc7 synthesis is not here: `make synth` runs it on every pull
 # request and rewrites syn/reports/qcore_top.md from the run.
 #
@@ -202,10 +202,51 @@ jobs:
       - uses: actions/checkout@v7
       - run: echo "x-initial-unique is held until the range check of rtl/qcore_lut_interp.sv reads only the table its request addressed; make determinism-x runs the check and names the run it stops on"
 
+  # The held-out quality rows, measured again (docs/VERIFICATION.md, layer 6).
+  # `uv run quettos corpus` fetches wikitext-2-raw-v1.zip and checks its
+  # SHA-256; `uv run quettos check <alias> --heldout` cuts 64 non-overlapping
+  # windows of 512 tokens out of the test split and scores the 32,704 positions
+  # that have a next token, at W8A16 and at W8A8, on the integer golden model
+  # against the float32 reference forward of sw/quettos/reference_np.py -- numpy
+  # over the same checkpoint, so this job installs no optional group and no
+  # torch. A run refuses to write when a saturation or shift-error counter is
+  # non-zero, and the last step prints what the regeneration moved in the rows
+  # the repository ships.
+  # What it costs: the two scoring commands took 985.49 s on Qwen and 626.13 s
+  # on SmolLM2 (`/usr/bin/time -p`, one run each) in the run that measured the
+  # table in docs/NUMERICS.md, on the machine docs/PERFORMANCE.md names.
   quality-regen:
-    if: false   # held: `uv run quettos check` scores the calibration corpus. The job scores golden vs HF fp32 over >= 32k WikiText-2 tokens (installs the optional 'ref' group) and runs when that command takes the wider set (docs/ROADMAP.md, v1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - run: echo "quality-regen is held until uv run quettos check scores a set wider than the calibration corpus -- at least 32k WikiText-2 tokens against HF fp32 (docs/ROADMAP.md, v1.1)"
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      # The checkpoints: sw/quettos/model.py downloads into build/models/<name>
+      # and keeps the Hub cache in build/hf_cache, so ~/.cache is never written.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            build/models
+            build/hf_cache
+          key: hf-qwen-and-smollm2-${{ hashFiles('sw/quettos/model.py') }}
+      - run: uv sync --frozen
+      - name: Download both checkpoints (ungated, no token)
+        run: |
+          uv run quettos download qwen
+          uv run quettos download smollm2
+      - name: Fetch the held-out corpus and check the SHA-256 of what it holds
+        run: uv run quettos corpus
+      - name: Quantize both models
+        run: |
+          uv run quettos quantize qwen
+          uv run quettos quantize smollm2
+      - name: Score the 64 held-out windows at W8A16 and W8A8, both models
+        run: |
+          uv run quettos check qwen --heldout
+          uv run quettos check smollm2 --heldout
+      - name: What the regeneration moved in the checked-in rows
+        if: always()
+        run: git --no-pager diff -- models

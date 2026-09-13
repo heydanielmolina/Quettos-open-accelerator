@@ -341,7 +341,7 @@ async def test_every_counter_has_exactly_one_source(dut):
 
 
 @cocotb.test()
-async def test_the_one_hot_detector_counts_every_claim(dut):
+async def test_one_hot_detector_counts_every_claim(dut):
     """``bucket_ones`` is the population count the module's own check compares against one.
 
     A bucket mask is presented and withdrawn between two rising edges, so the

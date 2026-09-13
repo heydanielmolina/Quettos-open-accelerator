@@ -175,6 +175,43 @@ variant issues `ceil(64/WB)` `WB`-byte writes, one per V tile, and both carry
 `MAX_CTX` in the `k` field. The compiler writes zero data and zero meta for the
 whole `MAX_CTX` range so that unwritten positions read as `m = 0`.
 
-Prefix save and restore (`--kv-save FILE`, `--kv-load FILE`) copy this region
-byte for byte at the layout above, so a saved file is valid for the model and
-the port width that wrote it.
+## The prefix file
+
+An agent turn repeats a long head -- the system message and the tool
+descriptions are the same on every call -- so the KV region above is worth
+computing once and restoring. `--kv-save FILE` writes it byte for byte at the
+layout above, behind a header that records what those bytes were computed
+under; `--kv-load FILE` holds every term of that record to the run restoring
+the file and starts the token loop at the first position the file does not
+cover. Little-endian throughout.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic, `QKVPRFX1` |
+| 8 | 4 | format version, 1 |
+| 12 | 4 | header bytes, which is where the payload starts |
+| 16 | 4 | ISA version |
+| 20 | 4 | `WB` |
+| 24 | 4 | `MAX_CTX` |
+| 28 | 4 | positions: the leading positions of the sequence the file covers |
+| 32 | 8 | KV base address in the image |
+| 40 | 8 | KV region size, which is also the payload size |
+| 48 | 64 | model name, NUL padded |
+| 112 | 64 | SHA-256 of `image.bin`, the 64 hex characters `layout.json` records |
+| 176 | 4 x positions | the token id fed in at each covered position, in order |
+
+The header is `176 + 4 * positions` bytes and the payload is the whole KV
+region, so a file is 14,155,776 B plus its header on Qwen and 26,542,080 B plus
+its header on SmolLM2, at `MAX_CTX = 2048, WB = 64`. A restore is refused,
+before the run's first cycle, when the ISA version, the width, `MAX_CTX`, the
+model name, the image SHA-256, the KV base or the KV size differs from the
+run's own; when the file covers no position, or more than the prompt leaves;
+and when any position it covers carries a token this prompt does not have
+there. The last of those is what makes a saved head belong to a conversation
+rather than to a file name: the ids are in the header, so a prefix computed
+from other text is refused rather than continued.
+
+`make regen-prefix` writes one from `IMAGE`'s own prompt, and `make
+demo-toolcall` is the demonstration: the system-and-tools turn computed once on
+`qcore_top`, restored, and only the user's turn prefilled after it
+(`docs/PERFORMANCE.md`, the prefix a run restores).

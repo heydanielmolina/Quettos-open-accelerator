@@ -10,6 +10,9 @@
 #   make -C sim/verilator csr-check              CSR driver against rtl/qcore_csr.sv
 #   make -C sim/verilator clean
 
+VERILATOR       ?= verilator
+HARNESS_CXX     ?= c++
+
 TOP             ?= qcore_top
 WB              ?= 64
 B_MAX           ?= 1
@@ -69,10 +72,38 @@ ifneq ($(THREADS),1)
 THREADFLAGS := --threads $(THREADS)
 endif
 
+# The C++ warning suppressions Verilator hands its build come from the
+# installation, not from here: CFG_CXXFLAGS_NO_UNUSED in verilated.mk, fixed
+# when Verilator itself was compiled and recorded there beside the compiler
+# that compiled it (CFG_CXX_VERSION). A Verilator built by a newer compiler
+# therefore names suppressions the compiler on this machine may not have. The
+# Verilator 5.048 and Apple clang 17 of docs/PERFORMANCE.md are such a pair:
+# the list carries -Wno-unnecessary-virtual-specifier, that compiler has no
+# such warning, and it says so once per translation unit.
+#
+# One probe compile of an empty translation unit collects the suppressions this
+# compiler answers as unknown, and the rest go back to the build's own make. The
+# compile line then carries only options this compiler reads, so
+# -Wunknown-warning-option stays armed for the options set here rather than
+# being switched off, and a compiler that reports none is handed nothing and
+# builds exactly as before.
+NO_UNUSED     := $(shell sed -n 's/^CFG_CXXFLAGS_NO_UNUSED *= *//p' \
+                   "$(shell $(VERILATOR) --getenv VERILATOR_ROOT 2>/dev/null)/include/verilated.mk" 2>/dev/null)
+NO_UNUSED_BAD := $(shell printf '' | LC_ALL=C $(HARNESS_CXX) -x c++ -fsyntax-only $(filter -W%,$(NO_UNUSED)) - 2>&1 | \
+                   sed -n "s/.*unknown warning option '\(-W[^']*\)'.*/\1/p" | sort -u)
+EMPTY :=
+SPACE := $(EMPTY) $(EMPTY)
+ifneq ($(NO_UNUSED_BAD),)
+# Spaces escaped: the value is one argument to Verilator and one variable
+# setting on the make command line under it.
+NO_UNUSED_FIX := -MAKEFLAGS "CFG_CXXFLAGS_NO_UNUSED=$(subst $(SPACE),\$(SPACE),$(filter-out $(NO_UNUSED_BAD),$(NO_UNUSED)))"
+endif
+
 # Flags from docs/PERFORMANCE.md: the same set the speed probe was measured with.
 VFLAGS := --cc --exe --build -j 0 -O3 --x-assign fast --x-initial $(XINIT) --no-assert \
           --no-timing -Wall --output-split 20000 $(TRACEFLAGS) $(THREADFLAGS) \
-          -CFLAGS "-O2 -I$(HERE) $(DEFS)" -I$(RTL) $(PARAMS) --top-module $(TOP)
+          -CFLAGS "-O2 -I$(HERE) $(DEFS)" -I$(RTL) $(PARAMS) --top-module $(TOP) \
+          $(NO_UNUSED_FIX)
 
 CONFIG := $(TOP) $(WB) $(B_MAX) $(VL) $(VSRAM_WORDS) $(VPU_FIFO_BEATS) $(FIFO_BEATS) \
           $(META_FIFO_BEATS) $(ACC_W) $(MAX_BURST) $(DQ_DEPTH) $(THREADS) $(TRACE) $(XINIT)
@@ -92,7 +123,7 @@ build: $(BIN)
 $(BIN):
 	@mkdir -p $(OBJ)
 	@echo "harness: verilating $(TOP) WB=$(WB) B_MAX=$(B_MAX) threads=$(THREADS) -> $(OBJ)"
-	@cd $(REPO) && bash -c 'TIMEFORMAT="harness: build_seconds=%R"; time verilator $(VFLAGS) --Mdir $(OBJ) -o qcore_sim $(SV) $(HERE)/main.cpp'
+	@cd $(REPO) && bash -c 'TIMEFORMAT="harness: build_seconds=%R"; time $(VERILATOR) $(VFLAGS) --Mdir $(OBJ) -o qcore_sim $(SV) $(HERE)/main.cpp'
 
 # Run from the repository root so relative output paths land where the rest of
 # the build does.
@@ -104,9 +135,10 @@ csr-check: $(CSR_BIN)
 
 $(CSR_BIN):
 	@mkdir -p $(CSR_OBJ)
-	@cd $(REPO) && verilator --cc --exe --build -j 0 -O3 --x-assign fast --x-initial fast \
+	@cd $(REPO) && $(VERILATOR) --cc --exe --build -j 0 -O3 --x-assign fast --x-initial fast \
 	  --no-assert --no-timing -Wall --output-split 20000 -CFLAGS "-O2 -I$(HERE)" -I$(RTL) \
-	  --top-module qcore_csr --Mdir $(CSR_OBJ) -o csr_check $(RTL)/qcore_csr.sv $(HERE)/csr_check.cpp
+	  --top-module qcore_csr --Mdir $(CSR_OBJ) -o csr_check $(RTL)/qcore_csr.sv $(HERE)/csr_check.cpp \
+	  $(NO_UNUSED_FIX)
 
 where:
 	@echo $(BIN)

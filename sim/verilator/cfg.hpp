@@ -103,8 +103,13 @@ const char* const USAGE =
     "  --dump-dir DIR     where --dump-ops writes (build/perf/steps)\n"
     "  --dump-bytes N     --dump-ops also writes the bytes of every planned\n"
     "                     memory region of at most N bytes, next to its hash (0)\n"
-    "  --kv-save FILE     write the KV region to FILE after the run\n"
-    "  --kv-load FILE     load the KV region from FILE before the run\n"
+    "  --kv-save FILE     write the prefix -- the KV region and the record of\n"
+    "                     what it belongs to -- to FILE after the run\n"
+    "  --kv-load FILE     restore the prefix in FILE and run the positions after\n"
+    "                     it; a file that belongs to another image, width or\n"
+    "                     prompt is refused\n"
+    "  --prefix-len N     prefill only the first N prompt ids and stop, so what\n"
+    "                     --kv-save writes is that prefix (needs --max-new 0)\n"
     "  --max-cycles N     stop and fail after N cycles (0: no limit)\n"
     "  --quiet            counters and the final line only\n"
     "  +verilator+...     a Verilator runtime plusarg, passed to the kernel;\n"
@@ -158,6 +163,9 @@ struct Options {
   uint64_t trace_cycles = 20000;
   std::string kv_save;
   std::string kv_load;
+  // How many leading prompt ids a prefix run consumes; 0 is the token loop's
+  // own extent, every prompt id but the last.
+  uint32_t prefix_len = 0;
   std::vector<int64_t> prompt_ids;
   std::vector<int64_t> eos_ids;
   uint32_t lat = 32;
@@ -274,6 +282,7 @@ inline bool parse_args(int argc, char** argv, Options* o) {
     else if (a == "--dump-bytes") o->dump_bytes = static_cast<uint32_t>(strtoul(next(i, "--dump-bytes").c_str(), nullptr, 0));
     else if (a == "--kv-save") o->kv_save = next(i, "--kv-save");
     else if (a == "--kv-load") o->kv_load = next(i, "--kv-load");
+    else if (a == "--prefix-len") o->prefix_len = static_cast<uint32_t>(strtoul(next(i, "--prefix-len").c_str(), nullptr, 0));
     else if (a == "--program") o->program = next(i, "--program");
     else if (a == "--program-addr") o->program_addr = strtoull(next(i, "--program-addr").c_str(), nullptr, 0);
     else if (a == "--bringup-json") o->bringup_json = next(i, "--bringup-json");
@@ -307,6 +316,15 @@ inline bool parse_args(int argc, char** argv, Options* o) {
                              !o->dump_mem.empty() || !o->passes.empty())) {
     throw std::runtime_error("--sreg, --dump-vsram, --dump-mem and --at belong to a --program run");
   }
+  // A prefix run computes a prefix and stops: what it leaves in the KV is the
+  // state of those positions and nothing after them.
+  if (o->prefix_len != 0 && o->max_new != 0) {
+    throw std::runtime_error("--prefix-len prefills a prefix and generates nothing; pass "
+                             "--max-new 0 with it");
+  }
+  if (o->prefix_len != 0 && !o->program.empty()) {
+    throw std::runtime_error("--prefix-len belongs to the token loop, not to a --program run");
+  }
   if (o->passes.empty()) o->passes.push_back(Pass{o->tok, o->pos});
   if (o->prompt.empty() && o->prompt_ids.empty()) o->prompt = o->image + "/prompt.tokens";
   return true;
@@ -333,6 +351,7 @@ struct Layout {
   std::vector<int64_t> eos_ids;
   Program decode;
   Program prefill;
+  std::string image_sha256;
   uint64_t kv_base = 0;
   uint64_t kv_size = 0;
   bool has_tokens_bin = false;
@@ -384,6 +403,7 @@ struct Layout {
     }
     l.image_file = r.at("image.file").str();
     l.image_size = static_cast<uint64_t>(r.at("image.size").i64());
+    l.image_sha256 = r.at("image.sha256").str();
     l.decode = program_of(r.at("programs.decode"));
     l.prefill = program_of(r.at("programs.prefill"));
     l.kv_base = static_cast<uint64_t>(r.at("bases.kv").i64());

@@ -299,7 +299,7 @@ def edit(path: Path, change) -> None:
 # --------------------------------------------------------------------------- the image
 
 
-def test_a_clean_run_reports_ok(run_dir, capsys) -> None:
+def test_clean_run_reports_ok(run_dir, capsys) -> None:
     """The fixture is a run the report accepts, so every failure below is the change it names."""
     image, perf = run_dir
     assert report(image, perf) == 0
@@ -342,7 +342,7 @@ def entry_of(layout: dict[str, Any], dotted: str) -> dict[str, Any]:
     return node
 
 
-def test_the_report_finds_every_hashed_entry_of_the_layout(run_dir) -> None:
+def test_report_finds_every_hashed_entry(run_dir) -> None:
     """What the report walks for and what the compiler writes are the same set."""
     image, _ = run_dir
     layout = json.loads((image / "layout.json").read_text(encoding="utf-8"))
@@ -350,9 +350,7 @@ def test_the_report_finds_every_hashed_entry_of_the_layout(run_dir) -> None:
 
 
 @pytest.mark.parametrize("dotted", HASHED)
-def test_a_file_that_no_longer_hashes_to_its_record_fails_the_report(
-    run_dir, capsys, dotted
-) -> None:
+def test_changed_file_fails_the_report(run_dir, capsys, dotted) -> None:
     """Every file the layout carries a hash for is hashed, not the image alone."""
     image, perf = run_dir
     layout = json.loads((image / "layout.json").read_text(encoding="utf-8"))
@@ -364,7 +362,7 @@ def test_a_file_that_no_longer_hashes_to_its_record_fails_the_report(
 
 
 @pytest.mark.parametrize("dotted", IN_IMAGE)
-def test_a_file_the_layout_names_and_is_not_there_fails_the_report(run_dir, capsys, dotted) -> None:
+def test_missing_file_fails_the_report(run_dir, capsys, dotted) -> None:
     """A missing file is reported as missing rather than passed over."""
     image, perf = run_dir
     layout = json.loads((image / "layout.json").read_text(encoding="utf-8"))
@@ -373,7 +371,7 @@ def test_a_file_the_layout_names_and_is_not_there_fails_the_report(run_dir, caps
     assert "is not there" in capsys.readouterr().out
 
 
-def test_a_doctored_token_table_fails_the_report(run_dir, capsys) -> None:
+def test_doctored_token_table_fails_the_report(run_dir, capsys) -> None:
     """The table turns the hardware's ids into the sentence: a doctored one is a failed run.
 
     The ids are the hardware's either way, so the only thing a rewritten table
@@ -390,7 +388,7 @@ def test_a_doctored_token_table_fails_the_report(run_dir, capsys) -> None:
     assert "tokens.bin hashes to" in out and "demo: FAILED" in out
 
 
-def test_a_prompt_file_of_other_ids_fails_the_report(run_dir, capsys) -> None:
+def test_prompt_file_of_other_ids_fails_the_report(run_dir, capsys) -> None:
     """The prompt entry hashes the ids the file carries, which is the digest the compiler took."""
     image, perf = run_dir
     ids = [int(v) for v in (image / "prompt.tokens").read_text().split()]
@@ -399,7 +397,7 @@ def test_a_prompt_file_of_other_ids_fails_the_report(run_dir, capsys) -> None:
     assert "prompt.tokens hashes to" in capsys.readouterr().out
 
 
-def test_a_prompt_file_that_is_not_ids_fails_the_report(run_dir, capsys) -> None:
+def test_prompt_file_that_is_not_ids_fails_the_report(run_dir, capsys) -> None:
     """A file the digest cannot be taken of ends in a verdict, not in a traceback."""
     image, perf = run_dir
     (image / "prompt.tokens").write_text("thirty-seven\n", encoding="utf-8")
@@ -418,7 +416,7 @@ def test_one_corrupted_byte_fails_the_report(run_dir, capsys) -> None:
     assert "hashes to" in out and "layout.json describes" in out
 
 
-def test_a_truncated_image_fails_the_report(run_dir, capsys) -> None:
+def test_truncated_image_fails_the_report(run_dir, capsys) -> None:
     """A file of the wrong size is caught before its hash is."""
     image, perf = run_dir
     blob = (image / "image.bin").read_bytes()
@@ -427,7 +425,7 @@ def test_a_truncated_image_fails_the_report(run_dir, capsys) -> None:
     assert "layout.json describes" in capsys.readouterr().out
 
 
-def test_an_image_the_run_did_not_execute_fails_the_report(run_dir, capsys) -> None:
+def test_unexecuted_image_fails_the_report(run_dir, capsys) -> None:
     """The report holds the run's own record of what it mapped to the directory it is given."""
     image, perf = run_dir
     edit(perf, lambda d: d["run"].__setitem__("image", "/tmp/somewhere-else/image.bin"))
@@ -435,7 +433,7 @@ def test_an_image_the_run_did_not_execute_fails_the_report(run_dir, capsys) -> N
     assert "the hardware executed /tmp/somewhere-else/image.bin" in capsys.readouterr().out
 
 
-def test_a_run_record_without_an_image_fails_the_report(run_dir, capsys) -> None:
+def test_run_record_without_an_image_fails_the_report(run_dir, capsys) -> None:
     """A record that does not say which image ran cannot be reported on."""
     image, perf = run_dir
     edit(perf, lambda d: d["run"].pop("image"))
@@ -446,7 +444,7 @@ def test_a_run_record_without_an_image_fails_the_report(run_dir, capsys) -> None
 # --------------------------------------------------------------------------- the generation
 
 
-def test_an_empty_generation_fails_the_report(run_dir, capsys) -> None:
+def test_empty_generation_fails_the_report(run_dir, capsys) -> None:
     """A run that generated nothing is a failure, not a match against an empty list."""
     image, perf = run_dir
     write_perf(perf, image, list(range(1, 38)), [])
@@ -456,7 +454,7 @@ def test_an_empty_generation_fails_the_report(run_dir, capsys) -> None:
     assert "identical to" not in out
 
 
-def test_an_empty_generation_fails_even_without_a_reference(run_dir, capsys) -> None:
+def test_empty_generation_fails_without_a_reference(run_dir, capsys) -> None:
     """``--no-reference`` drops the record, not the requirement that the run produced ids."""
     image, perf = run_dir
     write_perf(perf, image, list(range(1, 38)), [])
@@ -464,7 +462,7 @@ def test_an_empty_generation_fails_even_without_a_reference(run_dir, capsys) -> 
     assert "generated no ids" in capsys.readouterr().out
 
 
-def test_a_wrong_id_fails_the_report(run_dir, capsys) -> None:
+def test_wrong_id_fails_the_report(run_dir, capsys) -> None:
     """The positive control's counterpart: an id the record does not carry."""
     image, perf = run_dir
     ids = recorded_ids()
@@ -476,7 +474,7 @@ def test_a_wrong_id_fails_the_report(run_dir, capsys) -> None:
 # --------------------------------------------------------------------------- the prompt
 
 
-def test_a_prompt_the_image_was_not_compiled_with_fails_the_report(run_dir, capsys) -> None:
+def test_uncompiled_prompt_fails_the_report(run_dir, capsys) -> None:
     """A run given other ids is neither labelled with the image's prompt nor held to its record."""
     image, perf = run_dir
     other = list(range(2, 39))
@@ -487,7 +485,7 @@ def test_a_prompt_the_image_was_not_compiled_with_fails_the_report(run_dir, caps
     assert f"identical to {RECORD}" not in out
 
 
-def test_a_prompt_of_another_length_fails_the_report(run_dir, capsys) -> None:
+def test_prompt_of_another_length_fails_the_report(run_dir, capsys) -> None:
     """The count is part of the record: a shorter prompt is a different prompt."""
     image, perf = run_dir
     write_perf(perf, image, list(range(1, 30)), recorded_ids())
@@ -495,7 +493,7 @@ def test_a_prompt_of_another_length_fails_the_report(run_dir, capsys) -> None:
     assert "not the 37 of prompt.tokens" in capsys.readouterr().out
 
 
-def test_a_run_record_without_a_prompt_fails_the_report(run_dir, capsys) -> None:
+def test_run_record_without_a_prompt_fails_the_report(run_dir, capsys) -> None:
     """A record that does not carry its prompt cannot be labelled with one."""
     image, perf = run_dir
     edit(perf, lambda d: d["run"].pop("prompt"))
@@ -503,7 +501,7 @@ def test_a_run_record_without_a_prompt_fails_the_report(run_dir, capsys) -> None
     assert "does not carry the prompt the hardware was given" in capsys.readouterr().out
 
 
-def test_a_prompt_the_run_did_not_prefill_fails_the_report(run_dir, capsys) -> None:
+def test_unprefilled_prompt_fails_the_report(run_dir, capsys) -> None:
     """The prompt record and the token records are the same run: they say the same length."""
     image, perf = run_dir
     prompt, ids = list(range(1, 38)), recorded_ids()
@@ -516,7 +514,7 @@ def test_a_prompt_the_run_did_not_prefill_fails_the_report(run_dir, capsys) -> N
 # --------------------------------------------------------------------------- a file it cannot read
 
 
-def test_a_perf_record_that_is_not_json_ends_in_a_verdict(run_dir, capsys) -> None:
+def test_perf_record_that_is_not_json_ends_in_a_verdict(run_dir, capsys) -> None:
     """The report's job is a verdict, so a file it cannot parse is one too."""
     image, perf = run_dir
     perf.write_text("{ this is not json", encoding="utf-8")
@@ -526,21 +524,21 @@ def test_a_perf_record_that_is_not_json_ends_in_a_verdict(run_dir, capsys) -> No
     assert f"{perf}, the record of the run, is not JSON" in out
 
 
-def test_a_layout_that_is_not_json_ends_in_a_verdict(run_dir, capsys) -> None:
+def test_layout_that_is_not_json_ends_in_a_verdict(run_dir, capsys) -> None:
     image, perf = run_dir
     (image / "layout.json").write_text("[1, 2", encoding="utf-8")
     assert report(image, perf) == 1
     assert "the compiled layout, is not JSON" in capsys.readouterr().out
 
 
-def test_a_perf_record_that_is_not_there_ends_in_a_verdict(run_dir, capsys) -> None:
+def test_missing_perf_record_ends_in_a_verdict(run_dir, capsys) -> None:
     image, perf = run_dir
     perf.unlink()
     assert report(image, perf) == 1
     assert "cannot be read: No such file or directory" in capsys.readouterr().out
 
 
-def test_a_perf_record_missing_a_field_ends_in_a_verdict(run_dir, capsys) -> None:
+def test_perf_record_missing_a_field_ends_in_a_verdict(run_dir, capsys) -> None:
     """Valid JSON that is not the record the harness writes is reported, not raised."""
     image, perf = run_dir
     edit(perf, lambda d: d.pop("counters"))
@@ -549,7 +547,7 @@ def test_a_perf_record_missing_a_field_ends_in_a_verdict(run_dir, capsys) -> Non
     assert "demo: FAILED" in out and "KeyError('counters')" in out
 
 
-def test_a_stage_line_that_is_not_a_timing_ends_in_a_verdict(run_dir, capsys, tmp_path) -> None:
+def test_stage_line_that_is_not_a_timing_ends_in_a_verdict(run_dir, capsys, tmp_path) -> None:
     """The stage timings are an input file like the other two."""
     image, perf = run_dir
     stages = tmp_path / "stages.jsonl"
@@ -564,7 +562,7 @@ def test_a_stage_line_that_is_not_a_timing_ends_in_a_verdict(run_dir, capsys, tm
 # --------------------------------------------------------------------------- the program that ran
 
 
-def test_a_faulted_decode_token_is_held_to_the_decode_program(run_dir, capsys) -> None:
+def test_faulted_token_is_held_to_the_decode_program(run_dir, capsys) -> None:
     """A token that faulted has no id, and it is still a decode token.
 
     Its ``out`` is -1, like a prefill token's, so the program it is held to is
@@ -608,7 +606,7 @@ def run_harness(binary: Path, image: Path, out: Path, *args: str) -> subprocess.
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
 
 
-def test_the_run_records_the_image_and_the_prompt(harness, tiny_image, tmp_path) -> None:
+def test_run_records_the_image_and_the_prompt(harness, tiny_image, tmp_path) -> None:
     """perf.json says which image the hardware executed and which ids it was given."""
     out = tmp_path / "perf.json"
     proc = run_harness(harness, tiny_image, out, "--max-new", "1", "--prompt-ids", "3,5", "--quiet")
@@ -622,7 +620,7 @@ def test_the_run_records_the_image_and_the_prompt(harness, tiny_image, tmp_path)
     assert run["prompt"]["from"] == "--prompt-ids"
 
 
-def test_an_image_the_layout_does_not_describe_stops_the_run(harness, tiny_image, tmp_path) -> None:
+def test_image_the_layout_does_not_describe_stops_the_run(harness, tiny_image, tmp_path) -> None:
     """A truncated image.bin is refused before the first cycle."""
     copy = tmp_path / "image"
     shutil.copytree(tiny_image, copy)
@@ -633,7 +631,7 @@ def test_an_image_the_layout_does_not_describe_stops_the_run(harness, tiny_image
     assert "layout.json describes" in proc.stderr
 
 
-def test_an_unknown_register_name_fails_the_dump(harness, tiny_image, tmp_path) -> None:
+def test_unknown_register_name_fails_the_dump(harness, tiny_image, tmp_path) -> None:
     """A dump plan naming a register the CSR window does not carry stops the run."""
     copy = tmp_path / "image"
     shutil.copytree(tiny_image, copy)
@@ -662,7 +660,7 @@ def test_an_unknown_register_name_fails_the_dump(harness, tiny_image, tmp_path) 
     assert 'names "ARGMAX_TOKEN"' in proc.stderr
 
 
-def test_the_run_records_the_program_every_token_ran(harness, tiny_image, tmp_path) -> None:
+def test_run_records_the_program_every_token_ran(harness, tiny_image, tmp_path) -> None:
     """Each token record names its own program, which is what the report groups and checks by."""
     out = tmp_path / "perf.json"
     proc = run_harness(harness, tiny_image, out, "--max-new", "2", "--prompt-ids", "3,5", "--quiet")
@@ -671,7 +669,7 @@ def test_the_run_records_the_program_every_token_ran(harness, tiny_image, tmp_pa
     assert [t["pass"] for t in tokens] == ["prefill", "decode", "decode"]
 
 
-def test_a_faulted_decode_token_is_held_to_the_counters(harness, tiny_image, tmp_path) -> None:
+def test_faulted_token_is_held_to_the_counters(harness, tiny_image, tmp_path) -> None:
     """A token that faulted is held to the traffic model and the bucket sum like every other one.
 
     The opcode byte of the second descriptor of ``decode.prog`` is set to a
@@ -696,7 +694,7 @@ def test_a_faulted_decode_token_is_held_to_the_counters(harness, tiny_image, tmp
     assert [(t["pass"], t["out"]) for t in tokens] == [("decode", -1)]
 
 
-def test_a_descriptor_count_disagreement_fails_the_run(harness, tiny_image, tmp_path) -> None:
+def test_descriptor_count_disagreement_fails_the_run(harness, tiny_image, tmp_path) -> None:
     """A token that did not retire its program's descriptors is reported, not passed over."""
     copy = tmp_path / "image"
     shutil.copytree(tiny_image, copy)

@@ -78,7 +78,7 @@ def test_distinct_shapes_differ_in_hidden_vocab_and_heads() -> None:
     assert stepcmp.distinct_shapes(5, seed=0) == shapes, "the draw is a function of the seed"
 
 
-def test_the_capture_is_the_simulators_own(tiny_image, prompt) -> None:
+def test_capture_is_the_simulators_own(tiny_image, prompt) -> None:
     """``record_token`` captures exactly what ``isa_sim.record_program`` does, plus the counters."""
     layout = compiler.load_layout(tiny_image)
     programs = isa_sim.Programs.from_dir(tiny_image)
@@ -104,7 +104,7 @@ def test_the_capture_is_the_simulators_own(tiny_image, prompt) -> None:
     assert isa_sim.check_plan(records) == [], "the plan names every write the descriptors made"
 
 
-def test_the_plan_names_every_write_of_both_programs(tiny_image, prompt) -> None:
+def test_plan_names_every_write_of_both_programs(tiny_image, prompt) -> None:
     """The premise of the layer: comparing the planned state is comparing all of it."""
     layout = compiler.load_layout(tiny_image)
     programs = isa_sim.Programs.from_dir(tiny_image)
@@ -118,7 +118,7 @@ def test_the_plan_names_every_write_of_both_programs(tiny_image, prompt) -> None
         assert isa_sim.check_plan(records) == [], which
 
 
-def test_the_effects_carry_the_counters_and_the_pc(tiny_image, prompt) -> None:
+def test_effects_carry_the_counters_and_the_pc(tiny_image, prompt) -> None:
     """Each descriptor's effects hold the state its entry names and the counters since START."""
     layout = compiler.load_layout(tiny_image)
     programs = isa_sim.Programs.from_dir(tiny_image)
@@ -170,7 +170,7 @@ def _as_rtl(e: stepcmp.Effects) -> dict[str, Any]:
     }
 
 
-def test_the_two_sides_parse_into_the_same_effects(tiny_image, prompt) -> None:
+def test_two_sides_parse_into_the_same_effects(tiny_image, prompt) -> None:
     """A record written the way the harness writes it reads back as the effects it came from."""
     layout = compiler.load_layout(tiny_image)
     programs = isa_sim.Programs.from_dir(tiny_image)
@@ -223,7 +223,7 @@ def _effects(**kw) -> stepcmp.Effects:
         ),
     ],
 )
-def test_a_difference_is_reported_where_it_is(
+def test_difference_is_reported_where_it_is(
     change: dict[str, Any], what: str, element: int | None
 ) -> None:
     """Every compared field names itself, and an element difference names its index."""
@@ -235,7 +235,7 @@ def test_a_difference_is_reported_where_it_is(
     assert list(stepcmp.differences(exp, _effects())) == []
 
 
-def test_a_memory_region_is_reported_at_its_byte_or_by_its_hash() -> None:
+def test_memory_region_reports_its_byte_or_its_hash() -> None:
     """The bytes name the byte; a region too large to carry names the region and its hash."""
     exp = _effects()
     got = _effects(mem={"kv.0.0.kt": stepcmp.Region(0x1000, 4, stepcmp.fnv1a64(b"abXd"), b"abXd")})
@@ -249,7 +249,7 @@ def test_a_memory_region_is_reported_at_its_byte_or_by_its_hash() -> None:
     assert list(stepcmp.differences(hashed_exp, hashed_exp)) == []
 
 
-def test_a_mismatch_names_the_descriptor_and_the_listing() -> None:
+def test_mismatch_names_the_descriptor_and_the_listing() -> None:
     """The report line carries the program, position, index, opcode, name, element and listing."""
     m = stepcmp.Mismatch(
         "decode",
@@ -292,7 +292,7 @@ def test_every_descriptor_of_both_programs_matches_the_rtl(tiny_image, prompt) -
     assert r.tokens == 2 * TINY.wb == int(layout["max_ctx"])
 
 
-def test_a_flipped_weight_byte_is_reported_at_its_descriptor(tiny_image, prompt, tmp_path) -> None:
+def test_flipped_weight_byte_names_its_descriptor(tiny_image, prompt, tmp_path) -> None:
     """A defect the layer exists to localize: one byte of a gamma row, named at its descriptor."""
     needs_verilator()
     layout = compiler.load_layout(tiny_image)
@@ -319,7 +319,7 @@ def test_a_flipped_weight_byte_is_reported_at_its_descriptor(tiny_image, prompt,
     assert first.expected != first.got and "VRMSNORM" in first.listing
 
 
-def test_the_rtl_dump_follows_the_plan(tiny_image, prompt) -> None:
+def test_rtl_dump_follows_the_plan(tiny_image, prompt) -> None:
     """What the harness writes per descriptor is what that descriptor's plan entry names."""
     needs_verilator()
     plan = compiler.load_dump_plan(tiny_image)["decode"]
@@ -338,7 +338,7 @@ def test_the_rtl_dump_follows_the_plan(tiny_image, prompt) -> None:
             assert len(eff.vsram) == entry["vsram"]["count"]
 
 
-def test_the_sweep_runs_five_shapes(tmp_path) -> None:
+def test_sweep_runs_five_shapes(tmp_path) -> None:
     """``make stepcmp``: five random tiny models, both programs, every position of the cache."""
     needs_verilator()
     results = stepcmp.sweep(
@@ -355,7 +355,7 @@ def test_the_sweep_runs_five_shapes(tmp_path) -> None:
 @pytest.mark.slow
 @pytest.mark.parametrize("alias", ["qwen", "smollm2"])
 @pytest.mark.parametrize("layers", [1, 2])
-def test_a_truncated_real_model_matches_the_rtl(alias: str, layers: int, tmp_path) -> None:
+def test_truncated_real_model_matches_the_rtl(alias: str, layers: int, tmp_path) -> None:
     """One and two layers of each real model, compiled and compared descriptor by descriptor."""
     needs_verilator()
     cfg = compare.CONFIGS[64]
@@ -374,7 +374,7 @@ def test_a_truncated_real_model_matches_the_rtl(alias: str, layers: int, tmp_pat
     assert r.events == dict.fromkeys(stepcmp.EVENTS, 0)
 
 
-def test_a_layers_list_names_numbers_and_the_complete_model() -> None:
+def test_layers_list_names_numbers_and_the_whole_model() -> None:
     """``--layers 1,2,all``: two truncated compiles and the whole checkpoint."""
     assert stepcmp.layer_counts("1,2") == [1, 2]
     assert stepcmp.layer_counts(stepcmp.ALL_LAYERS) == [None]
@@ -384,7 +384,7 @@ def test_a_layers_list_names_numbers_and_the_complete_model() -> None:
 
 @pytest.mark.slow
 @pytest.mark.parametrize("alias", ["qwen", "smollm2"])
-def test_a_complete_real_model_matches_the_rtl(alias: str, tmp_path) -> None:
+def test_complete_real_model_matches_the_rtl(alias: str, tmp_path) -> None:
     """``make stepcmp-model``: every descriptor of the whole checkpoint, on both machines.
 
     Two prefill positions and two decode steps, so the state after every
@@ -424,7 +424,7 @@ def test_a_complete_real_model_matches_the_rtl(alias: str, tmp_path) -> None:
 # --------------------------------------------------------------------------- the vector opcodes
 
 
-def test_the_compared_programs_run_every_vector_opcode(tiny_image) -> None:
+def test_compared_programs_run_every_vector_opcode(tiny_image) -> None:
     """The programs the comparison walks issue all six vector opcodes and both KVWRITE forms."""
     programs = isa_sim.Programs.from_dir(tiny_image)
     ops = {d.opcode for d in programs.decode}
@@ -443,7 +443,7 @@ def test_the_compared_programs_run_every_vector_opcode(tiny_image) -> None:
     assert {d.opcode for d in programs.prefill} <= ops, "prefill is decode without the head"
 
 
-def test_the_sreg_word_is_the_word_the_bank_holds() -> None:
+def test_sreg_word_is_the_word_the_bank_holds() -> None:
     """A scale travels as its sfloat pair and a tracked absmax as its int32."""
     assert stepcmp.sreg_word(numerics.SFloat(0x8000, -15)) == stepcmp.sreg_word(
         numerics.SFloat(0x8000, -15)

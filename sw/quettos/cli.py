@@ -2,11 +2,14 @@
 
 Commands: ``download``, ``tokens``, ``export-tokens-bin``, ``calibrate``,
 ``quantize``, ``compile``, ``golden``, ``isa-sim``, ``compare``, ``check``,
-``csr-defs``, ``demo-report``.
+``provenance``, ``corpus``, ``csr-defs``, ``demo-report``.
 Each command is a thin wrapper over the module of the same name; the file
 formats they read and write are described in ``docs/``.  ``quantize`` and
 ``check`` take ``--no-qk-smoothing``, which builds and scores the
-K-centering-only variant of the model into the ``-nosmooth`` quality rows.
+K-centering-only variant of the model into the ``-nosmooth`` quality rows, and
+``check --heldout`` scores the same build on the held-out WikiText-2 windows
+``corpus`` fetches.  ``provenance`` reads a written ``quality.json`` back and
+says which text each of its rows was scored on, without scoring anything.
 """
 
 from __future__ import annotations
@@ -321,11 +324,33 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     return compare.run(args)
 
 
+def _row_line(row: dict[str, Any], seconds: float | None = None) -> str:
+    """One quality row as the ``check`` command prints it."""
+    st = row["stats"]
+    took = "" if seconds is None else f" ({seconds:.1f} s)"
+    return (
+        f"{row['config']}: tokens {row['tokens']} top-1 {row['top1_percent']:.2f}% "
+        f"KL {row['kl_mean']:.4g} nats delta-NLL {row['delta_nll']:+.4g} +/- "
+        f"{row['delta_nll_se']:.3g} PPL {row['ppl_fp32']:.3f} -> {row['ppl_int']:.3f} "
+        f"sat={st['sat']} err_shift={st['err_shift']} clip={st['clip']}{took}"
+    )
+
+
+def _cmd_corpus(args: argparse.Namespace) -> int:
+    """Fetch and verify the held-out archive, then print what it holds."""
+    from quettos import corpus
+
+    path = corpus.fetch_archive(download=not args.no_download)
+    record = corpus.source_record(split=args.split, count=args.windows)
+    print(json.dumps({"path": str(path), "bytes": path.stat().st_size, **record}, indent=2))
+    return 0
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
 
-    from quettos import calibrate, quality, quantize
+    from quettos import calibrate, corpus, quality, quantize
 
     spec = load_spec(args.model)
     if args.quant:
@@ -342,27 +367,45 @@ def _cmd_check(args: argparse.Namespace) -> int:
     if model.n_layers != spec.layers:
         print(f"{qpath} holds {model.n_layers} of {spec.layers} layers", file=sys.stderr)
         return 1
-    seqs = calibrate.calibration_sequences(spec)
+    calib_seqs = calibrate.calibration_sequences(spec)
     widths = list(quality.CONFIGS) if args.a_bits is None else [args.a_bits]
-    t0 = time.perf_counter()
-    ref = quality.reference_logits(spec, seqs)
-    t1 = time.perf_counter()
-    n_tok = sum(len(s) for s in seqs)
-    print(f"reference: {n_tok} tokens in {len(seqs)} sequences, {t1 - t0:.1f} s")
-    rows = []
-    for a_bits in widths:
-        t2 = time.perf_counter()
-        row = quality.evaluate(spec, model, seqs, a_bits=a_bits, ref=ref)
-        rows.append(row)
-        st = row["stats"]
+
+    if args.heldout:
+        source = corpus.source_record(split=args.split, count=args.windows)
+        seqs = corpus.heldout_sequences(spec, split=args.split, count=args.windows)
+        n_tok = sum(len(s) for s in seqs)
         print(
-            f"{row['config']}: tokens {row['tokens']} top-1 {row['top1_percent']:.2f}% "
-            f"KL {row['kl_mean']:.4g} nats delta-NLL {row['delta_nll']:+.4g} +/- "
-            f"{row['delta_nll_se']:.3g} PPL {row['ppl_fp32']:.3f} -> {row['ppl_int']:.3f} "
-            f"sat={st['sat']} err_shift={st['err_shift']} clip={st['clip']} "
-            f"({time.perf_counter() - t2:.1f} s)"
+            f"held-out: {n_tok} tokens in {len(seqs)} windows of {source['window_tokens']}, "
+            f"{source['member']} sha256 {source['member_sha256'][:16]}"
         )
-    rep = quality.report(model, seqs, rows)
+
+        def progress(done: int, total: int, seconds: float) -> None:
+            eta = seconds / done * (total - done)
+            print(
+                f"  window {done}/{total}  {seconds / done:.1f} s each  {eta / 60:.1f} min left",
+                file=sys.stderr,
+            )
+
+        rows = quality.evaluate_multi(spec, [(model, b) for b in widths], seqs, progress=progress)
+        for row in rows:
+            print(_row_line(row))
+        heldout = quality.heldout_block(model, seqs, rows, source)
+        rep = quality.report(model, calib_seqs, [], heldout=heldout)
+    else:
+        seqs = calib_seqs
+        t0 = time.perf_counter()
+        ref = quality.reference_logits(spec, seqs)
+        t1 = time.perf_counter()
+        n_tok = sum(len(s) for s in seqs)
+        print(f"reference: {n_tok} tokens in {len(seqs)} sequences, {t1 - t0:.1f} s")
+        rows = []
+        for a_bits in widths:
+            t2 = time.perf_counter()
+            row = quality.evaluate(spec, model, seqs, a_bits=a_bits, ref=ref)
+            rows.append(row)
+            print(_row_line(row, time.perf_counter() - t2))
+        rep = quality.report(model, seqs, rows)
+
     if any(r["stats"]["sat"] or r["stats"]["err_shift"] for r in rows):
         print("refusing to write: saturation or shift-error counters are non-zero", file=sys.stderr)
         return 1
@@ -372,6 +415,44 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(f"wrote {path}")
     else:
         print(quality.quality_json_text(rep), end="")
+    return 0
+
+
+def _cmd_provenance(args: argparse.Namespace) -> int:
+    """Which text each published quality row was scored on, rebuilt and hashed here."""
+    import textwrap
+    import time
+
+    from quettos import quality
+
+    t0 = time.perf_counter()
+    spec = load_spec(args.model)
+    path = Path(args.file) if args.file else quality.quality_path(spec.name)
+    if not path.is_file():
+        print(f"{path} not found; run: uv run quettos check {args.model}", file=sys.stderr)
+        return 1
+    rep = quality.load_quality(path)
+    model = rep["model"]
+    print(f"{path}: {model['repo_id']}, {model['layers']} layers, numerics {rep['numerics']}")
+    sets = quality.provenance(spec, rep, download=not args.no_download)
+    rows = 0
+    bad = 0
+    for s in sets:
+        rows += len(s.rows)
+        print(f"\n{s.name}: {s.tokens} scored positions, rows {', '.join(s.rows)}")
+        print(textwrap.fill(s.text, width=94, initial_indent="  ", subsequent_indent="  "))
+        for check in s.checks:
+            bad += not check.ok
+            mark = "ok  " if check.ok else "FAIL"
+            print(f"  {mark} {check.label:<24} {check.detail}")
+    took = time.perf_counter() - t0
+    if bad:
+        print(f"\nprovenance: FAILED -- {bad} check(s) disagree with the record ({took:.1f} s)")
+        return 1
+    print(
+        f"\nprovenance: OK -- {rows} published rows in {len(sets)} sets, "
+        f"each over the ids its own record names ({took:.1f} s)"
+    )
     return 0
 
 
@@ -584,7 +665,10 @@ def _demo_prompt(
     ``layout.json`` names the prompt the image was compiled with and the run
     records the ids it actually prefilled.  The source comes back only when the
     two are the same ids, so a run is neither labelled with nor held to the
-    record of a prompt it was not given.
+    record of a prompt it was not given.  A run that restored a prefix consumed
+    the leading positions of that prompt from a file instead of prefilling
+    them, and its record says how many (``sim/verilator/prefix.hpp``), so the
+    two counts still have to add up to the prompt.
     """
     from quettos.golden import ids_sha256
 
@@ -594,9 +678,13 @@ def _demo_prompt(
         return [], None, ["the run record does not carry the prompt the hardware was given"]
     ids = [int(i) for i in given["ids"]]
     bad: list[str] = []
-    prefilled = sum(1 for t in perf["tokens"] if not _demo_decode(t)) + 1
+    restored = int(perf["run"].get("prefix", {}).get("restored", 0))
+    prefilled = sum(1 for t in perf["tokens"] if not _demo_decode(t)) + 1 + restored
     if prefilled != len(ids):
-        bad.append(f"the run prefilled {prefilled} ids of its {len(ids)}-id prompt")
+        bad.append(
+            f"the run restored {restored} and prefilled {prefilled - restored} ids of its "
+            f"{len(ids)}-id prompt"
+        )
     if entry is None:
         return ids, None, bad
     if len(ids) != int(entry["count"]) or ids_sha256(ids) != str(entry["sha256"]):
@@ -692,6 +780,43 @@ def _demo_bucket_lines(perf: dict[str, Any]) -> list[str]:
     busy = int(c["BUSY"]) or 1
     cells = [f"{k} {100.0 * int(c[k]) / busy:.2f}%" for k in DEMO_BUCKETS]
     return ["  ".join(f"{cell:<22}" for cell in cells[i : i + 3]).rstrip() for i in (0, 3)]
+
+
+def _demo_prefix(args: argparse.Namespace, perf: dict[str, Any]) -> list[str]:
+    """The prefix block of the summary: what was restored, and what it saved.
+
+    Printed only for a run given the other two runs of the comparison
+    (``python -m quettos.prefix``): the pass that computed the prefix and the
+    pass that ran the same prompt without reuse.  The numbers are the three
+    runs' own PERF counters, and the ids after the restore are held to the ids
+    without it.
+    """
+    from quettos import prefix as prefix_mod
+
+    if args.prefix_perf is None or args.baseline_perf is None:
+        return []
+    prefix_perf = _demo_read_json(args.prefix_perf, "the record of the prefix run")
+    baseline = _demo_read_json(args.baseline_perf, "the record of the run without reuse")
+    print("\n  prefix reuse, from the core's own PERF counters")
+    if args.prefix_file is not None:
+        try:
+            header = prefix_mod.read_header(args.prefix_file)
+        except (prefix_mod.PrefixError, OSError) as exc:
+            raise DemoInput(f"{args.prefix_file} is not a prefix file this reads: {exc}") from exc
+        ids = [int(i) for i in perf["run"]["prompt"]["ids"]]
+        for line in prefix_mod.prefix_lines(
+            header,
+            ids,
+            turn=args.prefix_turn,
+            shared=args.prefix_shared,
+            refused=args.prefix_refused,
+        ):
+            print(line)
+        print()
+    lines, bad = prefix_mod.reuse_lines(perf, prefix_perf, baseline)
+    for line in lines:
+        print(line)
+    return bad
 
 
 def _demo_report(args: argparse.Namespace) -> int:
@@ -802,6 +927,9 @@ def _demo_report(args: argparse.Namespace) -> int:
         f"MACS {int(counters['MACS']):,}, DESCRIPTORS {int(counters['DESCRIPTORS']):,}, "
         f"WR_BYTES {int(counters['WR_BYTES']):,}"
     )
+
+    # --- the prefix this run restored, and the prefill it did not have to run
+    failures.extend(_demo_prefix(args, perf))
 
     # --- the wall clock: every stage of the run, as it was measured
     stages = _demo_stages(args.stages)
@@ -942,6 +1070,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_arguments(p)
     p.set_defaults(func=_cmd_compare)
 
+    from quettos import corpus
+
     p = sub.add_parser("check", help="quality of the integer golden model against fp32")
     p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
     p.add_argument(
@@ -959,13 +1089,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="score the build of `quantize --no-qk-smoothing` "
         "(default build/quant/<name>-nosmooth.npz) into the -nosmooth rows",
     )
+    p.add_argument(
+        "--heldout",
+        action="store_true",
+        help=f"score the held-out {corpus.WIKITEXT2_NAME} windows instead of the calibration "
+        "set, into the heldout block of the same file",
+    )
+    p.add_argument(
+        "--windows",
+        type=int,
+        default=corpus.WINDOWS,
+        help=f"held-out windows of {corpus.WINDOW_TOKENS} tokens (default {corpus.WINDOWS})",
+    )
+    p.add_argument(
+        "--split",
+        default=corpus.DEFAULT_SPLIT,
+        choices=tuple(corpus.MEMBERS),
+        help=f"held-out split (default {corpus.DEFAULT_SPLIT})",
+    )
     p.add_argument("--out", default=None, help="output path (default models/<name>/quality.json)")
     p.set_defaults(func=_cmd_check)
+
+    p = sub.add_parser(
+        "provenance", help="which text each row of a written quality.json was scored on"
+    )
+    p.add_argument("model", help="alias (qwen, smollm2) or Hugging Face repo id")
+    p.add_argument(
+        "--file", default=None, help="the report to read (default models/<name>/quality.json)"
+    )
+    p.add_argument(
+        "--no-download",
+        action="store_true",
+        help="require the held-out archive to be there already",
+    )
+    p.set_defaults(func=_cmd_provenance)
+
+    p = sub.add_parser("corpus", help=f"fetch and verify the held-out {corpus.WIKITEXT2_NAME}")
+    p.add_argument(
+        "--no-download", action="store_true", help="require the archive to be there already"
+    )
+    p.add_argument("--windows", type=int, default=corpus.WINDOWS, help="windows in the record")
+    p.add_argument(
+        "--split", default=corpus.DEFAULT_SPLIT, choices=tuple(corpus.MEMBERS), help="split"
+    )
+    p.set_defaults(func=_cmd_corpus)
 
     p = sub.add_parser("demo-report", help="the summary of a demo run (scripts/demo.sh)")
     p.add_argument("--image", required=True, help="the compiled model directory the run used")
     p.add_argument("--perf", required=True, help="the perf.json the harness wrote")
     p.add_argument("--stages", default=None, help="stage timings from scripts/demo.sh")
+    p.add_argument(
+        "--prefix-perf", default=None, help="the perf.json of the run that computed the prefix"
+    )
+    p.add_argument(
+        "--baseline-perf", default=None, help="the perf.json of the same prompt without reuse"
+    )
+    p.add_argument("--prefix-file", default=None, help="the prefix file the restore was given")
+    p.add_argument(
+        "--prefix-turn", default="the prompt's first turn", help="what the prefix covers"
+    )
+    p.add_argument(
+        "--prefix-shared",
+        type=int,
+        default=0,
+        help="leading ids this prompt shares with the same tools asked something else",
+    )
+    p.add_argument(
+        "--prefix-refused", default="", help="what the harness said to a prefix file it refused"
+    )
     p.add_argument(
         "--no-reference",
         action="store_true",

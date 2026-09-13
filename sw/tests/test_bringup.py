@@ -74,7 +74,7 @@ def gqa_image(tmp_path_factory) -> object:
 # --------------------------------------------------------------------------- the programs
 
 
-def test_the_program_is_embed_vquant_gemv_halt(demo_image) -> None:
+def test_program_is_embed_vquant_gemv_halt(demo_image) -> None:
     """Four descriptors, 128 bytes, loaded behind prefill.prog, with nothing loaded by the host."""
     c = compare.bringup(demo_image, DEMO, tok=3)
     assert [d.opcode for d in c.program] == [
@@ -96,7 +96,7 @@ def test_the_program_is_embed_vquant_gemv_halt(demo_image) -> None:
     assert c.mem == ((gemv.imm32, 4 * gemv.n),)
 
 
-def test_the_vquant_writes_the_scale_the_gemv_reads(demo_image) -> None:
+def test_vquant_writes_the_scale_the_gemv_reads(demo_image) -> None:
     """No SREG is loaded from the host: descriptor 1 leaves the scale descriptor 2 reads."""
     c = compare.bringup(demo_image, DEMO, tok=4)
     _, quant, gemv, _ = c.program
@@ -107,7 +107,7 @@ def test_the_vquant_writes_the_scale_the_gemv_reads(demo_image) -> None:
     assert records[2].sreg[0][gemv.sreg_src] == records[1].sreg[0][quant.sreg_dst]
 
 
-def test_the_vector_program_runs_the_elementwise_opcodes(demo_image) -> None:
+def test_vector_program_runs_the_elementwise_opcodes(demo_image) -> None:
     """VRMSNORM, VQUANT with USE_TRACKED, VSUBC, VSILUMUL and a GROUP VQUANT, back to back."""
     c = compare.vector_ops(demo_image, DEMO, tok=6)
     ops = [d.opcode for d in c.program]
@@ -128,7 +128,7 @@ def test_the_vector_program_runs_the_elementwise_opcodes(demo_image) -> None:
     assert c.mem == (), "the vector program compares no memory region"
 
 
-def test_the_vector_program_carries_a_value_through_the_sreg_bank(demo_image) -> None:
+def test_vector_program_carries_a_value_through_the_sregs(demo_image) -> None:
     """The tracked absmax the VRMSNORM writes is what the VQUANT after it quantizes with."""
     c = compare.vector_ops(demo_image, DEMO, tok=6)
     rms, tracked = c.program[1], c.program[2]
@@ -140,7 +140,7 @@ def test_the_vector_program_carries_a_value_through_the_sreg_bank(demo_image) ->
     assert any(v < 0 for v in written) and any(v > 0 for v in written)
 
 
-def test_the_vector_program_puts_a_value_in_every_counter_it_can_reach(demo_image) -> None:
+def test_vector_program_reaches_every_counter(demo_image) -> None:
     """The last VSILUMUL saturates, so SAT_VPU is a number both models have to agree on."""
     c = compare.vector_ops(demo_image, DEMO, tok=6)
     records, _ = compare.reference(demo_image, c, DEMO)
@@ -162,7 +162,7 @@ def test_argmax_is_the_input_token(demo_image) -> None:
         assert last.perf["DESCRIPTORS"] == 4
 
 
-def test_the_simulator_counts_what_the_isa_defines(demo_image) -> None:
+def test_simulator_counts_what_the_isa_defines(demo_image) -> None:
     """DESCRIPTORS, MACS and WT_BYTES of the four descriptors, from the shapes alone."""
     shape = synthetic.SHAPES[0]
     c = compare.bringup(demo_image, DEMO, tok=5)
@@ -193,7 +193,7 @@ def test_compare_names_the_first_differing_element(demo_image) -> None:
 # --------------------------------------------------------------------------- the attention step
 
 
-def test_the_attention_program_is_the_compilers_own_sequence(tiny_image) -> None:
+def test_attention_program_is_the_compilers_sequence(tiny_image) -> None:
     """A prefix of decode.prog with a HALT: the rotation, the scores, the softmax, the values."""
     c = compare.attention(tiny_image, TINY, tok=3)
     descs = isa.parse((tiny_image / compare.compiler.FILES["decode"]).read_bytes())
@@ -210,7 +210,7 @@ def test_the_attention_program_is_the_compilers_own_sequence(tiny_image) -> None
     assert c.program[-2].opcode is Opcode.GEMV, "the step ends on the value GEMV"
 
 
-def test_the_attention_positions_step_the_derived_extents(tiny_image) -> None:
+def test_attention_positions_step_the_extents(tiny_image) -> None:
     """The first position, one inside the first tile, the boundary, one past it, and the last."""
     layout = compare.compiler.load_layout(tiny_image)
     max_ctx = int(layout["max_ctx"])
@@ -228,7 +228,7 @@ def test_the_attention_positions_step_the_derived_extents(tiny_image) -> None:
     assert len(set(zip(n, k, strict=True))) == len(got), "no two positions run the same shapes"
 
 
-def test_the_attention_step_matches_the_simulator_on_the_tiny_configuration(tiny_image) -> None:
+def test_attention_matches_the_simulator_on_the_tiny_config(tiny_image) -> None:
     """THE MILESTONE at WB=16: every element, register, KV byte and counter, at six positions."""
     needs_verilator()
     result = compare.check_image(
@@ -239,7 +239,7 @@ def test_the_attention_step_matches_the_simulator_on_the_tiny_configuration(tiny
     assert result.passes == 6
 
 
-def test_the_attention_step_matches_the_simulator_at_the_demo_width(demo_image) -> None:
+def test_attention_matches_the_simulator_at_the_demo_width(demo_image) -> None:
     """The synthesized configuration, WB=64: the same six positions a tile apart."""
     needs_verilator()
     result = compare.check_image(
@@ -249,7 +249,7 @@ def test_the_attention_step_matches_the_simulator_at_the_demo_width(demo_image) 
     assert result.determinism == []
 
 
-def test_the_attention_step_matches_the_simulator_across_a_kv_head_group(gqa_image) -> None:
+def test_attention_matches_the_simulator_across_a_kv_group(gqa_image) -> None:
     """Six query heads over three KV heads: every head reads the group its q vector belongs to."""
     needs_verilator()
     c = compare.attention(gqa_image, TINY, tok=7)
@@ -259,7 +259,7 @@ def test_the_attention_step_matches_the_simulator_across_a_kv_head_group(gqa_ima
     assert result.mismatches == [], "\n".join(str(m) for m in result.mismatches)
 
 
-def test_the_attention_step_matches_at_every_position_the_cache_holds(tiny_image) -> None:
+def test_attention_matches_at_every_cached_position(tiny_image) -> None:
     """Every position from the first to the last, so the softmax reduces over a full row."""
     needs_verilator()
     layout = compare.compiler.load_layout(tiny_image)
@@ -276,7 +276,7 @@ def test_the_attention_step_matches_at_every_position_the_cache_holds(tiny_image
     assert sum(1 for v in row if v != 0) == max_ctx, "every token of the last row carries a weight"
 
 
-def test_the_whole_layer_matches_the_simulator(tiny_image) -> None:
+def test_whole_layer_matches_the_simulator(tiny_image) -> None:
     """The decoder layer end to end: attention, the output projection, the norm and the MLP."""
     needs_verilator()
     c = compare.layer(tiny_image, TINY, tok=5)
@@ -289,14 +289,14 @@ def test_the_whole_layer_matches_the_simulator(tiny_image) -> None:
     assert result.determinism == []
 
 
-def test_the_whole_layer_matches_the_simulator_at_the_demo_width(demo_image) -> None:
+def test_whole_layer_matches_the_simulator_at_the_demo_width(demo_image) -> None:
     """The same layer on the synthesized configuration."""
     needs_verilator()
     result = compare.check_image(demo_image, DEMO, 13, program="layer")
     assert result.mismatches == [], "\n".join(str(m) for m in result.mismatches)
 
 
-def test_the_kv_cache_the_hardware_writes_is_the_one_it_reads(tiny_image) -> None:
+def test_kv_cache_written_is_the_one_read(tiny_image) -> None:
     """The KV region is compared as bytes at every position, and it grows as the passes run."""
     needs_verilator()
     c = compare.attention(tiny_image, TINY, tok=3)
@@ -313,7 +313,7 @@ def test_the_kv_cache_the_hardware_writes_is_the_one_it_reads(tiny_image) -> Non
 
 
 @pytest.mark.parametrize("byte", UNDEFINED_OPCODES)
-def test_an_undefined_opcode_stops_the_run_with_the_fault_in_status(demo_image, byte) -> None:
+def test_undefined_opcode_stops_with_the_fault_in_status(demo_image, byte) -> None:
     """The fault the ISA gives an opcode the hardware cannot execute, on both models.
 
     Every opcode the ISA defines now issues to a unit, so ``FAULT = OPCODE``
@@ -362,7 +362,7 @@ def test_every_vector_opcode_reaches_the_unit(tiny_image) -> None:
 
 
 @pytest.mark.parametrize("wb", [16, 64])
-def test_the_generated_ids_match_the_simulator(tiny_image, demo_image, wb) -> None:
+def test_generated_ids_match_the_simulator(tiny_image, demo_image, wb) -> None:
     """The whole compiled model: the prefill/decode loop on qcore_top emits isa_sim's ids.
 
     This is the oracle chain closed from the top -- `isa_sim` reproduces the
@@ -398,15 +398,13 @@ def record(tmp_path: Path, image: Path, key: str, ids: list[int]) -> Path:
     return out
 
 
-def test_an_image_without_a_record_carries_no_continuation(demo_image) -> None:
+def test_image_without_a_record_carries_no_continuation(demo_image) -> None:
     """A synthetic model has no ``expected_tokens.json``, so there is nothing to check against."""
     assert compare.recorded_continuation(demo_image, "prompts/chat_short.json") is None
     assert compare.prompt_source(compare.compiler.load_layout(demo_image)) is None
 
 
-def test_the_recorded_continuation_is_the_one_the_image_was_compiled_against(
-    tmp_path, demo_image
-) -> None:
+def test_recorded_continuation_belongs_to_its_prompt(tmp_path, demo_image) -> None:
     """The ids come back for the prompt that has them, and for no other."""
     key = "prompts/chat_short.json"
     out = record(tmp_path, demo_image, key, [5, 8, 13])
@@ -415,7 +413,7 @@ def test_the_recorded_continuation_is_the_one_the_image_was_compiled_against(
     assert compare.recorded_continuation(out, None) is None
 
 
-def test_a_rewritten_continuation_is_a_failure(tmp_path, demo_image) -> None:
+def test_rewritten_continuation_is_a_failure(tmp_path, demo_image) -> None:
     """Editing the file after the compile does not weaken the check; it fails the run."""
     key = "prompts/chat_short.json"
     out = record(tmp_path, demo_image, key, [5, 8, 13])
@@ -427,7 +425,7 @@ def test_a_rewritten_continuation_is_a_failure(tmp_path, demo_image) -> None:
         compare.recorded_continuation(out, key)
 
 
-def test_the_generated_ids_are_held_to_the_record(tmp_path, demo_image) -> None:
+def test_generated_ids_are_held_to_the_record(tmp_path, demo_image) -> None:
     """With a continuation recorded for the prompt, the run reports it beside the two machines."""
     needs_verilator()
     key = "prompts/chat_short.json"
@@ -450,7 +448,7 @@ def generated(rtl: list[int], expected: list[int] | None) -> compare.Generated:
     return compare.Generated(Path("i"), DEMO, [1], rtl, rtl, 0, 0.0, "p", expected)
 
 
-def test_a_run_longer_than_the_record_is_held_to_the_record() -> None:
+def test_run_longer_than_the_record_is_still_held_to_it() -> None:
     """The record ends at an end-of-sequence id a generation run is told to ignore."""
     assert generated([5, 8, 13, 21], [5, 8, 13]).expected_ok
     assert generated([5, 8, 13, 21], [5, 8, 13]).first_expected_difference is None
@@ -460,7 +458,7 @@ def test_a_run_longer_than_the_record_is_held_to_the_record() -> None:
     assert generated([5, 8], None).first_expected_difference is None
 
 
-def test_the_generate_options_name_one_prompt(tiny_image) -> None:
+def test_generate_options_name_one_prompt(tiny_image) -> None:
     """``--prompt`` and ``--prompt-ids`` each replace the image's prompt, and not both at once."""
     parsed = cli.build_parser().parse_args(
         ["compare", "--image", str(tiny_image), "--generate", "2", "--prompt-ids", "1,2,3"]
@@ -511,7 +509,7 @@ def cross_row_program(image, cfg, tok: int):
     return dataclasses.replace(c, program=program, blob=isa.assemble(list(program)))
 
 
-def test_the_crossbar_routes_a_descriptor_across_rows(tiny_image) -> None:
+def test_crossbar_routes_a_descriptor_across_rows(tiny_image) -> None:
     """Reads of bank 0 and writes of bank 1, in the one configuration that has two."""
     needs_verilator()
     assert TINY.b_max == 2
@@ -525,7 +523,7 @@ def test_the_crossbar_routes_a_descriptor_across_rows(tiny_image) -> None:
     assert last.sreg[0] == [0] * len(last.sreg[0]), "row 0's bank was only read"
 
 
-def test_the_vector_unit_runs_both_rows_of_a_descriptor(tiny_image) -> None:
+def test_vector_unit_runs_both_rows_of_a_descriptor(tiny_image) -> None:
     """ROW_EN = 3: the unit walks the participating rows ascending, each to completion.
 
     The ``EMBED`` stays on row 0, so row 1 starts from an empty bank and the two
@@ -549,7 +547,7 @@ def test_the_vector_unit_runs_both_rows_of_a_descriptor(tiny_image) -> None:
     assert last.events["SAT_VPU"] == ref[-1].events["SAT_VPU"] > 0
 
 
-def test_a_gemv_with_no_inputs_matches_the_hardware(demo_image) -> None:
+def test_gemv_with_no_inputs_matches_the_hardware(demo_image) -> None:
     """A GEMV with K == 0 is zero work in both models: nothing written, no MACs, no weight bytes."""
     needs_verilator()
     c = compare.bringup(demo_image, DEMO, tok=6)
@@ -565,7 +563,7 @@ def test_a_gemv_with_no_inputs_matches_the_hardware(demo_image) -> None:
     assert last.argmax_tok == 0, "the GEMV writes no logits, so ARGMAX_TOK stays as it was"
 
 
-def test_the_compare_command_runs_the_comparison(tiny_image, capsys) -> None:
+def test_compare_command_runs_the_comparison(tiny_image, capsys) -> None:
     """``quettos compare`` takes the options of ``python -m quettos.compare`` and runs it."""
     parsed = cli.build_parser().parse_args(
         ["compare", "--sweep", "--shapes", "2", "--widths", "16"]

@@ -530,7 +530,7 @@ def test_bounds_counter_and_pos_derived_fields(built) -> None:
     assert len(isa_sim.written_ranges(kv, 0)) == 64 + 1
 
 
-def test_a_gemv_with_no_inputs_is_zero_work(built) -> None:
+def test_gemv_with_no_inputs_is_zero_work(built) -> None:
     """K == 0 with N > 0 retires with the bounds events counted and nothing else touched."""
     b = built(0)
     m = b.machine()

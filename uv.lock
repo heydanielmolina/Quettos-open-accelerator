@@ -1383,6 +1383,8 @@ dev = [
     { name = "cocotb" },
     { name = "mpmath" },
     { name = "ruff" },
+]
+pnr = [
     { name = "yowasp-nextpnr-ecp5" },
 ]
 ref = [
@@ -1406,8 +1408,8 @@ dev = [
     { name = "cocotb", specifier = ">=2.1" },
     { name = "mpmath", specifier = ">=1.3" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "yowasp-nextpnr-ecp5" },
 ]
+pnr = [{ name = "yowasp-nextpnr-ecp5" }]
 ref = [
     { name = "datasets", specifier = ">=3.0" },
     { name = "torch", specifier = ">=2.4" },

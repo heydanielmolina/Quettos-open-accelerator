@@ -1,21 +1,29 @@
-"""Quality measurement: the metric definitions on synthetic logits, the SmolLM2 W8A16 gate on
-the calibration set, the row naming and merging that keep the shipped and ``-nosmooth`` rows in
-one file, and agreement of the checked-in ``quality.json`` files with a fresh evaluation
-(``slow`` for the complete models from ``build/quant/``)."""
+"""Quality measurement: the metric definitions on synthetic logits, the SmolLM2 W8A16 gates on
+the calibration set and on the held-out WikiText-2 windows, the corpus fetch and its hashes, the
+row naming and merging that keep the shipped and ``-nosmooth`` rows and the two sets in one file,
+agreement of the checked-in ``quality.json`` files with a fresh evaluation (``slow`` for the
+complete models from ``build/quant/``), and the provenance pass that reads those files back and
+says which text each published row was scored on without scoring anything."""
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
-from quettos import calibrate, numerics, quality, quantize
+from quettos import calibrate, cli, corpus, numerics, quality, quantize, synthetic
 from quettos.model import ModelSpec
+from quettos.tokenizer_io import encode
 
 GATE_KL_NATS = 0.02
 GATE_TOP1_PERCENT = 93.0
 REL = 1e-4  # float tolerance between a stored report and a fresh evaluation
+HELDOUT_WINDOWS_FAST = 2  # windows the SmolLM2 held-out gate scores fresh
+HELDOUT_WINDOWS_SLOW = 4  # windows every row of the held-out block is re-evaluated over
 
 
 # --------------------------------------------------------------------------- metric definitions
@@ -377,5 +385,404 @@ def test_quality_json_matches_fresh_evaluation(spec: ModelSpec, qmodel_full, qmo
             f"KL {row['kl_mean']:.5f} delta-NLL {row['delta_nll']:+.5f} {row['stats']}"
         )
         assert row["stats"]["sat"] == 0 and row["stats"]["err_shift"] == 0
-    assert quality.close(stored, fresh, REL)
-    print(f"{spec.name}: text identical {quality.quality_json_text(fresh) == path.read_text()}")
+    # the calibration half of the document; the held-out half has its own test
+    calibration_half = {k: v for k, v in stored.items() if k != quality.HELDOUT_KEY}
+    assert quality.HELDOUT_KEY in stored
+    assert quality.close(calibration_half, fresh, REL)
+    text = quality.quality_json_text({**fresh, quality.HELDOUT_KEY: stored[quality.HELDOUT_KEY]})
+    print(f"{spec.name}: text identical {text == path.read_text()}")
+
+
+# --------------------------------------------------------------------------- held-out corpus
+
+
+@pytest.fixture(scope="session")
+def heldout_archive() -> Path:
+    """The verified WikiText-2 archive, or a skip: the tests never download it."""
+    try:
+        return corpus.fetch_archive(download=False)
+    except (FileNotFoundError, ValueError) as exc:
+        pytest.skip(f"held-out archive unavailable: {exc}")
+
+
+def test_cut_windows_slices_the_stream_without_overlap() -> None:
+    ids = list(range(1000))
+    w = corpus.cut_windows(ids, length=100, count=3)
+    assert [len(x) for x in w] == [100, 100, 100]
+    assert w[0] == list(range(100)) and w[2] == list(range(200, 300))
+    assert [i for win in w for i in win] == list(range(300))  # contiguous, in order
+    assert corpus.cut_windows(ids, length=100, count=3) == w  # a pure function of the stream
+    for length, count in ((100, 11), (1, 1), (100, 0), (0, 1)):
+        with pytest.raises(ValueError):
+            corpus.cut_windows(ids, length=length, count=count)
+
+
+def test_fetch_archive_checks_the_hash_of_what_it_reads(tmp_path) -> None:
+    wrong = tmp_path / "wikitext-2-raw-v1.zip"
+    wrong.write_bytes(b"not the archive")
+    with pytest.raises(ValueError, match="sha256"):
+        corpus.fetch_archive(path=wrong, download=False)
+    with pytest.raises(FileNotFoundError):
+        corpus.fetch_archive(path=tmp_path / "absent.zip", download=False)
+    assert corpus.sha256_file(wrong) == hashlib.sha256(b"not the archive").hexdigest()
+
+
+def test_heldout_windows_are_the_text_the_record_names(smollm2, heldout_archive) -> None:
+    """The provenance block rebuilds the windows: archive hash, member hash, then the cut."""
+    src = corpus.source_record(count=4)
+    assert src["archive_sha256"] == corpus.WIKITEXT2_SHA256
+    assert heldout_archive.stat().st_size == corpus.WIKITEXT2_BYTES == src["archive_bytes"]
+    raw = corpus.split_bytes(src["split"])
+    assert hashlib.sha256(raw).hexdigest() == src["member_sha256"]
+    seqs = corpus.heldout_sequences(smollm2, count=4)
+    assert [len(s) for s in seqs] == [corpus.WINDOW_TOKENS] * 4 == [src["window_tokens"]] * 4
+    stream = encode(smollm2, raw.decode("utf-8"))
+    assert [i for w in seqs for i in w] == list(stream[: 4 * corpus.WINDOW_TOKENS])
+    with pytest.raises(ValueError):
+        corpus.source_record(split="dev")
+
+
+def test_heldout_text_is_none_of_the_text_the_quantizer_saw(qwen, heldout_archive) -> None:
+    """No calibration passage or prompt is in the held-out split: the sets are disjoint text."""
+    text = corpus.split_text()
+    for passage in calibrate.CALIB_TEXTS:
+        assert passage not in text
+        assert passage[:120] not in text
+    for name in calibrate.CALIB_PROMPT_FILES:
+        prompt = json.loads((calibrate.PROMPTS_DIR / name).read_text(encoding="utf-8"))
+        for message in prompt["messages"]:
+            assert message["content"][:120] not in text
+    calib_ids = calibrate.calibration_sequences(qwen)
+    assert calibrate.token_ids_sha256(calib_ids) != calibrate.token_ids_sha256(
+        corpus.heldout_sequences(qwen, count=2)
+    )
+
+
+# --------------------------------------------------------------------------- streamed rows
+
+
+@pytest.fixture(scope="session")
+def synthetic_model(tmp_path_factory) -> synthetic.SyntheticModel:
+    return synthetic.build(synthetic.SHAPES[3], 7, out_dir=tmp_path_factory.mktemp("syn-quality"))
+
+
+def test_evaluate_multi_is_evaluate_run_one_sequence_at_a_time(synthetic_model) -> None:
+    """Streaming the reference gives the same rows as holding every sequence's logits at once."""
+    spec, qmodel, seqs = synthetic_model.spec, synthetic_model.quant, synthetic_model.sequences
+    builds = [(qmodel, 16), (qmodel, 8)]
+    seen: list[tuple[int, int]] = []
+    rows = quality.evaluate_multi(
+        spec, builds, seqs, progress=lambda done, total, _s: seen.append((done, total))
+    )
+    assert seen == [(i, len(seqs)) for i in range(1, len(seqs) + 1)]
+    one_at_a_time = [quality.evaluate(spec, qmodel, seqs, a_bits=b) for _, b in builds]
+    assert [r["config"] for r in rows] == ["W8A16", "W8A8"]
+    assert rows == one_at_a_time
+    assert [len(r["sequences"]) for r in rows] == [len(seqs), len(seqs)]
+    assert all(set(s) == set(quality.SEQ_KEYS) for r in rows for s in r["sequences"])
+
+
+def test_evaluate_multi_rejects_builds_it_cannot_share_a_reference_with(synthetic_model) -> None:
+    spec, qmodel, seqs = synthetic_model.spec, synthetic_model.quant, synthetic_model.sequences
+    assert qmodel.n_layers == 2
+    truncated = dataclasses.replace(qmodel, layers=qmodel.layers[:1])
+    for builds, bad_seqs in (
+        ([], seqs),
+        ([(qmodel, 16)], []),
+        ([(qmodel, 16), (qmodel, 16)], seqs),  # one row name twice
+        ([(qmodel, 16), (truncated, 8)], seqs),  # different stacks, one reference
+    ):
+        with pytest.raises(ValueError):
+            quality.evaluate_multi(spec, builds, bad_seqs)
+
+
+# --------------------------------------------------------------------------- the two sets
+
+
+_SOURCE = {
+    "name": "wikitext-2-raw-v1",
+    "url": "https://example.invalid/wikitext-2-raw-v1.zip",
+    "archive_bytes": 4721645,
+    "archive_sha256": "aa" * 32,
+    "member": "wikitext-2-raw/wiki.test.raw",
+    "member_sha256": "bb" * 32,
+    "split": "test",
+    "windows": 2,
+    "window_tokens": 4,
+}
+
+
+def test_heldout_block_records_the_corpus_it_scored() -> None:
+    model = _stub_model(smoothing=True)
+    seqs = [[1, 2, 3, 4], [5, 6, 7, 8]]
+    row = {"config": "W8A16", "kl_mean": 0.5}
+    block = quality.heldout_block(model, seqs, [row], _SOURCE)
+    assert block["rows"] == {"W8A16": row}
+    assert block["protocol"]["source"] == _SOURCE
+    assert block["protocol"]["tokens"] == 6
+    assert block["protocol"]["ids_sha256"] == calibrate.token_ids_sha256(seqs)
+    assert block["protocol"]["logits_frac"] == 16
+    assert block["protocol"]["scoring"] == quality.PROTOCOL["scoring"]
+    text = block["protocol"]["text"]
+    assert "wiki.test.raw" in text and "2 non-overlapping windows of 4 tokens" in text
+    doc = quality.report(model, [[1, 2], [3, 4]], [], heldout=block)
+    assert doc[quality.HELDOUT_KEY] == block and doc["rows"] == {}
+    assert doc["protocol"]["text"] == quality.PROTOCOL["text"]  # the sets keep their own protocol
+    assert quality.HELDOUT_KEY not in quality.report(model, [[1, 2]], [])
+
+
+def _stub_heldout(rows: dict, *, source: dict | None = None) -> dict:
+    return {
+        "protocol": {"text": "held out", "source": source or _SOURCE, "tokens": 6},
+        "rows": rows,
+    }
+
+
+def test_merge_quality_keeps_the_two_sets_apart(tmp_path) -> None:
+    """Each block merges on its own protocol; a run of one set never touches the other's rows."""
+    path = tmp_path / "quality.json"
+    stored = _stub_report({"W8A16": {"kl_mean": 1.0}})
+    stored[quality.HELDOUT_KEY] = _stub_heldout(
+        {"W8A16": {"kl_mean": 5.0}, "W8A8": {"kl_mean": 6.0}}
+    )
+    path.write_text(quality.quality_json_text(stored), encoding="utf-8")
+
+    calib_run = _stub_report({"W8A16": {"kl_mean": 3.0}})
+    merged = quality.merge_quality(calib_run, path)
+    assert merged["rows"] == {"W8A16": {"kl_mean": 3.0}}
+    assert merged[quality.HELDOUT_KEY] == stored[quality.HELDOUT_KEY]
+
+    heldout_run = {**_stub_report({}), quality.HELDOUT_KEY: _stub_heldout({"W8A16": {"kl": 7.0}})}
+    merged = quality.merge_quality(heldout_run, path)
+    assert merged["rows"] == stored["rows"]
+    assert merged[quality.HELDOUT_KEY]["rows"] == {"W8A16": {"kl": 7.0}, "W8A8": {"kl_mean": 6.0}}
+
+    other_windows = {
+        **_stub_report({}),
+        quality.HELDOUT_KEY: _stub_heldout(
+            {"W8A16": {"kl": 9.0}}, source={**_SOURCE, "windows": 3}
+        ),
+    }
+    merged = quality.merge_quality(other_windows, path)
+    assert merged["rows"] == stored["rows"]
+    assert merged[quality.HELDOUT_KEY]["rows"] == {"W8A16": {"kl": 9.0}}
+
+    # a report of another model replaces the file, held-out block and all
+    replaced = quality.merge_quality({**calib_run, "numerics": 2}, path)
+    assert replaced["rows"] == calib_run["rows"] and quality.HELDOUT_KEY not in replaced
+
+
+# --------------------------------------------------------------------------- SmolLM2 held-out
+
+
+def _heldout_rows(spec: ModelSpec, builds, count: int) -> list[dict]:
+    return quality.evaluate_multi(spec, builds, corpus.heldout_sequences(spec, count=count))
+
+
+def _stored_heldout(name: str) -> dict:
+    path = quality.quality_path(name)
+    if not path.is_file():
+        pytest.skip(f"{path} not present (run: uv run quettos check)")
+    stored = quality.load_quality(path)
+    if quality.HELDOUT_KEY not in stored:
+        pytest.skip(f"{path} carries no held-out block (run: uv run quettos check --heldout)")
+    return stored[quality.HELDOUT_KEY]
+
+
+def test_heldout_protocol_names_the_windows_it_scored(spec: ModelSpec, heldout_archive) -> None:
+    """The stored provenance is the corpus this clone rebuilds, ids and all."""
+    protocol = _stored_heldout(spec.name)["protocol"]
+    source = protocol["source"]
+    assert source == corpus.source_record(split=source["split"], count=source["windows"])
+    seqs = corpus.heldout_sequences(spec, split=source["split"], count=source["windows"])
+    assert protocol["ids_sha256"] == calibrate.token_ids_sha256(seqs)
+    assert protocol["tokens"] == sum(len(s) - 1 for s in seqs)
+    assert set(_stored_heldout(spec.name)["rows"]) == set(quality.ROW_NAMES)
+
+
+@pytest.fixture(scope="session")
+def smollm2_heldout(smollm2: ModelSpec, heldout_archive, smollm2_quality) -> dict:
+    """W8A16 over the first :data:`HELDOUT_WINDOWS_FAST` held-out windows of SmolLM2."""
+    qmodel, _, _ = smollm2_quality
+    return _heldout_rows(smollm2, [(qmodel, 16)], HELDOUT_WINDOWS_FAST)[0]
+
+
+def test_smollm2_w8a16_heldout_gate(smollm2_heldout) -> None:
+    """The calibration-set gate, met on text the quantizer never saw."""
+    row = smollm2_heldout
+    print(
+        f"smollm2 held-out {row['config']}: tokens {row['tokens']} "
+        f"top-1 {row['top1_percent']:.2f}% KL {row['kl_mean']:.5f} "
+        f"delta-NLL {row['delta_nll']:+.5f} +/- {row['delta_nll_se']:.5f} "
+        f"PPL {row['ppl_fp32']:.3f} -> {row['ppl_int']:.3f} {row['stats']}"
+    )
+    assert row["tokens"] == HELDOUT_WINDOWS_FAST * (corpus.WINDOW_TOKENS - 1)
+    assert row["stats"]["sat"] == 0 and row["stats"]["err_shift"] == 0
+    assert row["kl_mean"] <= GATE_KL_NATS
+    assert row["top1_percent"] >= GATE_TOP1_PERCENT
+    assert row["delta_nll"] == pytest.approx(row["nll_int"] - row["nll_fp32"])
+
+
+def test_smollm2_heldout_json_matches_fresh_windows(smollm2, smollm2_heldout) -> None:
+    """The stored per-window values are what a fresh run of those windows produces."""
+    stored = _stored_heldout(smollm2.name)["rows"]["W8A16"]
+    _assert_row_close(
+        {"sequences": stored["sequences"][:HELDOUT_WINDOWS_FAST]},
+        {"sequences": smollm2_heldout["sequences"]},
+    )
+
+
+@pytest.mark.slow
+def test_heldout_json_matches_fresh_windows(
+    spec: ModelSpec, heldout_archive, qmodel_full, qmodel_nosmooth
+):
+    """Every held-out row of the checked-in file, over a prefix of the windows it names."""
+    stored = _stored_heldout(spec.name)["rows"]
+    builds = [(m, b) for m in (qmodel_full, qmodel_nosmooth) for b in quality.CONFIGS]
+    rows = _heldout_rows(spec, builds, HELDOUT_WINDOWS_SLOW)
+    assert {r["config"] for r in rows} == set(quality.ROW_NAMES)
+    for row in rows:
+        print(
+            f"{spec.name} held-out {row['config']}: top-1 {row['top1_percent']:.2f}% "
+            f"KL {row['kl_mean']:.5f} delta-NLL {row['delta_nll']:+.5f} {row['stats']}"
+        )
+        assert row["stats"]["sat"] == 0 and row["stats"]["err_shift"] == 0
+        _assert_row_close(
+            {"sequences": stored[row["config"]]["sequences"][:HELDOUT_WINDOWS_SLOW]},
+            {"sequences": row["sequences"]},
+        )
+
+
+# --------------------------------------------------------------------------- provenance
+
+
+def test_scored_sets_puts_the_held_out_block_first() -> None:
+    rep = _stub_report({"W8A16": {"kl_mean": 1.0}})
+    assert [name for name, _ in quality.scored_sets(rep)] == [quality.CALIB_SET]
+    rep[quality.HELDOUT_KEY] = _stub_heldout({"W8A8": {"kl_mean": 2.0}})
+    blocks = quality.scored_sets(rep)
+    assert [name for name, _ in blocks] == [quality.HELDOUT_SET, quality.CALIB_SET]
+    assert blocks[0][1] is rep[quality.HELDOUT_KEY]
+    assert blocks[1][1] == {"protocol": rep["protocol"], "rows": rep["rows"]}
+
+
+def _stored_report(spec: ModelSpec) -> dict:
+    path = quality.quality_path(spec.name)
+    if not path.is_file():
+        pytest.skip(f"{path} not present (run: uv run quettos check)")
+    stored = quality.load_quality(path)
+    if quality.HELDOUT_KEY not in stored:
+        pytest.skip(f"{path} carries no held-out block (run: uv run quettos check --heldout)")
+    return stored
+
+
+def test_provenance_rebuilds_the_text_every_published_row_was_scored_on(
+    spec: ModelSpec, heldout_archive
+) -> None:
+    """Both sets of the checked-in file, ids and all, without running a model."""
+    stored = _stored_report(spec)
+    sets = quality.provenance(spec, stored, download=False)
+    assert [s.name for s in sets] == [quality.HELDOUT_SET, quality.CALIB_SET]
+    heldout, calib = sets
+    for block in sets:
+        assert set(block.rows) == set(quality.ROW_NAMES)
+        assert block.ok, [c for c in block.checks if not c.ok]
+        assert (
+            block.tokens
+            == stored[quality.HELDOUT_KEY if block.name == quality.HELDOUT_SET else "protocol"].get(
+                "protocol", stored["protocol"]
+            )["tokens"]
+        )
+    labels = [c.label for c in heldout.checks]
+    assert labels == [
+        "archive",
+        "member",
+        "the cut",
+        "scored ids",
+        "scored positions",
+        "not the calibration ids",
+    ]
+    assert (
+        corpus.WIKITEXT2_SHA256[:16] in dict((c.label, c.detail) for c in heldout.checks)["archive"]
+    )
+    assert "wiki.test.raw" in heldout.text and str(corpus.WINDOW_TOKENS) in heldout.text
+    assert heldout.tokens == corpus.WINDOWS * (corpus.WINDOW_TOKENS - 1)
+    assert [c.label for c in calib.checks] == [
+        "scored ids",
+        "scored positions",
+        "sequence lengths",
+        "the ids calibration saw",
+    ]
+    assert calib.tokens == sum(len(x) - 1 for x in calibrate.calibration_sequences(spec))
+
+
+@pytest.mark.parametrize(
+    ("doctor", "failing"),
+    [
+        (("heldout", "ids_sha256"), {"scored ids"}),
+        (("heldout", "tokens"), {"scored positions"}),
+        (("calib", "ids_sha256"), {"scored ids", "the ids calibration saw"}),
+        (("calib", "tokens"), {"scored positions"}),
+        (("calib", "sequences"), {"sequence lengths"}),
+        (("report", "calib_tokens_sha256"), {"the ids calibration saw"}),
+        (("source", "member_sha256"), {"member", "the cut"}),
+        (("source", "archive_sha256"), {"archive", "the cut"}),
+        # a record that lies about the cut still rebuilds an archive record of
+        # its own: the ids it names are what catches it
+        (("source", "windows"), {"scored ids", "scored positions"}),
+    ],
+)
+def test_provenance_names_the_record_that_does_not_rebuild(
+    smollm2: ModelSpec, heldout_archive, doctor, failing
+) -> None:
+    """A field changed in the file is one named failing check, and never a silent pass."""
+    stored = json.loads(json.dumps(_stored_report(smollm2)))  # a copy to doctor
+    where, field = doctor
+    block = {
+        "heldout": stored[quality.HELDOUT_KEY]["protocol"],
+        "calib": stored["protocol"],
+        "report": stored,
+        "source": stored[quality.HELDOUT_KEY]["protocol"]["source"],
+    }[where]
+    block[field] = (
+        2 if isinstance(block[field], int) else ["f" * 8] if field == "sequences" else "f" * 64
+    )
+    sets = quality.provenance(smollm2, stored, download=False)
+    assert {c.label for s in sets for c in s.checks if not c.ok} == failing
+    assert not all(s.ok for s in sets)
+
+
+def test_provenance_catches_held_out_rows_that_name_the_calibration_ids(
+    smollm2: ModelSpec, heldout_archive
+) -> None:
+    """The suspicion the command exists to settle, made true in the file and caught."""
+    stored = json.loads(json.dumps(_stored_report(smollm2)))
+    stored[quality.HELDOUT_KEY]["protocol"]["ids_sha256"] = stored["protocol"]["ids_sha256"]
+    heldout = quality.provenance(smollm2, stored, download=False)[0]
+    failed = {c.label for c in heldout.checks if not c.ok}
+    assert failed == {"scored ids", "not the calibration ids"}
+
+
+def test_provenance_command_ends_in_a_verdict(
+    smollm2: ModelSpec, heldout_archive, capsys, tmp_path
+) -> None:
+    """``uv run quettos provenance`` over a good file and over a doctored one."""
+    stored = _stored_report(smollm2)
+    good = tmp_path / "quality.json"
+    good.write_text(quality.quality_json_text(stored), encoding="utf-8")
+    assert cli.main(["provenance", smollm2.repo_id, "--file", str(good), "--no-download"]) == 0
+    out = capsys.readouterr().out
+    assert "provenance: OK" in out and f"{len(quality.ROW_NAMES) * 2} published rows" in out
+    assert stored[quality.HELDOUT_KEY]["protocol"]["ids_sha256"][:16] in out
+    assert stored["protocol"]["ids_sha256"][:16] in out
+    assert "FAIL" not in out
+
+    doctored = json.loads(json.dumps(stored))
+    doctored[quality.HELDOUT_KEY]["protocol"]["ids_sha256"] = "f" * 64
+    bad = tmp_path / "doctored.json"
+    bad.write_text(quality.quality_json_text(doctored), encoding="utf-8")
+    assert cli.main(["provenance", smollm2.repo_id, "--file", str(bad), "--no-download"]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL scored ids" in out and "provenance: FAILED -- 1 check(s)" in out
+
+    assert cli.main(["provenance", smollm2.repo_id, "--file", str(tmp_path / "absent.json")]) == 1
