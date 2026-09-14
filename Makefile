@@ -106,7 +106,10 @@ demo-qwen:
 # the result -- the ids the hardware generated against
 # models/<name>/expected_tokens.json and the counters a clean run leaves at
 # zero -- and the stage wall clocks and the verdict go to
-# build/clean-clone/<model>.json.
+# build/clean-clone/<model>.json. A run that stops names the stage of the demo
+# that stopped it and prints that stage's last lines, and the demo's whole
+# output is kept beside the report as build/clean-clone/<model>.log, because the
+# clone it ran in is removed when the run ends.
 #
 # `clean-clone` checks the committed tree, which is what anyone else can fetch;
 # `clean-clone-worktree` checks the tree as it stands here, every tracked path
@@ -194,7 +197,11 @@ synth:
 # the source module and that netlist from the same stimulus and compares every
 # output every cycle against Yosys's own cell models. A construct the two front
 # ends read differently is a mismatch, and any mismatch fails the target.
-# GATESIM_ARGS passes flags through, e.g. GATESIM_ARGS="--only seq_fetch_wb64".
+# A full run also holds the coverage table of sim/gatesim/README.md to what it
+# just measured: every cell count on the Yosys build the table records, and the
+# cases and their configurations on any other build, which packs its own cells.
+# GATESIM_ARGS passes flags through, e.g. GATESIM_ARGS="--only seq_fetch_wb64"
+# or GATESIM_ARGS=--write-table to rewrite that table from the run.
 GATESIM_ARGS ?=
 
 gatesim:

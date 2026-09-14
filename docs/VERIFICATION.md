@@ -58,12 +58,24 @@ sequences run from 36 to 520 tokens.
    case fails as well when an output port stops toggling, when the netlist
    instantiates a cell the Yosys library only declares, or
    when more than a tenth of the window is still undefined.
+   The netlist is read against the cell models of the Yosys that wrote it, so a
+   machine carrying two Yosys installations cannot pair one build's netlist with
+   another build's models, and the lookup-table images both front ends load are
+   staged beside the netlist under their bare names, so the cell count a case
+   reports is a figure of the design rather than of the directory the repository
+   sits in.
+   `sim/gatesim/README.md` carries the coverage table the run writes and the
+   Yosys build that measured it. On that build a full run holds the page to
+   every cell count on it; on another build, whose cell packing is its own, it
+   holds the page to the cases and their configurations and reports what the
+   counts came to. The equivalence itself -- every case, the cycle-by-cycle
+   comparison and the three conditions above -- is checked in full on either.
    `sim/gatesim/README.md` lists what is covered and the reason for each block
    that is not: `qcore_vsram`, the demo-width `qcore_stream_ctrl` FIFOs and
-   `qcore_top` all infer `RAMB18E1` / `RAMB36E1`, which Yosys 0.65 declares
-   without a simulation body. The lookup tables do not: `memory_libmap` picks
-   the logic mapping for a write-free memory, so `qcore_lut_rom` and the whole
-   of `qcore_vpu_top` are simulable.
+   `qcore_top` all infer `RAMB18E1` / `RAMB36E1`, which the Yosys Xilinx cell
+   library declares without a simulation body. The lookup tables do not:
+   `memory_libmap` picks the logic mapping for a write-free memory, so
+   `qcore_lut_rom` and the whole of `qcore_vpu_top` are simulable.
 2. **`numerics.py` pytest.** `round_shift` / `sat` / `sfloat` / `sfloat_mul`
    properties (m in range for all pairs), LUT error bounds vs float64,
    recip/rsqrt at `m in {1.0, 2.0, 4-eps}`, requant vs a big-int reference
@@ -419,7 +431,9 @@ sequences run from 36 to 520 tokens.
    run (`make synth`: every block and the whole core in both configurations,
    with every `syn/reports/*.md` regenerated and checked against the run; a
    report written by a different Yosys build is held to its parameters and its
-   hard-block inventory, since LUT packing and path length belong to the build),
+   hard-block inventory, since LUT packing and path length belong to the build,
+   and the `README.md` row that quotes the whole-core page is held to that same
+   split, naming the build that packed it),
    the tiny-configuration bring-up comparison (`bringup-tiny`: `make
    harness-csr` then `make bringup`; `docs/PERFORMANCE.md` holds that target's
    local wall clock) and the demo on the small model (`demo-smollm2`: `make
@@ -468,7 +482,13 @@ sequences run from 36 to 520 tokens.
    lock names, so a file that is in the working tree and was never added, and a
    package installed by hand rather than declared in `pyproject.toml`, both stop
    the demo here rather than on a reader's machine. Every stage carries its wall
-   clock and the report is `build/clean-clone/<model>.json`. The `clean-clone` job of
+   clock and the report is `build/clean-clone/<model>.json`.
+   A run that stops says what stopped it: the stage of the check, the stage of
+   the demo under it, the seconds it had run for and the last lines that stage
+   printed. The report is written either way and the demo's whole output is kept
+   beside it as `build/clean-clone/<model>.log`, so the clone goes and the
+   evidence stays -- which is what a reader of a failed run has to work from,
+   and what the CI job prints. The `clean-clone` job of
    `.github/workflows/ci.yml` runs the check on the small model, where the
    checkout is already the commit and what is under test is the cold path: no uv
    cache, no checkpoint and no harness object directory, and the only thing

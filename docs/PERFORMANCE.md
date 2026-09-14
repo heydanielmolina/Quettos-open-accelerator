@@ -574,7 +574,11 @@ measurement with 3.8x to spare.
 
 - The README's results table quotes the `qcore_top` rows above and the Demo
   configuration section of `syn/reports/qcore_top.md`, which `make synth`
-  regenerates from `build/synth/synth_top.log` and checks.
+  regenerates from `build/synth/synth_top.log` and checks. Its hard-block counts
+  are what `synth_xilinx` infers from the source on any build; its `SRL16E`,
+  LUT, flop, cell and LC figures are how the Yosys named under **Machine and
+  tools** packed the fabric on this machine, and `make synth` prints what
+  another build packs instead.
 - The wall clock includes an ideal C++ memory model; `--lat` and `--bw-div` are
   how far it bends, and the memory-latency table above is that sweep.
 - CI runs on `ubuntu-latest` (4 vCPU, no Apple silicon) with the same flags, so

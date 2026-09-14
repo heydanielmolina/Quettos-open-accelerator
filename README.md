@@ -51,16 +51,16 @@ for the paged KV cache, the batched decode and the constrained decoding on the
 ## Results
 
 Every row names the command that produced it. Simulation numbers are from an
-Apple M5 Pro with Verilator 5.048 and Apple clang 17; synthesis is Yosys 0.65.
-The workload is a compiled image at the demo configuration
-`WB=64, B_MAX=1, VL=4, VSRAM_WORDS=4096` -- Qwen2.5-0.5B-Instruct, the whole
-model in `build/images/qwen2.5-0.5b-instruct` and its first two layers in
-`build/images/qwen2.5-0.5b-instruct-l2`, except where a row names
-SmolLM2-135M-Instruct: every descriptor at its real address, stride, meta and
-partial tile, generating the tokens it generates. A wall clock is the median of
-a set of runs, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) owns that set and
-its extremes; cycle counts are the core's own counters and are identical run to
-run.
+Apple M5 Pro with Verilator 5.048 and Apple clang 17; the synthesis row names the
+Yosys build that packed it, run on that same machine. The workload is a compiled
+image at the demo configuration `WB=64, B_MAX=1, VL=4, VSRAM_WORDS=4096` --
+Qwen2.5-0.5B-Instruct, the whole model in `build/images/qwen2.5-0.5b-instruct`
+and its first two layers in `build/images/qwen2.5-0.5b-instruct-l2`, except where
+a row names SmolLM2-135M-Instruct: every descriptor at its real address, stride,
+meta and partial tile, generating the tokens it generates. A wall clock is the
+median of a set of runs, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) owns
+that set and its extremes; cycle counts are the core's own counters and are
+identical run to run.
 
 | Measurement | Value | Command |
 |---|---|---|
@@ -71,7 +71,7 @@ run.
 | 36-token prompt + 1 decode token, two layers | 20,736,018 cycles, 91.6% MAC-active, 59.2 read bytes per cycle, 6.2% in the vector unit and 0.10% in sequencing | `make perf` |
 | 32-token prompt + 20 decode tokens, whole model | 358,570,293 cycles in 127.7 s, 91.8% MAC-active, 59.3 read bytes per cycle | `make perf IMAGE=build/images/qwen2.5-0.5b-instruct PERF_ARGS="--max-new 20 --prompt-ids <the first 32 ids of prompt.tokens> --eos 999999999"` |
 | Verilator simulation rate, `--threads 1` | 2.754 Mcycles/s | the two-layer decode-token run above |
-| `qcore_top` on xc7 | 109 DSP48E1, 32 RAMB36E1, 15 RAMB18E1, 359 RAM32M, 354 SRL16E, 35,510 LUTs, 22,437 flops; 63,162 cells, 29,014 estimated LCs | `make synth` (Yosys `synth_xilinx -family xc7 -flatten`); the table is the Demo configuration section of `syn/reports/qcore_top.md`, which that command regenerates from its own log |
+| `qcore_top` on xc7 | what any Yosys build infers from the source: 109 DSP48E1, 32 RAMB36E1, 15 RAMB18E1, 359 RAM32M; how Yosys 0.65 packed the fabric around them: 354 SRL16E, 35,510 LUTs, 22,437 flops, 63,162 cells, 29,014 estimated LCs | `make synth` (Yosys `synth_xilinx -family xc7 -flatten`); the table is the Demo configuration section of `syn/reports/qcore_top.md`, which that command regenerates from its own log |
 | RTL against the ISA simulator, descriptor by descriptor | 80 of 80 runs match element by element at WB=64 and WB=128, over the bring-up, vector, attention and layer programs | `make bringup-sweep` |
 | RTL against the ISA simulator, generated ids | the whole SmolLM2-135M-Instruct model, 37 prompt tokens and 4 generated: `[504, 3575, 282, 4649]` on both, in 86,361,436 clock cycles | `uv run quettos compare --image build/images/smollm2-135m-instruct --wb 64 --generate 4` |
 | Quality against fp32, W8A16 (integer golden model) | on 32,704 held-out WikiText-2 positions: Qwen KL 0.0044 nats, top-1 96.65% and delta-NLL -0.0037 +/- 0.0006; SmolLM2 KL 0.0041, top-1 96.10% and +0.0023 +/- 0.0005 | `uv run quettos check <alias> --heldout` |
@@ -89,6 +89,16 @@ scored on: it rebuilds the held-out windows from the WikiText-2 archive and the
 calibration ids from `prompts/`, hashes both, and holds each hash to the one
 stored with the rows.
 
+The synthesis row states its two halves apart, because they reproduce
+differently. The hard-block counts are inference outcomes: `synth_xilinx` reads
+the same multipliers and the same memories out of this source whatever build
+runs it, so those four figures come back exactly. The figures after the `;` are
+one build's packing -- which shift registers it put in an `SRL16E` rather than
+in flops, how it filled the LUTs, and the totals over both -- and they belong to
+the Yosys the row names and the machine it ran on. `make synth` holds the row to
+that split: every figure on the build the row names, the inference outcomes on
+any other, printing what that build packed instead.
+
 The synthesis row is `qcore_top` as it stands: the GEMV, EMBED and KVWRITE
 datapath, the whole control path and `qcore_vpu_top` with its lanes, its scalar
 unit and its four lookup tables. The same core before it carried a vector unit
@@ -96,8 +106,9 @@ stood at 11,484 estimated LCs and 69 `DSP48E1` in the demo configuration, and th
 one whose vector unit ran four of the six V opcodes at 23,026 LCs and 101
 `DSP48E1` -- read against the row above, what the unit costs and what its
 rotation and softmax passes cost; `syn/reports/qcore_top.md` names the commits
-both were measured at. The cycle rows include the unit's work: 6.1% of the
-32 + 20 run's cycles are `STALL_VPU`.
+both were measured at, and the build that packed them is the one the row names,
+so the three are a like-for-like comparison. The cycle rows include the unit's
+work: 6.1% of the 32 + 20 run's cycles are `STALL_VPU`.
 
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) holds the full tables, the
 measurement protocol, the memory model and the demo configuration;

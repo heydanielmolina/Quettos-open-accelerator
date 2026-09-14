@@ -147,7 +147,9 @@ else
 fi
 
 stage harness "make -C sim/verilator build $CFG" make -C sim/verilator build $CFG
-BIN=$(make -s -C sim/verilator where $CFG)
+# `make -C` turns on -w, so the directory lines land in this capture unless they
+# are turned off; -s silences the command echo but not them.
+BIN=$(make -s --no-print-directory -C sim/verilator where $CFG)
 
 rc=0
 stage run "$(basename "$BIN") --image $IMAGE --max-new $MAX_NEW" \

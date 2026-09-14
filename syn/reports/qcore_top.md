@@ -204,12 +204,13 @@ count does not move.
 
 The VROPE and VSOFTMAX passes are the difference between this page and the one commit
 `b9e3c5c` carries, whose vector unit executed the other four V opcodes: `git show
-b9e3c5c:syn/reports/qcore_top.md` records 23026 estimated LCs in the demo configuration
-(53177 cells, 28778 LUTs, 19545 flops, 101 `DSP48E1`) and 16317 in the tiny one (39669
-cells, 20113 LUTs, 16612 flops, 55 `DSP48E1`). Read against the estimated-LC and `DSP48E1`
-lines of the two tables above, that is what the two operations cost in each configuration,
-again with no second number typed here. Every added DSP is the rotation's second 32 x 17
-product, two per `qcore_vpu_lane`; the table interpolators are unchanged, because the exp2
-image shares the instances the sigmoid already had. The longest path does not move to either
-pass: it is the dispatcher's POS derivation at both widths, and the softmax exponential is
-the deeper of the two new chains at a depth `syn/reports/qcore_vpu_top.md` gives.
+b9e3c5c:syn/reports/qcore_top.md`, which the Yosys build named above wrote as well, records
+23026 estimated LCs in the demo configuration (53177 cells, 28778 LUTs, 19545 flops, 101
+`DSP48E1`) and 16317 in the tiny one (39669 cells, 20113 LUTs, 16612 flops, 55 `DSP48E1`).
+Read against the estimated-LC and `DSP48E1` lines of the two tables above, that is what the
+two operations cost in each configuration, again with no second number typed here. Every
+added DSP is the rotation's second 32 x 17 product, two per `qcore_vpu_lane`; the table
+interpolators are unchanged, because the exp2 image shares the instances the sigmoid already
+had. The longest path does not move to either pass: it is the dispatcher's POS derivation at
+both widths, and the softmax exponential is the deeper of the two new chains at a depth
+`syn/reports/qcore_vpu_top.md` gives.

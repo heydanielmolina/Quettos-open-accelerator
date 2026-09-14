@@ -4,15 +4,17 @@ For every entry of CASES: Yosys maps the module to Xilinx 7-series cells and
 writes the netlist, then one Icarus bench drives the source module and the
 netlist from the same stimulus and compares the concatenation of their outputs
 every cycle. A cycle in which the two differ is a mismatch and the run exits
-non-zero. The netlist is simulated against Yosys's own cell models
-(``$(yosys-config --datdir)/xilinx/cells_sim.v``), so the source side is read by
-Icarus and the netlist side by Yosys: a construct the two front ends read
-differently shows up as a mismatch instead of surviving to the bitstream.
+non-zero. The netlist is simulated against the cell models of the Yosys that
+wrote it (``<yosys>/../share/yosys/xilinx/cells_sim.v``), so the source side is
+read by Icarus and the netlist side by Yosys: a construct the two front ends
+read differently shows up as a mismatch instead of surviving to the bitstream.
 
 The coverage table of ``sim/gatesim/README.md`` is written from the run: every
-case, the parameters it is elaborated with and the cell count Yosys reported for
-it. A full run checks that table and fails when it no longer matches;
-``--write-table`` rewrites it.
+case, the parameters it is elaborated with, the cell count Yosys reported for it
+and the Yosys build that reported it. A full run checks that table.  On the
+build the table records it is held to every figure; on another build, whose cell
+packing is its own, it is held to the cases and the configurations and the run
+says which counts moved. ``--write-table`` rewrites it.
 """
 
 from __future__ import annotations
@@ -50,6 +52,30 @@ MAX_X_SHARE = 0.10
 
 
 @dataclass(frozen=True)
+class Rom:
+    """One lookup-table image a case elaborates a ROM with.
+
+    Both front ends are given the bare file name, and the run stages the image
+    beside the netlist under that name. A directory in the value would reach the
+    `$paramod` name Yosys derives from a submodule's parameters, and a module
+    name is an input to how the design is mapped: the same tree in two
+    directories would then report two different cell counts. The bare name makes
+    the count a property of the design.
+    """
+
+    table: str
+
+    @property
+    def value(self) -> str:
+        """What `chparam` and the bench instance carry: the quoted file name."""
+        return f'"{self.table}.hex"'
+
+    def source(self, rtl_dir: Path) -> Path:
+        """The image itself, in the RTL directory the run was pointed at."""
+        return rtl_dir / "gen" / f"{self.table}.hex"
+
+
+@dataclass(frozen=True)
 class Case:
     """One module in one configuration."""
 
@@ -57,10 +83,10 @@ class Case:
     top: str
     sources: tuple[str, ...]
     # Parameter values as Yosys, Icarus and the generated bench all read them:
-    # an int, or the already-quoted absolute path `rom_image` builds for a ROM
-    # image parameter (`ROM_FILE`, `ROM_FILE_<TABLE>`), which the RTL declares
-    # untyped because Yosys 0.65 rejects `parameter string`.
-    params: dict[str, int | str] = field(default_factory=dict)
+    # an int, or a `Rom` for a lookup-table image parameter (`ROM_FILE`,
+    # `ROM_FILE_<TABLE>`), which the RTL declares untyped because Yosys 0.65
+    # rejects `parameter string`.
+    params: dict[str, int | Rom] = field(default_factory=dict)
     cycles: int = 4000
     reset: str | None = "rst"
     # Verilog driven verbatim on the cycles right after reset, one entry per
@@ -120,9 +146,9 @@ DESC_SHAPE = """
 """
 
 
-def rom_image(table: str) -> str:
-    """The `chparam` / instance value of one ROM_FILE parameter: a quoted image path."""
-    return f'"{REPO / "rtl" / "gen" / f"{table}.hex"}"'
+def param_values(case: Case) -> dict[str, int | str]:
+    """The case's parameters as Yosys and Icarus take them, images resolved."""
+    return {k: v.value if isinstance(v, Rom) else v for k, v in case.params.items()}
 
 
 CASES: tuple[Case, ...] = (
@@ -334,7 +360,7 @@ CASES: tuple[Case, ...] = (
         name="lut_rom_exp2",
         top="qcore_lut_rom",
         sources=("rtl/qcore_lut_rom.sv",),
-        params={"ROM_FILE": rom_image("exp2"), "ENTRIES": 256},
+        params={"ROM_FILE": Rom("exp2"), "ENTRIES": 256},
         cycles=4000,
         reset=None,
         directed=(
@@ -349,7 +375,7 @@ CASES: tuple[Case, ...] = (
         name="lut_rom_rsqrt",
         top="qcore_lut_rom",
         sources=("rtl/qcore_lut_rom.sv",),
-        params={"ROM_FILE": rom_image("rsqrt"), "ENTRIES": 512},
+        params={"ROM_FILE": Rom("rsqrt"), "ENTRIES": 512},
         cycles=4000,
         reset=None,
         directed=(
@@ -414,8 +440,8 @@ CASES: tuple[Case, ...] = (
             "rtl/qcore_vpu_scalar.sv",
         ),
         params={
-            "ROM_FILE_RSQRT": rom_image("rsqrt"),
-            "ROM_FILE_RECIP": rom_image("recip"),
+            "ROM_FILE_RSQRT": Rom("rsqrt"),
+            "ROM_FILE_RECIP": Rom("recip"),
         },
         cycles=6000,
         directed=(
@@ -454,10 +480,10 @@ CASES: tuple[Case, ...] = (
             "rtl/qcore_vpu_top.sv",
         ),
         params={
-            "ROM_FILE_SIGMOID": rom_image("sigmoid"),
-            "ROM_FILE_EXP2": rom_image("exp2"),
-            "ROM_FILE_RSQRT": rom_image("rsqrt"),
-            "ROM_FILE_RECIP": rom_image("recip"),
+            "ROM_FILE_SIGMOID": Rom("sigmoid"),
+            "ROM_FILE_EXP2": Rom("exp2"),
+            "ROM_FILE_RSQRT": Rom("rsqrt"),
+            "ROM_FILE_RECIP": Rom("recip"),
             "WB": 16,
             "B_MAX": 2,
             "VL": 2,
@@ -516,17 +542,36 @@ CASES: tuple[Case, ...] = (
 PHASES = ((0, 50), (60, 85), (25, 20), (85, 95))
 
 
-def datdir() -> Path:
-    """Where Yosys keeps its cell models: what yosys-config reports, and
-    otherwise the share/yosys beside the yosys on PATH."""
-    if shutil.which("yosys-config"):
-        out = subprocess.run(["yosys-config", "--datdir"], capture_output=True, text=True)
-        if out.returncode == 0 and out.stdout.strip():
-            return Path(out.stdout.strip())
+def yosys_bin() -> Path:
+    """The yosys this run synthesizes with."""
     exe = shutil.which("yosys")
     if exe is None:
         raise SystemExit("gatesim: yosys is not on PATH")
-    return Path(exe).resolve().parent.parent / "share" / "yosys"
+    return Path(exe).resolve()
+
+
+def datdir() -> Path:
+    """Where that Yosys keeps its cell models.
+
+    The models have to come from the build that wrote the netlist, so the
+    lookup starts from the yosys binary rather than from PATH: the yosys-config
+    beside it if there is one, and otherwise the share/yosys beside it. Two
+    installations on one PATH would otherwise pair one build's netlist with
+    another build's cell models.
+    """
+    exe = yosys_bin()
+    cfg = exe.parent / "yosys-config"
+    if cfg.is_file():
+        out = subprocess.run([str(cfg), "--datdir"], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip())
+    return exe.parent.parent / "share" / "yosys"
+
+
+def tool_banner() -> str:
+    """The Yosys build this run uses, as the coverage table records it."""
+    out = subprocess.run([str(yosys_bin()), "-V"], capture_output=True, text=True, check=False)
+    return out.stdout.strip() or "yosys -V printed nothing"
 
 
 def modelled_cells(cells_sim: Path) -> set[str]:
@@ -546,7 +591,7 @@ def modelled_cells(cells_sim: Path) -> set[str]:
 
 def yosys_script(case: Case, rtl_dir: Path, netlist: Path, ports: Path) -> str:
     files = " ".join(str(rewrite(s, rtl_dir)) for s in case.sources)
-    chparam = "".join(f"chparam -set {k} {v} {case.top};\n" for k, v in case.params.items())
+    chparam = "".join(f"chparam -set {k} {v} {case.top};\n" for k, v in param_values(case).items())
     return (
         f"read_verilog -sv -defer -I{rtl_dir} {files};\n"
         f"{chparam}"
@@ -626,6 +671,7 @@ def gen_bench(case: Case, ports: list[tuple[str, str, int]]) -> str:
     # The integer parameters only: a directed or shape line names them
     # (`ENTRIES - 1`, `{WB{1'b1}}`), and a ROM image path is not an int.
     lp = [f"  localparam int {k} = {v};\n" for k, v in case.params.items() if isinstance(v, int)]
+    values = param_values(case)
     if case.top == "qcore_requant":
         lp.append("  localparam int NVALID_MAX = WB;\n")
 
@@ -658,7 +704,7 @@ def gen_bench(case: Case, ports: list[tuple[str, str, int]]) -> str:
     def inst(prefix: str, module: str, params: bool) -> str:
         pstr = ""
         if params and case.params:
-            pstr = " #(" + ", ".join(f".{k}({v})" for k, v in case.params.items()) + ")"
+            pstr = " #(" + ", ".join(f".{k}({v})" for k, v in values.items()) + ")"
         conns = ["    .clk(clk)"]
         if case.reset:
             conns.append(f"    .{case.reset}({case.reset})")
@@ -768,16 +814,14 @@ RESULT_RE = re.compile(
     r"GATESIM compared=(\d+) mismatches=(\d+) x_cycles=(\d+) toggled=(\d+)/(\d+)"
 )
 PORT_RE = re.compile(r"^gatesim:   port (\S+) toggled (\d+)/(\d+)$", re.M)
+ROW_RE = re.compile(r"^\| `([^`]+)` \| `([^`]+)` \| (.*?) \| (\d+) \|$", re.M)
+TOOL_RE = re.compile(r"^Tool: `(.+)`$", re.M)
 
 
 def config_text(case: Case) -> str:
     """The Configuration cell of one row: the parameters the case is elaborated with."""
     widths = ", ".join(f"{k}={v}" for k, v in case.params.items() if isinstance(v, int))
-    roms = [
-        Path(v.strip('"')).relative_to(REPO).as_posix()
-        for v in case.params.values()
-        if isinstance(v, str)
-    ]
+    roms = [f"rtl/gen/{v.table}.hex" for v in case.params.values() if isinstance(v, Rom)]
     cells = ([f"`{widths}`"] if widths else []) + [f"`{r}`" for r in roms]
     return ", ".join(cells) if cells else "defaults"
 
@@ -790,21 +834,78 @@ def case_table(cells: dict[str, int]) -> str:
     return "\n".join(rows)
 
 
-def sync_table(path: Path, table: str, write: bool) -> str | None:
-    """Put `table` between the markers in `path`; the failure to report, or None."""
+def table_block(cells: dict[str, int], tool: str) -> str:
+    """What goes between the markers: the coverage table and the build that measured it."""
+    return f"{case_table(cells)}\n\nTool: `{tool}`"
+
+
+def block_tool(block: str) -> str:
+    """The Yosys build a recorded block was measured with, empty if absent."""
+    m = TOOL_RE.search(block)
+    return m.group(1) if m else ""
+
+
+def block_rows(block: str) -> list[tuple[str, str, str, str]]:
+    """The rows of a block: case, block, configuration, cell count."""
+    return ROW_RE.findall(block)
+
+
+def design_rows(block: str) -> list[tuple[str, str, str]]:
+    """The part of the table any Yosys build has to reproduce.
+
+    The cell count is the one figure a build packs for itself; everything else
+    on the row -- that the case is there at all, which module it maps and which
+    parameters and lookup-table images it is elaborated with -- is the design
+    and is held to on every build.
+    """
+    return [(case, top, cfg) for case, top, cfg, _ in block_rows(block)]
+
+
+def drift(old: str, new: str) -> str:
+    """The counts that moved between two blocks, one line, longest move first."""
+    was = {case: cells for case, _, _, cells in block_rows(old)}
+    moved = [
+        (abs(int(cells) - int(was[case])), f"{case} {was[case]}->{cells}")
+        for case, _, _, cells in block_rows(new)
+        if was.get(case) not in (None, cells)
+    ]
+    return ", ".join(t for _, t in sorted(moved, reverse=True))
+
+
+def sync_table(path: Path, fresh: str, write: bool) -> tuple[str | None, str | None]:
+    """Hold `path` to this run's block: (the failure to report, what to note)."""
     text = path.read_text()
     head, sep, rest = text.partition(TABLE_BEGIN)
-    _, end, tail = rest.partition(TABLE_END)
+    recorded, end, tail = rest.partition(TABLE_END)
+    rel = path.relative_to(REPO).as_posix()
     if not sep or not end:
-        return f"{path} carries no {TABLE_BEGIN} ... {TABLE_END} block for the table"
-    fresh = f"{head}{TABLE_BEGIN}\n\n{table}\n\n{TABLE_END}{tail}"
-    if fresh == text:
-        return None
-    if not write:
-        rel = path.relative_to(REPO).as_posix()
-        return f"{rel} does not carry this run's table; rewrite it with --write-table"
-    path.write_text(fresh)
-    return None
+        return f"{rel} carries no {TABLE_BEGIN} ... {TABLE_END} block for the table", None
+    if write:
+        path.write_text(f"{head}{TABLE_BEGIN}\n\n{fresh}\n\n{TABLE_END}{tail}")
+        return None, None
+    if recorded.strip() == fresh:
+        return None, None
+    was, now = block_tool(recorded), block_tool(fresh)
+    if was == now:
+        return (
+            f"{rel} does not carry this run's table; rewrite it with --write-table"
+            + (f" ({drift(recorded, fresh)})" if drift(recorded, fresh) else ""),
+            None,
+        )
+    # Another Yosys build. Its cell packing is its own, so the table is held to
+    # the design on it and the run says what its counts came to.
+    if design_rows(recorded) != design_rows(fresh):
+        return (
+            f"{rel}: this Yosys maps a different set of cases than the table records; "
+            "compare `--list` against the table",
+            None,
+        )
+    moved = drift(recorded, fresh)
+    return None, (
+        f"{rel} was measured with {was}; this run is {now} and packs its own cells "
+        + (f"({moved})" if moved else "(every count came out the same)")
+        + ". Every case and configuration matches."
+    )
 
 
 def run_case(
@@ -813,6 +914,15 @@ def run_case(
     t0 = time.time()
     d = work / case.name
     d.mkdir(parents=True, exist_ok=True)
+    # The lookup-table images, under the bare names both front ends are given:
+    # Yosys reads them from its working directory and so does vvp, and both run
+    # in this one. A missing image is a Yosys error rather than an empty ROM.
+    for v in case.params.values():
+        if isinstance(v, Rom):
+            src = v.source(rtl_dir)
+            if not src.is_file():
+                return Result(case.name, False, f"no lookup-table image at {src}")
+            shutil.copyfile(src, d / f"{v.table}.hex")
     netlist, ports, bench = d / "netlist.v", d / "ports.json", d / "bench.sv"
     script = yosys_script(case, rtl_dir, netlist, ports)
     (d / "synth.ys").write_text(script)
@@ -820,6 +930,7 @@ def run_case(
         ["yosys", "-q", "-l", str(d / "synth.log"), "-s", str(d / "synth.ys")],
         capture_output=True,
         text=True,
+        cwd=str(d),
     )
     if y.returncode != 0:
         return Result(case.name, False, f"yosys failed:\n{y.stdout}{y.stderr}")
@@ -910,7 +1021,7 @@ def main() -> int:
 
     if args.list:
         for c in CASES:
-            cfg = ", ".join(f"{k}={v}" for k, v in c.params.items()) or "defaults"
+            cfg = ", ".join(f"{k}={v}" for k, v in param_values(c).items()) or "defaults"
             print(f"{c.name:20s} {c.top:22s} {cfg}")
         return 0
 
@@ -933,7 +1044,9 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     rtl_dir = Path(args.rtl_dir).resolve()
     modelled = modelled_cells(cells_sim)
+    tool = tool_banner()
     print(f"gatesim: {len(cases)} case(s), RTL from {rtl_dir}, cells from {cells_sim}")
+    print(f"gatesim: {tool}")
 
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
@@ -964,11 +1077,14 @@ def main() -> int:
     # The whole set was run, so its cell counts are the coverage table: hold the
     # page to them, and rewrite it on request.
     if args.only is None:
-        stale = sync_table(README, case_table({r.name: r.cells for r in results}), args.write_table)
+        fresh = table_block({r.name: r.cells for r in results}, tool)
+        stale, note = sync_table(README, fresh, args.write_table)
         if stale is not None:
             print(f"gatesim: {stale}")
             print("gatesim: FAILED")
             return 1
+        if note is not None:
+            print(f"gatesim: {note}")
         if args.write_table:
             print(f"gatesim: wrote the coverage table into {README.relative_to(REPO).as_posix()}")
     print("gatesim: OK")

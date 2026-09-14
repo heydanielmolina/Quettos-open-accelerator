@@ -18,10 +18,14 @@ a failing command rather than a misleading page. The `## Notes (hand-written)`
 section at the end of a report is the one part written by a person; it is
 carried forward unchanged.
 
-The README row that quotes the whole-core report is held to the same run: every
-figure it states is read back off the row and required to equal what Yosys just
-reported for the demo configuration, so the front page cannot drift away from
-the page it points at.
+The README row that quotes the whole-core report is held to the same rule the
+report is. The row names the Yosys build that packed it and states its figures
+in two clauses: the hard blocks, which any build infers from the same source,
+and the packing, which is that build's own. On the build it names, every figure
+has to equal what Yosys just reported for the demo configuration; on any other
+build the hard blocks still do, and the packing drift is printed instead. So the
+front page cannot drift away from the page it points at, and a reader on another
+Yosys can tell from the row which of its figures come back unchanged.
 
 Yosys's own output is passed through, minus the lines `is_noise` names: the
 `check` pass that `synth_xilinx` runs between `proc` and its first `opt_clean`
@@ -50,14 +54,37 @@ LOG_DIR = ROOT / "build" / "synth"
 SHARED = SYN_DIR / "report.ys"
 FRONT_PAGE = ROOT / "README.md"
 
-# The README row that quotes syn/reports/qcore_top.md, and the figures it states.
-# Each is read off the row and held to the demo configuration of the run.
-FRONT_PAGE_ROW = "| `qcore_top` on xc7 |"
-FRONT_PAGE_CELLS = ("DSP48E1", "RAMB36E1", "RAMB18E1", "RAM32M", "SRL16E")
-FRONT_PAGE_TOTALS = ("LUTs", "flops", "cells", "estimated LCs")
-FRONT_PAGE_FIGURE = re.compile(
-    r"(\d[\d,]*) (" + "|".join(FRONT_PAGE_CELLS + FRONT_PAGE_TOTALS) + r")\b"
+# Cell types whose count is an inference outcome, not an optimization detail: a
+# different Yosys build may pack LUTs differently, but it must infer the same
+# DSPs and memories from the same source. Both `--check` comparisons hold these
+# to an exact match even when the tool that wrote the report was a different
+# build -- a generated page through `design_facts`, the README row through
+# `FRONT_PAGE_INFERRED`.
+HARD_BLOCKS = (
+    "DSP48E1",
+    "RAMB36E1",
+    "RAMB18E1",
+    "RAM32M",
+    "RAM64M",
+    "RAM128X1D",
 )
+
+# The README row that quotes syn/reports/qcore_top.md, and the figures it states,
+# split by what another Yosys build may change. The hard blocks it lists are
+# inference outcomes, held exactly on any build. The rest is how one build packed
+# the fabric: an `SRL16E` is a shift register the mapper put in a LUT rather than
+# in flops, so that count and the flop count trade against each other, and the
+# LUT count, the cell total and the LC estimate are sums over the same choice.
+# Those are held figure for figure only on the build the row names.
+FRONT_PAGE_ROW = "| `qcore_top` on xc7 |"
+FRONT_PAGE_INFERRED = ("DSP48E1", "RAMB36E1", "RAMB18E1", "RAM32M")
+FRONT_PAGE_PACKED = ("SRL16E", "LUTs", "flops", "cells", "estimated LCs")
+FRONT_PAGE_FIGURE = re.compile(
+    r"(\d[\d,]*) (" + "|".join(FRONT_PAGE_INFERRED + FRONT_PAGE_PACKED) + r")\b"
+)
+# The build behind the packed figures, named on the row and nowhere else on the
+# front page, so there is one place for it to be right.
+FRONT_PAGE_BUILD = re.compile(r"Yosys (\d[\w.+-]*)")
 
 NOTES_HEADING = "## Notes (hand-written)"
 DEFAULT_NOTES = "What dominates the area of this block, in a sentence.\n"
@@ -509,46 +536,126 @@ def keep_notes(path: Path) -> str:
 def report_figures(cfg: Config) -> dict[str, int]:
     """The figures the README row quotes, as this run measured them."""
     table = dict(cfg.cells)
-    figures = {name: table.get(name, 0) for name in FRONT_PAGE_CELLS}
-    figures["LUTs"] = sum(v for k, v in cfg.cells if re.fullmatch(r"LUT\d", k))
-    figures["flops"] = sum(v for k, v in cfg.cells if re.fullmatch(r"FD\w+", k))
-    figures["cells"] = cfg.total_cells
-    figures["estimated LCs"] = cfg.est_lcs
-    return figures
+    computed = {
+        "LUTs": sum(v for k, v in cfg.cells if re.fullmatch(r"LUT\d", k)),
+        "flops": sum(v for k, v in cfg.cells if re.fullmatch(r"FD\w+", k)),
+        "cells": cfg.total_cells,
+        "estimated LCs": cfg.est_lcs,
+    }
+    return {
+        unit: computed[unit] if unit in computed else table.get(unit, 0)
+        for unit in FRONT_PAGE_INFERRED + FRONT_PAGE_PACKED
+    }
 
 
-def check_front_page(cfgs: list[Config]) -> list[str]:
+def build_matches(named: str, version: str) -> bool:
+    """Whether a Yosys version line is the build a page or a row names.
+
+    A row names a release, `0.65`; a version line carries the build behind it,
+    `Yosys 0.65 (git sha1 ...)`. The release has to be the whole first token, so
+    `0.6` does not stand for `0.65` and `0.65` does not stand for `0.65+12`.
+    """
+    return re.match(rf"Yosys {re.escape(named)}(?![\w.+-])", version) is not None
+
+
+def front_page_clauses(row: str) -> list[str]:
+    """The row's value column, split into its inferred and packed clauses."""
+    columns = [c.strip() for c in row.strip().strip("|").split("|")]
+    if len(columns) != 3:
+        raise ReportError(f"the synthesis row has {len(columns)} columns, expected three")
+    clauses = columns[1].split(";")
+    if len(clauses) != 2:
+        raise ReportError(
+            "the synthesis row has to state the inferred figures and the packed figures as "
+            f"two clauses either side of one `;`, not {len(clauses)}"
+        )
+    return clauses
+
+
+def check_front_page(cfgs: list[Config], version: str, quoted: str) -> tuple[list[str], list[str]]:
     """Hold the README row that quotes the whole-core report to the run behind it.
 
-    The row is the front page's copy of a generated table, which is the one
-    place a synthesis figure can be typed. Every figure on it is read back and
-    required to equal this run's demo configuration, and a figure the row stops
-    stating fails too, so the check cannot be shortened away.
+    The row is the front page's copy of a generated table, which is the one place
+    a synthesis figure can be typed, so it is held to the rule the page it quotes
+    is held to. It names the Yosys build that packed it and puts its figures in
+    two clauses either side of a `;`: `FRONT_PAGE_INFERRED`, which any build
+    reads out of the same source, then `FRONT_PAGE_PACKED`, which is that build's
+    own. On the named build every figure has to match; on another build the
+    inferred ones still do and the packing drift is returned to be printed. A
+    figure the row stops stating, or states on the wrong side of the `;`, fails
+    either way, so the split cannot be blurred and the check cannot be shortened
+    away.
+
+    Returns the failures and the drift lines.
     """
     demo = next((c for c in cfgs if c.label == "demo"), None)
     if demo is None:
-        return []
+        return [], []
     rows = [ln for ln in FRONT_PAGE.read_text().splitlines() if ln.startswith(FRONT_PAGE_ROW)]
     if len(rows) != 1:
-        return [f"README.md carries {len(rows)} rows starting `{FRONT_PAGE_ROW}`, expected one"]
-    said = {unit: int(n.replace(",", "")) for n, unit in FRONT_PAGE_FIGURE.findall(rows[0])}
+        return [f"README.md carries {len(rows)} rows starting `{FRONT_PAGE_ROW}`, expected one"], []
+    try:
+        clauses = front_page_clauses(rows[0])
+    except ReportError as exc:
+        return [f"README.md: {exc}"], []
+    build = FRONT_PAGE_BUILD.search(clauses[1])
+    if build is None:
+        return ["README.md's synthesis row does not name the Yosys build that packed it"], []
+    named = build.group(1)
+
+    said: dict[str, int] = {}
+    stated_as_inferred: dict[str, bool] = {}
+    for n, clause in enumerate(clauses):
+        for number, unit in FRONT_PAGE_FIGURE.findall(clause):
+            said[unit] = int(number.replace(",", ""))
+            stated_as_inferred[unit] = n == 0
     figures = report_figures(demo)
-    bad = [
-        f"README.md's synthesis row says {said[unit]:,} {unit}, the run says {value:,}"
-        for unit, value in figures.items()
-        if unit in said and said[unit] != value
-    ]
+
+    bad: list[str] = []
     absent = [unit for unit in figures if unit not in said]
     if absent:
         bad.append("README.md's synthesis row states no " + ", ".join(absent))
-    return bad
+    for unit, inferred in stated_as_inferred.items():
+        if inferred != (unit in FRONT_PAGE_INFERRED):
+            bad.append(
+                f"README.md's synthesis row states {unit} as "
+                + (
+                    "an inference outcome; it is this build's packing"
+                    if inferred
+                    else "this build's packing; it is an inference outcome"
+                )
+            )
+    if quoted and not build_matches(named, quoted):
+        bad.append(
+            f"README.md's synthesis row names Yosys {named}, and the page it quotes, "
+            f"syn/reports/qcore_top.md, carries `{quoted}`"
+        )
+
+    same_build = build_matches(named, version)
+    drift: list[str] = []
+    for unit, value in figures.items():
+        if unit not in said or said[unit] == value:
+            continue
+        line = f"README.md's synthesis row says {said[unit]:,} {unit}, the run says {value:,}"
+        if same_build or unit in FRONT_PAGE_INFERRED:
+            bad.append(line)
+        else:
+            drift.append(line)
+    if drift:
+        drift.insert(
+            0,
+            f"README.md's synthesis row is packed by Yosys {named}; "
+            f"{version.split(' (')[0]} packs the same design differently, and the row's "
+            "inference outcomes are what it is held to here:",
+        )
+    return bad, drift
 
 
 # ------------------------------------------------------------------------ main
 
 
-def build(script: Path) -> tuple[str, str, list[Config]]:
-    """Run one script and return (report file name, report text, its configurations)."""
+def build(script: Path) -> tuple[str, str, list[Config], str]:
+    """Run one script; return its report name and text, its configurations and its Yosys."""
     log = LOG_DIR / f"{script.stem}.log"
     print(f"synth: {script.relative_to(ROOT)} -> {log.relative_to(ROOT)}")
     run_script(script, log)
@@ -563,21 +670,7 @@ def build(script: Path) -> tuple[str, str, list[Config]]:
     name = f"{cfgs[0].module}.md"
     page = render(script, log, version, cfgs, keep_notes(REPORT_DIR / name))
     check_facts_cover_params(name, cfgs, page)
-    return name, page, cfgs
-
-
-# Cell types whose count is an inference outcome, not an optimization detail: a
-# different Yosys build may pack LUTs differently, but it must infer the same
-# DSPs and memories from the same source. `--check` holds these to an exact
-# match even when the tool that wrote the report was a different build.
-HARD_BLOCKS = (
-    "DSP48E1",
-    "RAMB36E1",
-    "RAMB18E1",
-    "RAM32M",
-    "RAM64M",
-    "RAM128X1D",
-)
+    return name, page, cfgs, version
 
 
 def tool_banner() -> str:
@@ -653,6 +746,18 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    # The row's inferred half has to be a subset of what the page comparison
+    # holds exactly, or the front page would promise a figure back on any build
+    # that nothing checks on any build.
+    stray = [name for name in FRONT_PAGE_INFERRED if name not in HARD_BLOCKS]
+    if stray:
+        sys.stderr.write(
+            "synth-report: the README row holds "
+            + ", ".join(stray)
+            + " exactly on any Yosys build, and the report comparison does not\n"
+        )
+        return 1
+
     scripts = (
         [Path(s) if Path(s).is_absolute() else ROOT / s for s in args.script]
         if args.script
@@ -666,11 +771,12 @@ def main() -> int:
     built: dict[str, str] = {}
     source: dict[str, Path] = {}
     configs: dict[str, list[Config]] = {}
+    versions: dict[str, str] = {}
     print(f"synth-report: {tool_banner()}")
     try:
         for script in scripts:
             try:
-                name, text, cfgs = build(script)
+                name, text, cfgs, version = build(script)
             except ReportError as exc:
                 raise ReportError(f"{script.name}: {exc}") from exc
             if name in built:
@@ -678,13 +784,23 @@ def main() -> int:
                     f"{script.name} and {source[name].name} both write syn/reports/{name}"
                 )
             built[name], source[name], configs[name] = text, script, cfgs
+            versions[name] = version
     except ReportError as exc:
         sys.stderr.write(f"synth-report: {exc}\n")
         return 1
     elapsed = time.monotonic() - started
 
-    # The whole-core report is the one the front page quotes.
-    front = check_front_page(configs.get("qcore_top.md", []))
+    # The whole-core report is the one the front page quotes. `--check` holds the
+    # row to the build recorded on the page as it stands; a run that rewrites the
+    # page holds it to the build that is about to be written there instead.
+    top = "qcore_top.md"
+    recorded_top = REPORT_DIR / top
+    quoted = versions.get(top, "")
+    if args.check and recorded_top.exists():
+        quoted = recorded_tool(recorded_top.read_text())
+    front, drift = check_front_page(configs.get(top, []), versions.get(top, ""), quoted)
+    for line in drift:
+        print(f"synth-report: {line}")
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     if not args.check:

@@ -23,6 +23,12 @@
 # leaves at zero.  Every stage carries its wall clock, and the report goes to
 # `build/clean-clone/<model>.json` in the repository the script was run from.
 #
+# A run that stops names what stopped it: which stage of this script, which
+# stage of the demo under it, the seconds it had run for and the last lines it
+# printed.  The report is written either way, and the demo's whole output is
+# kept beside it as `build/clean-clone/<model>.log`, so the clone can go and
+# the evidence stays.
+#
 #   scripts/clean-clone.sh                 SmolLM2-135M-Instruct, the quick start's first line
 #   scripts/clean-clone.sh --model qwen    its second line
 #   scripts/clean-clone.sh --worktree      the tree as it stands, not the last commit
@@ -95,6 +101,18 @@ if [ -n "$MISSING" ]; then
   exit 2
 fi
 
+json_escape() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+
+# What stopped the run, filled in by `stage` and read by the report: the stage
+# of this script that did not finish, and the status it exited with.  The
+# seconds it had run for are on the stage table, which is printed either way.
+FAILED_STAGE=
+FAILED_RC=0
+VERDICT=OK
+WORK=
+LOG=
+STAGES=
+
 first_line() { "$@" 2>/dev/null | sed -n 1p || true; }
 V_GIT=$(first_line git --version)
 V_UV=$(first_line uv --version)
@@ -110,7 +128,20 @@ CHANGED=0
 UNTRACKED=0
 if [ -d "$SOURCE" ]; then
   SOURCE=$(cd "$SOURCE" && pwd -P)
-  [ -n "$REF" ] || REF=$(git -C "$SOURCE" rev-parse HEAD)
+  if ! git -C "$SOURCE" rev-parse --git-dir > /dev/null 2>&1; then
+    echo "clean-clone: $SOURCE is not a git repository, so it has no committed tree to clone" >&2
+    echo "clean-clone: --source names the repository to take the tree from" >&2
+    exit 2
+  fi
+  # Resolve what is to be checked before anything is built on it, so a revision
+  # the source does not carry is said here rather than by git several steps on.
+  WANT=${REF:-HEAD}
+  REF=$(git -C "$SOURCE" rev-parse --verify --quiet "$WANT^{commit}" || true)
+  if [ -z "$REF" ]; then
+    echo "clean-clone: $SOURCE has no revision $WANT to check" >&2
+    echo "clean-clone: --ref takes a commit, branch or tag of the source (git -C $SOURCE log --oneline -5 lists a few)" >&2
+    exit 2
+  fi
   SUBJECT=$(git -C "$SOURCE" log -1 --format=%s "$REF")
   UNTRACKED=$(git -C "$SOURCE" status --porcelain -uall | grep -c '^??' || true)
   CHANGED=$(( $(git -C "$SOURCE" status --porcelain -uall | wc -l) - UNTRACKED ))
@@ -167,12 +198,23 @@ stage() {
   TIMEFORMAT=%R
   secs=$( { time "$@" 1>&3 2>&4; } 2>&1 ) || rc=$?
   printf '{"name": "%s", "seconds": %s, "note": "%s"}\n' "$name" "$secs" "$note" >> "$STAGES"
+  if [ "$rc" != 0 ]; then FAILED_STAGE=$name; FAILED_RC=$rc; fi
   return $rc
 }
 
+# A CI checkout carries the commit under test at a detached HEAD, with a
+# remote-tracking or a pull-request ref on it and no branch.  A local clone
+# copies the whole object database, so the commit comes across either way; the
+# check before `checkout` is there so that a source that somehow does not carry
+# it is named here, rather than leaving git to say that a reference is not a
+# tree.
 clone() {
   git clone --quiet --no-checkout "$SOURCE" "$CLONE"
   if [ -n "$REF" ]; then
+    if ! git -C "$CLONE" cat-file -e "$REF^{commit}" 2> /dev/null; then
+      echo "clean-clone: the clone of $SOURCE carries no commit $REF" >&2
+      return 1
+    fi
     git -C "$CLONE" -c advice.detachedHead=false checkout --quiet --detach "$REF"
   else
     git -C "$CLONE" checkout --quiet
@@ -215,88 +257,147 @@ run_demo() {
   ) 2>&1 | tee "$LOG"
 }
 
+# What the demo's stages left behind, and what the run printed while it was in
+# one.  The demo prints `=== <stage>: <note>` as it enters a stage, so the last
+# such line in its log names the stage that did not finish and everything after
+# it is what that stage had to say.
+DEMO_STAGES="$CLONE/build/demo/$SLUG/stages.jsonl"
+IDS=
+TEXT=
+NAME=
+CKPT=0
+TOTAL_S=0.00
+DEMO_STAGE=
+
+inner() {
+  [ ! -f "$STAGES" ] || sed -n 1p "$STAGES"
+  [ ! -f "$DEMO_STAGES" ] || cat "$DEMO_STAGES"
+}
+
+demo_stage() {
+  [ -f "$LOG" ] || return 0
+  sed -n 's/^=== \([A-Za-z0-9_-]*\): .*/\1/p' "$LOG" | sed -n '$p'
+}
+
+demo_tail() {
+  [ -f "$LOG" ] || return 0
+  awk '/^=== [A-Za-z0-9_-]+: /{n = NR} {l[NR] = $0}
+       END {for (i = (n ? n : 1); i <= NR; i++) print l[i]}' "$LOG" | tail -n "${1:-20}"
+}
+
+# The report, written whatever happened, and the demo's whole output kept beside
+# it: the clone is about to go and the evidence has to outlive it.
+write_report() {
+  if [ -f "$LOG" ]; then
+    IDS=$(sed -n 's/^ *ids  *\(\[.*\]\)$/\1/p' "$LOG" | sed -n 1p || true)
+    TEXT=$(sed -n "s/^ *text  *'\(.*\)'$/\1/p" "$LOG" | sed -n 1p || true)
+    DEMO_STAGE=$(demo_stage)
+  fi
+  NAME=$(ls -1 "$CLONE/build/models" 2> /dev/null | sed -n 1p || true)
+  if [ -n "$NAME" ] && [ -f "$CLONE/build/models/$NAME/model.safetensors" ]; then
+    CKPT=$(wc -c < "$CLONE/build/models/$NAME/model.safetensors" | tr -d ' ')
+  fi
+  TOTAL_S=$(sed -n 's/.*"seconds": \([0-9.]*\).*/\1/p' "$STAGES" 2> /dev/null |
+    awk '{t += $1} END {printf "%.2f", t}')
+  [ -n "$TOTAL_S" ] || TOTAL_S=0.00
+
+  mkdir -p "$(dirname "$REPORT")"
+  [ ! -f "$LOG" ] || cp "$LOG" "${REPORT%.json}.log"
+  {
+    printf '{\n'
+    printf '  "model": "%s",\n  "source": "%s",\n  "tree": "%s",\n  "ref": "%s",\n  "subject": "%s",\n' \
+      "$MODEL" "$SOURCE" "$TREE" "$REF" "$(json_escape "$SUBJECT")"
+    printf '  "tracked_changes": %s,\n  "untracked_files": %s,\n' "$CHANGED" "$UNTRACKED"
+    printf '  "checkpoint_bytes": %s,\n' "$CKPT"
+    printf '  "tools": {"git": "%s", "uv": "%s", "verilator": "%s", "make": "%s", "cxx": "%s"},\n' \
+      "$V_GIT" "$V_UV" "$V_VERILATOR" "$V_MAKE" "$V_CXX"
+    printf '  "stages": [\n'
+    inner | awk '{ s = $0; sub(/^\{/, "", s); sub(/\}$/, "", s);
+                   printf "%s    {%s}", (NR > 1 ? ",\n" : ""), s } END { printf "\n" }'
+    printf '  ],\n'
+    printf '  "seconds_total": %s,\n' "$TOTAL_S"
+    printf '  "stopped_in": "%s",\n  "demo_stopped_in": "%s",\n' "$FAILED_STAGE" "$DEMO_STAGE"
+    printf '  "ids": %s,\n' "${IDS:-[]}"
+    printf '  "text": "%s",\n' "$(json_escape "$TEXT")"
+    printf '  "verdict": "%s"\n}\n' "$(json_escape "$VERDICT")"
+  } > "$REPORT"
+}
+
+print_stages() {
+  printf '\n  wall clock, on %s with nothing cached\n' "$WHAT"
+  inner | sed -n 's/^{"name": "\([^"]*\)", "seconds": \([0-9.]*\), "note": "\(.*\)"}$/\1\t\2\t\3/p' |
+    while IFS="$(printf '\t')" read -r n s note; do printf '    %-12s %8.2f s   %s\n' "$n" "$s" "$note"; done
+  printf '    %s\n' '----------------------------'
+  printf '    %-12s %8.2f s   %s\n' 'end to end' "$TOTAL_S" "$FROM to text on qcore_top"
+}
+
+# Every way out of the run goes through here, so there is always a report and
+# the last line always says which stage stopped it and how far it had got.
+finish() {
+  VERDICT=$1
+  write_report
+  print_stages
+  if [ "$VERDICT" = OK ]; then
+    printf '\nclean-clone: OK -- %s on %s, %s s from %s to %s on qcore_top; report %s\n' \
+      "${NAME:-$MODEL}" "$WHAT" "$TOTAL_S" "$FROM" "'$TEXT'" "${REPORT#"$REPO"/}"
+    exit 0
+  fi
+  if [ -n "$DEMO_STAGE" ] && [ "$FAILED_STAGE" = demo ]; then
+    printf '\nclean-clone: the demo stopped in its %s stage; its last lines were\n\n' "$DEMO_STAGE" >&2
+    demo_tail 20 | sed 's/^/    /' >&2
+    printf '\nclean-clone: the whole run is in %s\n' "${REPORT%.json}.log" >&2
+  fi
+  printf '\nclean-clone: %s -- on %s; the run is in %s\n' "$VERDICT" "$WHAT" "$REPORT" >&2
+  exit "$2"
+}
+
+# Room for a first run.  Nothing here is cached, so the clone pays for the
+# checkpoint, the quantized weights, the compiled image, a uv cache, a managed
+# Python and a Verilator object directory all at once: 823 MiB for the small
+# model on the machine `docs/PERFORMANCE.md` names, and a larger checkpoint
+# more.  The floor is 2 GiB, and the free space is on the opening line either
+# way -- a build that stops halfway through for want of space says only that a
+# compiler could not write a file.
+NEED_MB=2048
+FREE_MB=$(df -Pk "$WORK" | awk 'NR == 2 {printf "%d", $4 / 1024}')
+
 echo "clean-clone: $MODEL, the quick start on $WHAT"
+echo "clean-clone: the clone goes in $WORK, ${FREE_MB:-unknown} MB free"
+if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
+  echo "clean-clone: a first run needs about $NEED_MB MB there and has $FREE_MB MB" >&2
+  echo "clean-clone: TMPDIR chooses where the clone goes, and --dir names the directory outright" >&2
+  finish "FAILED: $WORK has $FREE_MB MB free, short of the $NEED_MB MB a first run needs" 2
+fi
 if [ "$TREE" = working ]; then
   echo "clean-clone: the $CHANGED tracked file(s) changed since $SHORT are in it, and the $UNTRACKED untracked file(s) are not, as a commit would not carry them either"
-  stage export "the tracked tree of $(basename "$SOURCE") at its content on disk" export_worktree
+  stage export "the tracked tree of $(basename "$SOURCE") at its content on disk" export_worktree ||
+    finish "FAILED: the tree as it stands could not be exported (exit $FAILED_RC)" "$FAILED_RC"
 else
   if [ "$CHANGED" != 0 ] || [ "$UNTRACKED" != 0 ]; then
     echo "clean-clone: the source's $CHANGED tracked change(s) and $UNTRACKED untracked file(s) are outside what this run checks; --worktree checks the tree as it stands"
   fi
-  stage clone "git clone $(basename "$SOURCE") at $SHORT" clone
+  stage clone "git clone $(basename "$SOURCE") at $SHORT" clone ||
+    finish "FAILED: $SHORT could not be cloned out of $SOURCE (exit $FAILED_RC)" "$FAILED_RC"
 fi
 
 # Nothing that tree did not bring: no build outputs, no environment, and, where
 # the tree came from a clone, a working tree that matches the commit.
 for p in build .venv; do
   if [ -e "$CLONE/$p" ]; then
-    echo "clean-clone: the clone carries $p, so it is not clean" >&2
-    exit 1
+    finish "FAILED: the clone carries $p, so it is not clean" 1
   fi
 done
 if [ "$TREE" = committed ] && [ -n "$(git -C "$CLONE" status --porcelain)" ]; then
-  echo "clean-clone: the clone's working tree does not match $REF" >&2
-  exit 1
+  git -C "$CLONE" --no-pager status --short >&2
+  finish "FAILED: the clone's working tree does not match $REF" 1
 fi
 
 rc=0
 stage demo "make demo MODEL=$MODEL MAX_NEW=$MAX_NEW, fresh uv cache and managed Python" run_demo || rc=$?
 
-VERDICT=OK
 if [ "$rc" != 0 ]; then
-  VERDICT="FAILED: make demo exited $rc"
+  finish "FAILED: make demo exited $rc" "$rc"
 elif ! grep -q '^demo: OK' "$LOG"; then
-  VERDICT="FAILED: the demo printed no verdict of its own"
+  finish "FAILED: the demo printed no verdict of its own" 1
 fi
-
-json_escape() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
-
-IDS=$(sed -n 's/^ *ids  *\(\[.*\]\)$/\1/p' "$LOG" | sed -n 1p || true)
-TEXT=$(sed -n "s/^ *text  *'\(.*\)'$/\1/p" "$LOG" | sed -n 1p || true)
-NAME=$(ls -1 "$CLONE/build/models" 2>/dev/null | sed -n 1p || true)
-CKPT=0
-if [ -n "$NAME" ] && [ -f "$CLONE/build/models/$NAME/model.safetensors" ]; then
-  CKPT=$(wc -c < "$CLONE/build/models/$NAME/model.safetensors" | tr -d ' ')
-fi
-
-# The demo times its own stages; this run puts around them whichever of the two
-# filled the directory, which is the first line of $STAGES.
-DEMO_STAGES="$CLONE/build/demo/$SLUG/stages.jsonl"
-inner() {
-  sed -n 1p "$STAGES"
-  if [ -f "$DEMO_STAGES" ]; then cat "$DEMO_STAGES"; fi
-}
-TOTAL_S=$(sed -n 's/.*"seconds": \([0-9.]*\).*/\1/p' "$STAGES" | awk '{t += $1} END {printf "%.2f", t}')
-
-printf '\n  wall clock, on %s with nothing cached\n' "$WHAT"
-inner | sed -n 's/^{"name": "\([^"]*\)", "seconds": \([0-9.]*\), "note": "\(.*\)"}$/\1\t\2\t\3/p' |
-  while IFS="$(printf '\t')" read -r n s note; do printf '    %-12s %8.2f s   %s\n' "$n" "$s" "$note"; done
-printf '    %s\n' '----------------------------'
-printf '    %-12s %8.2f s   %s\n' 'end to end' "$TOTAL_S" "$FROM to text on qcore_top"
-
-mkdir -p "$(dirname "$REPORT")"
-{
-  printf '{\n'
-  printf '  "model": "%s",\n  "source": "%s",\n  "tree": "%s",\n  "ref": "%s",\n  "subject": "%s",\n' \
-    "$MODEL" "$SOURCE" "$TREE" "$REF" "$(json_escape "$SUBJECT")"
-  printf '  "tracked_changes": %s,\n  "untracked_files": %s,\n' "$CHANGED" "$UNTRACKED"
-  printf '  "checkpoint_bytes": %s,\n' "$CKPT"
-  printf '  "tools": {"git": "%s", "uv": "%s", "verilator": "%s", "make": "%s", "cxx": "%s"},\n' \
-    "$V_GIT" "$V_UV" "$V_VERILATOR" "$V_MAKE" "$V_CXX"
-  printf '  "stages": [\n'
-  inner | awk '{ s = $0; sub(/^\{/, "", s); sub(/\}$/, "", s);
-                 printf "%s    {%s}", (NR > 1 ? ",\n" : ""), s } END { printf "\n" }'
-  printf '  ],\n'
-  printf '  "seconds_total": %s,\n' "$TOTAL_S"
-  printf '  "ids": %s,\n' "${IDS:-[]}"
-  printf '  "text": "%s",\n' "$(json_escape "$TEXT")"
-  printf '  "verdict": "%s"\n}\n' "$(json_escape "$VERDICT")"
-} > "$REPORT"
-
-if [ "$VERDICT" != OK ]; then
-  printf '\nclean-clone: %s -- on %s; the run is in %s\n' "$VERDICT" "$WHAT" "$REPORT" >&2
-  exit "${rc:-1}"
-fi
-
-printf '\nclean-clone: OK -- %s on %s, %s s from %s to %s on qcore_top; report %s\n' \
-  "${NAME:-$MODEL}" "$WHAT" "$TOTAL_S" "$FROM" "'$TEXT'" "${REPORT#"$REPO"/}"
+finish OK 0

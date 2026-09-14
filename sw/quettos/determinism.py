@@ -172,7 +172,7 @@ def harness_binary(cfg: Config, setting: Setting, *, quiet: bool = True) -> Path
     out = subprocess.DEVNULL if quiet else None
     subprocess.run(["make", "-C", str(HARNESS), "build", *args], cwd=REPO, check=True, stdout=out)
     where = subprocess.run(
-        ["make", "-s", "-C", str(HARNESS), "where", *args],
+        ["make", "-s", "--no-print-directory", "-C", str(HARNESS), "where", *args],
         cwd=REPO,
         check=True,
         capture_output=True,

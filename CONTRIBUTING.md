@@ -194,7 +194,13 @@ message.
   `ltp` path. `make synth` regenerates the page and fails when the run no
   longer reproduces it: byte for byte on the Yosys build the report records,
   and on any other build against its parameters and its hard-block inventory,
-  since LUT packing and path length belong to the build. One section of a
+  since LUT packing and path length belong to the build. The one synthesis
+  figure a person types is the `README.md` row that quotes the whole-core page,
+  and it carries that rule on its face: it names the Yosys build that packed it,
+  and it states the hard blocks any build infers from the source ahead of a `;`
+  and that build's packing after it. `make synth` holds the whole row on the
+  build it names and the hard blocks on any other, and fails on a figure the row
+  drops or puts on the wrong side of the `;`. One section of a
   report is a person's, `## Notes (hand-written)` at the end, which the
   generator carries forward unchanged; whoever changes a block owns keeping its
   note true.

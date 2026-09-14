@@ -262,10 +262,30 @@ jobs:
         with:
           version: ${{ env.OSS_CAD_SUITE_VERSION }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      # This job pays for the environment, the checkpoint and the harness build
+      # on every run, so what the runner brought to them belongs beside the
+      # result: the space the clone has, the cores the build gets and the
+      # versions the quick start found.
+      - name: What this runner brings to a cold run
+        run: |
+          df -h / "${TMPDIR:-/tmp}"
+          echo "cores: $(nproc)"
+          free -h || true
+          git --version && uv --version && verilator --version && c++ --version | head -1
       - name: Clone the commit under test and run the quick start in the clone
         run: make clean-clone
+      # The clone is removed when the run ends, so the demo's own output is
+      # copied out beside the report: whichever stage stopped the run, what it
+      # printed is still here.
       - name: The stage wall clocks and the verdict of that run
         if: always()
         run: |
-          cat build/clean-clone/smollm2.json 2>/dev/null ||
+          if [ -f build/clean-clone/smollm2.json ]; then
+            cat build/clean-clone/smollm2.json
+          else
             echo "no report: the run stopped before the clone was in place"
+          fi
+          if [ -f build/clean-clone/smollm2.log ]; then
+            echo "--- the last 200 lines the demo printed"
+            tail -n 200 build/clean-clone/smollm2.log
+          fi

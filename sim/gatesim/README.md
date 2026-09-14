@@ -7,7 +7,7 @@ output on every cycle. It answers a question the three-parser lint of
 *accept* the RTL, and this proves that Yosys and Icarus *read it the same way*.
 
 The failure it exists to catch is a construct the two front ends parse
-differently. `~25'(WB - 1)` is one: Yosys 0.65 binds the complement to the size
+differently. `~25'(WB - 1)` is one: Yosys binds the complement to the size
 literal and builds the mask `WB - 1`, where Verilator and Icarus build
 `~(WB - 1)`. Both tools accept the line, every simulation passes, and the
 bitstream computes something else.
@@ -22,8 +22,10 @@ For each entry of `CASES` in `gatesim.py`:
 2. `gatesim.py` generates one bench from the port list
    (`build/gatesim/<case>/bench.sv`) holding both the source module and the
    netlist, wired to the same input registers.
-3. Icarus compiles the bench with the RTL sources, the netlist and Yosys's own
-   Xilinx cell models (`$(yosys-config --datdir)/xilinx/cells_sim.v`). The
+3. Icarus compiles the bench with the RTL sources, the netlist and the Xilinx
+   cell models of the Yosys that wrote it -- `xilinx/cells_sim.v` under the
+   `yosys-config` beside that binary, or under the `share/yosys` beside it, so
+   one build's netlist is always read against that build's own models. The
    source side is therefore read by the Icarus front end and the netlist side by
    the Yosys one.
 4. The bench drives reset, then a short directed sequence chosen for the block,
@@ -52,7 +54,7 @@ stop meaning anything:
   the source's are unwritten -- so it is counted and skipped. Past a tenth of the
   window the case fails.
 
-The source side is compiled with `-DSYNTHESIS`, which Yosys 0.65 also defines,
+The source side is compiled with `-DSYNTHESIS`, which Yosys also defines,
 so both front ends read exactly the same text. What that leaves out is the
 simulation-only protocol assertions, which the random stimulus violates by
 design.
@@ -62,10 +64,20 @@ design.
 Nineteen configurations of fifteen blocks. `rtl/` holds eighteen files: the
 package `qcore_pkg.sv` and seventeen modules, fifteen of which are in the table
 below. The run writes that table: every cell count on it is one Yosys reported
-for the case beside it, and a full run fails when the page no longer carries the
-counts the run just produced. `gatesim.py --write-table` rewrites it, and
-`gatesim.py --list` prints the cases with the parameters each is elaborated
-with, without synthesizing anything.
+for the case beside it, and the `Tool` line under it is the build that reported
+them. `gatesim.py --write-table` rewrites both, and `gatesim.py --list` prints
+the cases with the parameters each is elaborated with, without synthesizing
+anything.
+
+A cell count is a figure of the design and of the build that packed it, so the
+table is checked against the `Tool` line. On the build the table records, a full
+run holds the page to every figure on it and fails on any difference, naming the
+counts that moved. On another build -- a newer Yosys, or the same release
+compiled for another host -- the run holds the page to the cases and their
+configurations, which are the design, and reports what that build's counts came
+to. Either way the equivalence itself is checked in full: the cases, the
+mismatch comparison and the three conditions above are the same on every
+toolchain, and the cell counts are what the page publishes about them.
 
 <!-- gatesim:cases -->
 
@@ -88,17 +100,29 @@ with, without synthesizing anything.
 | `lut_rom_rsqrt` | `qcore_lut_rom` | `ENTRIES=512`, `rtl/gen/rsqrt.hex` | 730 |
 | `lut_interp` | `qcore_lut_interp` | defaults | 99 |
 | `vpu_lane` | `qcore_vpu_lane` | defaults | 1734 |
-| `vpu_scalar` | `qcore_vpu_scalar` | `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 2765 |
-| `vpu_top_tiny` | `qcore_vpu_top` | `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048, VPU_FIFO_BEATS=16, MAX_BURST=64`, `rtl/gen/sigmoid.hex`, `rtl/gen/exp2.hex`, `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 24867 |
+| `vpu_scalar` | `qcore_vpu_scalar` | `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 2721 |
+| `vpu_top_tiny` | `qcore_vpu_top` | `WB=16, B_MAX=2, VL=2, VSRAM_WORDS=2048, VPU_FIFO_BEATS=16, MAX_BURST=64`, `rtl/gen/sigmoid.hex`, `rtl/gen/exp2.hex`, `rtl/gen/rsqrt.hex`, `rtl/gen/recip.hex` | 25261 |
+
+Tool: `Yosys 0.65 (git sha1 aec814bdf3071f7e0fd0fbe43f7f711e99d01e24, clang++ 21.0.0 -fPIC -O3)`
 
 <!-- /gatesim:cases -->
 
 A lookup table reaches the netlist as constants, so the image is part of the
 configuration and each of the four is compared: `exp2` through `lut_rom_exp2`,
 `rsqrt` through `lut_rom_rsqrt`, and `recip` and `sigmoid` through the units
-that instantiate them, `vpu_scalar` and `vpu_top_tiny`. Yosys reads the image
-through `chparam -set ROM_FILE`, Icarus through the same path on the source
-instance, so a table the two front ends load differently is a mismatch.
+that instantiate them, `vpu_scalar` and `vpu_top_tiny`. The run stages the
+images it needs under `build/gatesim/<case>/` and both front ends read them
+from there: Yosys through `chparam -set ROM_FILE`, Icarus through the same name
+on the source instance, so a table the two load differently is a mismatch and a
+name neither can find is an error rather than an empty ROM.
+
+The parameter carries the bare file name for a reason worth stating. Yosys
+names a parameterized submodule `$paramod$<hash of its parameters>`, and a
+module name is an input to how the design is mapped, so a directory in that
+value would put the directory the repository happens to sit in into the cell
+count: the same tree checked out twice would report two different figures, and
+the table would only ever reproduce in one of them. The bare name keeps the
+count a property of the design.
 
 ## What is not covered, and why
 
