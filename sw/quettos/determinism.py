@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -88,16 +89,44 @@ class Setting:
 #: every measured run is taken at (``docs/PERFORMANCE.md``).
 BASELINE = Setting("lat 32")
 
+
 #: Timing: when the core sees its weights, and how Verilator partitions an
 #: ``eval``. `--lat 200` is past the memory model's 64-beat in-flight window, so
 #: the port is bandwidth-bound rather than saturated, and `--bw-div 2` halves the
 #: bandwidth at the default latency.
-TIMING: tuple[Setting, ...] = (
-    Setting("lat 1", lat=1),
-    Setting("lat 200", lat=200),
-    Setting("bw-div 2", bw_div=2),
-    Setting("threads 4", threads=4),
-)
+def max_threads() -> int:
+    """How many simulation threads this machine can actually run.
+
+    Verilator refuses to run a model built for more threads than its runtime
+    context has, so a build for four threads cannot execute on a two-core
+    runner.  The property under test is that threading does not move a value,
+    and two threads test it as well as four do.
+    """
+    return min(4, os.cpu_count() or 1)
+
+
+def timing_settings(threads: int | None = None) -> tuple[Setting, ...]:
+    """The timing sweep, with the threaded run sized to this machine.
+
+    A machine that can only run one thread has nothing to compare a threaded
+    run against, so the threaded setting is left out rather than run at one
+    thread and reported as though it had been exercised.
+    """
+    n = max_threads() if threads is None else threads
+    sweep = [
+        Setting("lat 1", lat=1),
+        Setting("lat 200", lat=200),
+        Setting("bw-div 2", bw_div=2),
+    ]
+    if n > 1:
+        sweep.append(Setting(f"threads {n}", threads=n))
+    return tuple(sweep)
+
+
+#: The timing sweep on this machine.  ``timing_settings`` sizes the threaded
+#: run to the cores available, so the same sweep runs on a laptop and on a
+#: two-core CI runner.
+TIMING: tuple[Setting, ...] = timing_settings()
 
 #: The record fields that name storage the RTL holds rather than a value the
 #: program produced.  A run from an undefined-value start finds whatever the
@@ -535,10 +564,16 @@ def check(
 
 
 def check_timing(
-    image_dir: Path | str, cfg: Config, *, settings: Sequence[Setting] = TIMING, **kw: Any
+    image_dir: Path | str, cfg: Config, *, settings: Sequence[Setting] | None = None, **kw: Any
 ) -> Report:
-    """Latency 1 / 32 / 200, half bandwidth, and one against four simulation threads."""
-    return check(image_dir, cfg, settings, name="timing", **kw)
+    """Latency 1 / 32 / 200, half bandwidth, and one against several simulation threads.
+
+    The threaded run is sized to the machine by :func:`timing_settings`, and is
+    left out where only one thread is available.
+    """
+    return check(
+        image_dir, cfg, timing_settings() if settings is None else settings, name="timing", **kw
+    )
 
 
 def check_x_initial(

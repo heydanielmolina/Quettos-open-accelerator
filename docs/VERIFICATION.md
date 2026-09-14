@@ -279,11 +279,15 @@ sequences run from 36 to 520 tokens.
    descriptor, the field and the first element it is in.
 
    - **Timing.** `--lat` 1, 32 and 200, one returned beat every two cycles, and
-     one simulation thread against four. `--lat 200` is past the memory model's
-     64-beat in-flight window, so the weight port is bandwidth-bound rather
-     than saturated and the cycle count moves by more than a factor of three
-     across the set while no value moves at all; four threads take the same
-     cycles as one. Layer 4 holds its own records to the first four settings.
+     one simulation thread against several. `--lat 200` is past the memory
+     model's 64-beat in-flight window, so the weight port is bandwidth-bound
+     rather than saturated and the cycle count moves by more than a factor of
+     three across the set while no value moves at all; the threaded run takes
+     the same cycles as one thread. Verilator refuses a model built for more
+     threads than its runtime context has, so the threaded run takes the cores
+     the machine offers, up to four, and is left out where there is only one
+     (`determinism.timing_settings`). Layer 4 holds its own records to the
+     first four settings.
    - **Port width.** One model compiled at `WB=64` and at `WB=128` -- separate
      compiles of the same weights to the same context, with a different tiling
      and a zero-padded last tile -- generates the same ids, dumps the same int32

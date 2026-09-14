@@ -1,0 +1,33 @@
+Recorded 2026-09-14 00:41 UTC on macOS 25.5.0 (arm64), Homebrew tools.
+$ ./run.sh
+=== tool versions ===
+Yosys 0.65 (git sha1 aec814bdf3071f7e0fd0fbe43f7f711e99d01e24, clang++ 21.0.0 -fPIC -O3)
+Icarus Verilog version 13.0 (stable) (v13_0)
+Verilator 5.048 2026-04-26 rev vUNKNOWN-built20260426
+
+=== yosys: synthesized netlist ===
+$ yosys -p "read_verilog -sv cast_bug.sv; hierarchy -top dut; proc; opt -full; clean; write_verilog -noattr"
+  assign m = { 26'h0000000, a[5:0] };
+  assign y = 32'd3;
+
+=== yosys: its own parse tree (read_verilog -dump_ast1) ===
+      AST_ASSIGN <cast_bug.sv:9.10-9.20>
+        AST_IDENTIFIER <cast_bug.sv:9.10-9.11> str='\y' in_lvalue
+        AST_CAST_SIZE <cast_bug.sv:9.14-9.19>
+          AST_BIT_NOT <cast_bug.sv:9.14-9.16>
+            AST_CONSTANT <cast_bug.sv:9.15-9.16> signed range=[31:0] int=4
+
+=== iverilog + vvp ===
+  a                = 0xffffffff
+  y = ~4'(3)       = 0xfffffffc
+  m = a & ~32'(63) = 0xffffffc0
+
+=== verilator --binary ===
+  a                = 0xffffffff
+  y = ~4'(3)       = 0xfffffffc
+  m = a & ~32'(63) = 0xffffffc0
+
+=== comparison (a = 0xffffffff) ===
+expression       expected     yosys        icarus       verilator
+~4'(3)           0xfffffffc   0x00000003   0xfffffffc   0xfffffffc
+a & ~32'(63)     0xffffffc0   0x0000003f   0xffffffc0   0xffffffc0

@@ -86,13 +86,30 @@ def test_baseline_is_the_measured_configuration() -> None:
 
 
 def test_timing_settings_move_memory_and_threads() -> None:
-    """Latency 1 and 200, one beat every two cycles, and four threads -- nothing else."""
+    """Latency 1 and 200, one beat every two cycles, and a threaded run -- nothing else."""
     by_name = {s.name: s for s in determinism.TIMING}
-    assert set(by_name) == {"lat 1", "lat 200", "bw-div 2", "threads 4"}
+    threaded = f"threads {determinism.max_threads()}"
+    assert set(by_name) == {"lat 1", "lat 200", "bw-div 2", threaded}
     assert by_name["lat 1"].lat == 1 and by_name["lat 200"].lat == 200
     assert by_name["bw-div 2"].bw_div == 2 and by_name["bw-div 2"].lat == 32
-    assert by_name["threads 4"].make_args == ["THREADS=4", "XINIT=fast"]
+    n = determinism.max_threads()
+    assert by_name[threaded].make_args == [f"THREADS={n}", "XINIT=fast"]
     assert all(s.x_initial == "fast" for s in determinism.TIMING)
+
+
+def test_the_threaded_run_is_sized_to_the_machine() -> None:
+    """Verilator refuses a model built for more threads than its context has.
+
+    A build for four threads cannot run on a two-core machine, so the sweep
+    takes the threads the machine has.  One thread has nothing to compare
+    against, so the threaded run is left out rather than run at one thread.
+    """
+    assert [s.name for s in determinism.timing_settings(4)][-1] == "threads 4"
+    assert [s.name for s in determinism.timing_settings(2)][-1] == "threads 2"
+    assert determinism.timing_settings(2)[-1].make_args == ["THREADS=2", "XINIT=fast"]
+    one = [s.name for s in determinism.timing_settings(1)]
+    assert one == ["lat 1", "lat 200", "bw-div 2"], "no threaded run to compare at one thread"
+    assert 1 <= determinism.max_threads() <= 4
 
 
 def test_undefined_start_builds_unique_and_names_its_value() -> None:
@@ -385,11 +402,13 @@ def test_timing_does_not_move_a_value(tiny) -> None:
     needs_verilator()
     r = determinism.check_timing(tiny[64], DEMO, program="layer", max_new=2)
     assert r.ok, "\n".join(str(d) for row in r.all_rows for d in row.differences)
-    assert [row.result for row in r.all_rows] == ["match"] * 5
+    assert [row.result for row in r.all_rows] == ["match"] * (len(determinism.TIMING) + 1)
     cycles = {row.setting: row.cycles for row in r.all_rows}
     assert cycles["lat 1"] < cycles["lat 32"] < cycles["lat 200"]
     assert cycles["bw-div 2"] > cycles["lat 32"], "half the bandwidth costs cycles"
-    assert cycles["threads 4"] == cycles["lat 32"], "threads partition the eval, not the design"
+    threaded = f"threads {determinism.max_threads()}"
+    if threaded in cycles:
+        assert cycles[threaded] == cycles["lat 32"], "threads partition the eval, not the design"
     assert len(set(r.baseline.ids)) >= 1 and r.baseline.ids == r.rows[0].ids
 
 
